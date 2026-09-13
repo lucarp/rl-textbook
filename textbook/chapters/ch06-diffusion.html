@@ -1,0 +1,543 @@
+<section class="chapter" id="ch06">
+<h1>Chapter 6 &mdash; Diffusion policies from zero</h1>
+
+<p>Chapter 5 ended with a demand and no way to meet it. We need a policy that can represent a multimodal distribution over one-second action chunks &mdash; one that says "swing left around the mug <em>or</em> swing right, but never straight through it" &mdash; and we need samples from it thirty times a second on a robot. A Gaussian cannot do this. This chapter builds the first model class that could, from nothing.</p>
+
+<p>You will find diffusion strange for about ten minutes and then obvious. Everyone does. The strangeness is that the model is defined by a process running <em>backwards</em> from a process you never train. Once that clicks, the rest is a regression and a for-loop.</p>
+
+<p>Why this chapter, given that the \(\pi\)-family models and LeHome use flow matching rather than diffusion? Because Diffusion Policy (Chi et al., 2023) is the direct ancestor of all of them, and it established three ideas they inherit: diffuse the <em>action chunk</em> rather than a single action, condition on the observation without ever denoising it, and execute under a receding horizon &mdash; predict a long plan, run only its first part, re-plan from a fresh observation (Section 6.6). Chapter 7 is a cleaner parameterization of the same idea &mdash; and you cannot see that it is cleaner without having seen the thing it cleans up.</p>
+
+<h2>6.1 The idea in one page, no math</h2>
+
+<h3>6.1.1 What we want, and the obvious thing to try</h3>
+
+<p>Here is the goal. At each moment in a demonstration there is an observation \(o\) (three camera images and twelve joint angles, say) and the chunk of actions the demonstrator produced next, \(a_{t:t+H}\). We want a model that, given a fresh \(o\), produces a <em>sample</em> from the distribution of chunks a good demonstrator might have produced. Not the average chunk. A sample.</p>
+
+<p>The obvious thing to try is to have the network output the distribution's parameters directly &mdash; exactly what your PPO rover policy does, emitting a mean \(\mu_\theta(o)\) so the policy is \(\mathcal{N}(\mu_\theta(o), \sigma^2)\). Chapter 5 showed why this fails on demonstration data: fitting a unimodal density to bimodal data parks the mean in the valley between the modes, producing an action that appears in no demonstration at all.</p>
+
+<p>So make the output distribution richer. Chapter 5 worked through the two repairs any engineer thinks of first, and why each hurts: a <strong>mixture of Gaussians</strong>, whose component count is fixed in advance while the number of real modes changes frame to frame, and <strong>discretization</strong>, which either discards the correlations between action dimensions or needs a table with (bins)<sup>360</sup> entries. Add the third that Chapter 5 left to this one: <strong>autoregression</strong>, principled but one sequential forward pass per dimension.</p>
+
+<p>Here is what Chapter 5 did not say, and it motivates everything below. All three try to <em>write down</em> a complicated shape in 360 dimensions &mdash; a LeHome chunk is \(H \times d_a = 30 \times 12 = 360\) numbers, \(d_a\) being the width of one action &mdash; in one shot, from one forward pass. That is a hard thing to ask of a network, and the question worth asking is whether we can avoid asking it.</p>
+
+<h3>6.1.2 The fix: learn a process, not a shape</h3>
+
+<p>Here is the move. Do not model the distribution; model a <em>process</em> that ends at the distribution. And start from destruction, because destruction is free. Take a clean action chunk. Add a small amount of Gaussian noise; the result is still recognizably the chunk, just slightly fuzzy. Add a little more. Repeat, say, a hundred times. By the end you hold something statistically indistinguishable from a fresh draw of <code>randn</code>. That procedure has no parameters, nothing about it is learned, and you could implement it in one line.</p>
+
+<p>Now train a network to undo <em>one</em> step of it. Show the network a slightly-noised chunk and ask: what noise was added to get here? That is plain supervised regression with a known label, because you are the one who added the noise &mdash; you have the answer key.</p>
+
+<p>Finally, chain the undo steps. Start from pure Gaussian noise, apply the network, apply it again, and after a hundred applications you hold something that looks like it came from your dataset. Draw a different starting noise and you get a different chunk &mdash; sometimes the left-hand approach, sometimes the right-hand one, in proportion to how often each appeared in the demonstrations.</p>
+
+<p>The cleverness is the decomposition. The global problem &mdash; sample from a multimodal distribution over 360 dimensions &mdash; is hard. Each local problem &mdash; this vector is slightly noisier than a real chunk, guess the noise &mdash; is easy, because the answer is close to the input. Diffusion trades one hard problem for a hundred easy ones, and networks are very good at easy regressions.</p>
+
+<p><strong>An analogy from your own work.</strong> You do not solve a least-squares problem in closed form; you run gradient descent, where each step is trivial and the difficulty lives in the number of steps. Diffusion does the same for <em>sampling</em>. Where it breaks: gradient descent lands on the same answer every time, diffusion somewhere different every time. The randomness is not a nuisance; it is the product.</p>
+
+<p><strong>An analogy from everyday physics.</strong> Drop ink into still water and film it. The ink spreads, the film ends in uniform gray, and the spreading needs no intelligence. Play the film backwards and gray resolves into a blob. A diffusion model is a network that plays that film backwards one frame at a time. Where it breaks: real ink diffusion is irreversible, since reversing it would require knowing where every particle came from. The network does not recover <em>the</em> original blob; it produces <em>a</em> plausible one. For a policy that is not a defect &mdash; it is the multimodality we asked for.</p>
+
+<h2>6.2 The forward process, precisely</h2>
+
+<p>Now the math, one symbol at a time. Here \(x\) stands for whatever vector we are generating; from Section 6.6 onward it is an action chunk, but nothing depends on that. Write \(x_0\) for a clean data point and \(x_k\) for that point after \(k\) rounds of noising, with \(k \in \{1, \dots, N_{\mathrm{diff}}\}\). One step of destruction is</p>
+
+<p><strong>A warning about direction before you read another equation.</strong> The diffusion literature numbers noise levels <em>upward from clean data</em>: \(x_0\) is the data point, \(x_{N_{\mathrm{diff}}}\) is pure noise, and sampling therefore counts <em>down</em>. That is the reverse of Chapter 5's generic refinement sketch, where \(a^{(0)}\) was the noise draw and \(a^{(K)}\) the finished chunk. Flow matching (Chapter 7) picks a third convention: continuous \(u \in [0,1]\) with \(u = 0\) at noise and \(u = 1\) at data. None of the three is more correct, and every paper assumes its own is obvious. Before reading anyone's equations, find the sentence that says which end is noise; getting it backwards makes every formula look subtly wrong.</p>
+
+\[ q(x_k \mid x_{k-1}) \;=\; \mathcal{N}\!\left(x_k;\ \sqrt{1-\beta_k}\;x_{k-1},\ \beta_k I\right). \]
+
+<p>Two letters carry the whole chapter, so fix them now. \(q\) is the <strong>forward process</strong>: fixed, known in closed form, never learned &mdash; the corruption you apply yourself. \(p_\theta\) is the <strong>reverse model</strong>, arriving in Section 6.3: the network's attempt to undo \(q\), and the only thing here with parameters in it. Approximating \(q\) run backwards by a \(p_\theta\) run forwards is the entire chapter. Read \(\mathcal{N}(x_k;\ m,\ S)\) as "\(x_k\) is drawn from a Gaussian with mean \(m\) and covariance \(S\)"; the semicolon separates the variable from the parameters, and the \(\mathcal{N}(0, I)\) form below is the same object with the variable left implicit.</p>
+
+<p>Read the equation as an instruction: to get \(x_k\), shrink \(x_{k-1}\) by the factor \(\sqrt{1-\beta_k}\), then add Gaussian noise with variance \(\beta_k\) in every coordinate. The numbers \(\beta_1, \dots, \beta_{N_{\mathrm{diff}}}\) are the <strong>noise schedule</strong>: a fixed list of small positive numbers you choose once, before training, and never learn.</p>
+
+<p>Two borrowed letters, flagged once so they never confuse you again. The schedule's \(\beta_k\) and the \(\alpha_k = 1-\beta_k\) derived from it are local to the diffusion formalism and have nothing to do with the AWR temperature \(\beta\) of Chapter 4 or the baseline damping coefficient \(\alpha\) of Chapter 11. The collision is inherited from the source papers, which were written by different communities; inside this chapter, \(\beta\) and \(\alpha\) always carry a subscript \(k\) and always mean the schedule.</p>
+
+<p>Why the shrink? Without it the variance would grow without bound. With it, the process is <strong>variance-preserving</strong>: if \(x_{k-1}\) has unit variance, then \(x_k\) has variance \((1-\beta_k)\cdot 1 + \beta_k = 1\). Every noise level lives at the same scale, which is what lets one network handle all of them &mdash; and it is why you normalize actions to roughly unit scale before training. If your gripper command lives in \([0, 255]\) and your joint deltas in \([-0.01, 0.01]\), the process destroys them at wildly different rates.</p>
+
+<h3>6.2.1 The equation a practitioner actually uses</h3>
+
+<p>Applying that step \(k\) times in a row would be slow, and we would have to do it inside the training loop. We do not have to. Because a Gaussian pushed through a linear map plus more Gaussian noise is still Gaussian, the whole chain collapses. Define \(\alpha_k := 1 - \beta_k\) and \(\bar{\alpha}_k := \prod_{s=1}^{k}\alpha_s\). Then</p>
+
+<div class="key-eq">\[
+x_k \;=\; \sqrt{\bar{\alpha}_k}\;x_0 \;+\; \sqrt{1-\bar{\alpha}_k}\;\varepsilon,
+\qquad \varepsilon \sim \mathcal{N}(0, I).
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+<p>A data point at noise level \(k\) is a weighted blend of two things: the clean data point \(x_0\), and one draw of standard Gaussian noise \(\varepsilon\) of the same shape. The weights are \(\sqrt{\bar{\alpha}_k}\) on the data and \(\sqrt{1-\bar{\alpha}_k}\) on the noise, and \(\bar{\alpha}_k\) &mdash; "alpha-bar", the running product of all the \(1-\beta_s\) up to level \(k\) &mdash; starts near 1 and slides to near 0 as \(k\) grows. So \(\bar{\alpha}_k\) is an interpolation dial: at small \(k\) almost all data, at large \(k\) almost all noise. And this is why the equation matters: to build a training example at level \(k\) you never simulate the chain. Look up \(\bar{\alpha}_k\) in a precomputed table, draw one \(\varepsilon\), mix.</p></div>
+
+<p>To see the collapse, do two steps by hand. Substituting \(x_1 = \sqrt{\alpha_1}x_0 + \sqrt{1-\alpha_1}\,\varepsilon_1\) into \(x_2 = \sqrt{\alpha_2}x_1 + \sqrt{1-\alpha_2}\,\varepsilon_2\) gives \(x_2 = \sqrt{\alpha_1\alpha_2}\,x_0 + \sqrt{\alpha_2(1-\alpha_1)}\,\varepsilon_1 + \sqrt{1-\alpha_2}\,\varepsilon_2\). The last two terms are independent zero-mean Gaussians, so they fold into one draw whose variance is \(\alpha_2(1-\alpha_1) + (1-\alpha_2) = 1 - \bar{\alpha}_2\). That is the claim at \(k=2\); induction does the rest.</p>
+
+<h3>6.2.2 A number you can hold on to</h3>
+
+<p>Ho et al. (2020) used \(N_{\mathrm{diff}} = 1000\) with a linear schedule from \(\beta_1 = 10^{-4}\) to \(\beta_{1000} = 0.02\). The running product gives:</p>
+
+\[ \bar{\alpha}_{100} = 0.8970, \qquad \bar{\alpha}_{500} = 0.0786, \qquad \bar{\alpha}_{1000} = 0.00004 . \]
+
+\[ \sqrt{\bar{\alpha}_{100}} = 0.9471, \qquad \sqrt{\bar{\alpha}_{500}} = 0.2803, \qquad \sqrt{\bar{\alpha}_{1000}} = 0.0064 . \]
+
+\[ \sqrt{1-\bar{\alpha}_{100}} = 0.3209, \qquad \sqrt{1-\bar{\alpha}_{500}} = 0.9599, \qquad \sqrt{1-\bar{\alpha}_{1000}} = 1.0000 . \]
+
+<p>Take a normalized gripper position \(x_0 = 0.60\) and a drawn noise value \(\varepsilon = 1.20\). At level 100:</p>
+
+\[ x_{100} = 0.9471 \times 0.60 + 0.3209 \times 1.20 = 0.5683 + 0.3851 = 0.9533 . \]
+
+<p>Ninety-five percent of the original amplitude survives &mdash; early steps are gentle. At level 500:</p>
+
+\[ x_{500} = 0.2803 \times 0.60 + 0.9599 \times 1.20 = 0.1682 + 1.1519 = 1.3201 . \]
+
+<p>The data contributes 28% of the amplitude &mdash; recognizable only statistically. At level 1000 it contributes 0.6%: noise for all practical purposes, which is the point, because the last level must be indistinguishable from \(\mathcal{N}(0,I)\), where sampling starts. Figure 6.1 shows the same progression for a whole chunk.</p>
+
+<figure><svg viewBox="0 0 700 244" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch06f1arr" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#666"/></marker>
+</defs>
+<text x="350" y="20" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">Forward process: destruction. Fixed, cheap, and nothing is learned.</text>
+<text x="95" y="42" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">k = 0 (data)</text>
+<text x="265" y="42" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">k = 100</text>
+<text x="435" y="42" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">k = 500</text>
+<text x="605" y="42" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">k = 1000 (noise)</text>
+<rect x="40" y="50" width="110" height="76" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<rect x="210" y="50" width="110" height="76" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<rect x="380" y="50" width="110" height="76" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<rect x="550" y="50" width="110" height="76" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<polyline points="46,110 60,104 74,96 88,88 102,80 116,74 130,72 144,72" fill="none" stroke="#4878a8" stroke-width="2"/>
+<polyline points="216,108 230,107 244,93 258,90 272,83 286,71 300,76 314,69" fill="none" stroke="#4878a8" stroke-width="2"/>
+<polyline points="386,96 400,78 414,110 428,68 442,100 456,75 470,105 484,82" fill="none" stroke="#b0703a" stroke-width="2"/>
+<polyline points="556,72 570,112 584,70 598,105 612,80 626,116 640,74 654,100" fill="none" stroke="#b0703a" stroke-width="2"/>
+<line x1="152" y1="88" x2="204" y2="88" stroke="#666" stroke-width="1.5" marker-end="url(#ch06f1arr)"/>
+<line x1="322" y1="88" x2="374" y2="88" stroke="#666" stroke-width="1.5" marker-end="url(#ch06f1arr)"/>
+<line x1="492" y1="88" x2="544" y2="88" stroke="#666" stroke-width="1.5" marker-end="url(#ch06f1arr)"/>
+<text x="178" y="80" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">+ noise</text>
+<text x="348" y="80" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">+ noise</text>
+<text x="518" y="80" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">+ noise</text>
+<text x="95" y="146" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#4878a8">signal 1.000</text>
+<text x="95" y="161" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">noise 0.000</text>
+<text x="265" y="146" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#4878a8">signal 0.947</text>
+<text x="265" y="161" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">noise 0.321</text>
+<text x="435" y="146" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#4878a8">signal 0.280</text>
+<text x="435" y="161" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">noise 0.960</text>
+<text x="605" y="146" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#4878a8">signal 0.006</text>
+<text x="605" y="161" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">noise 1.000</text>
+<line x1="40" y1="180" x2="660" y2="180" stroke="#ddd" stroke-width="1"/>
+<text x="350" y="202" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">level-k sample = signal &#215; (clean chunk) + noise &#215; (one Gaussian draw)</text>
+<text x="350" y="224" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">signal is the square root of alpha-bar; training jumps straight to a random k, never walking the chain</text>
+</svg><figcaption>Figure 6.1 &mdash; One action chunk (a curve over the chunk's timesteps) at four levels of the standard 1000-step linear schedule. Notice how uneven the destruction is: at \(k=100\) the shape survives, and by \(k=500\) it is gone, so half the schedule is spent on samples carrying almost no information. That imbalance is what the cosine schedule fixes.</figcaption></figure>
+
+<h3>6.2.3 Schedules, and why the default is wrong for robots</h3>
+
+<p>Notice something uncomfortable in those numbers. The linear schedule's midpoint is already 96% noise. Tolerable at \(N_{\mathrm{diff}} = 1000\), fatal at the budgets robotics uses.</p>
+
+<p>The <strong>cosine schedule</strong> (Nichol &amp; Dhariwal, 2021) defines \(\bar{\alpha}_k\) directly as a shifted cosine curve rather than defining \(\beta_k\) linearly, and it destroys information much more evenly. At \(N_{\mathrm{diff}} = 100\) &mdash; Diffusion Policy's setting &mdash; its midpoint \(k = 50\) gives \(\bar{\alpha}_{50} = 0.494\), so the mix is \(0.703\,x_0 + 0.711\,\varepsilon\): a genuine fifty-fifty blend, exactly where a midpoint should be. Chi et al. (2023) report this "Square Cosine Schedule" works best, and it is what LeRobot's diffusion config ships with &mdash; see the config listing in Section 6.6. Do not reach for the linear schedule just because it appeared in the original paper.</p>
+
+<h2>6.3 The reverse process and the training objective</h2>
+
+<h3>6.3.1 What we would like, and why we cannot have it</h3>
+
+<p>Sampling means running the chain backwards: given \(x_k\), produce \(x_{k-1}\). The quantity we want is the true reverse conditional \(q(x_{k-1}\mid x_k)\). By Bayes' rule it is proportional to \(q(x_k \mid x_{k-1})\,q(x_{k-1})\), and \(q(x_{k-1})\) is <em>all your data noised to level \(k-1\)</em> &mdash; the very object we are trying to model. We are going in circles.</p>
+
+<p>Here is the escape, the deep fact that makes diffusion work. If each \(\beta_k\) is small, each forward step barely moves the point, and the reverse of a barely-moving step is <em>also approximately Gaussian</em>. So we do not need the full shape of \(q(x_{k-1}\mid x_k)\), only its mean and variance, and we posit the learned reverse model \(p_\theta\) promised in Section 6.2 &mdash; a Gaussian of our own, aimed at the one we cannot compute:</p>
+
+\[ p_\theta(x_{k-1}\mid x_k) \;=\; \mathcal{N}\!\left(x_{k-1};\ \mu_\theta(x_k, k),\ \sigma_k^2 I\right) \]
+
+<p>and we let the network supply the mean while fixing the variance to a schedule-derived constant. Ho et al. (2020) tried both \(\sigma_k^2 = \beta_k\) and \(\sigma_k^2 = \tilde{\beta}_k = \frac{1-\bar{\alpha}_{k-1}}{1-\bar{\alpha}_k}\beta_k\) and reported "similar results" &mdash; not a choice worth agonizing over. Making each step tiny is what turned an intractable distribution into a Gaussian with an unknown mean: the same trade as before, seen from the other side.</p>
+
+<h3>6.3.2 Predicting the noise instead of the mean</h3>
+
+<p>We could have the network output \(\mu_\theta\) directly. Ho et al. found a reparameterization that trains far better. Rearranging the closed-form jump gives \(x_0 = (x_k - \sqrt{1-\bar{\alpha}_k}\,\varepsilon)/\sqrt{\bar{\alpha}_k}\), so knowing \(\varepsilon\) means knowing \(x_0\), and a good guess at \(x_0\) is enough to write down the reverse mean. Predicting \(\varepsilon\) and predicting the clean data are the same task in different coordinates, related by an affine map.</p>
+
+<p>Why prefer \(\varepsilon\)? You have an exact label for free, because you drew \(\varepsilon\) yourself. And \(\varepsilon\) has unit variance at every noise level by construction, so the target is pre-whitened and one loss scale works across all \(k\), whereas an \(x_0\) target varies enormously in difficulty with \(k\). This convention is <strong>\(\varepsilon\)-prediction</strong> (epsilon-prediction), and almost every robotics implementation uses it.</p>
+
+<p>The training objective is then embarrassingly simple:</p>
+
+<div class="key-eq">\[
+L_{\text{simple}}(\theta) \;=\; \mathbb{E}_{k,\,x_0,\,\varepsilon}\Big[\; \big\lVert\, \varepsilon \;-\; \varepsilon_\theta\big(\sqrt{\bar{\alpha}_k}\,x_0 + \sqrt{1-\bar{\alpha}_k}\,\varepsilon,\ k\big) \,\big\rVert^2 \;\Big]
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+<p>The left side, \(L_{\text{simple}}(\theta)\), is the number you minimize; \(\theta\) is every weight in the denoiser, the only thing being changed. The right side says how to compute it. Pick a training example \(x_0\) at random. Pick a noise level \(k\) uniformly from \(\{1,\dots,N_{\mathrm{diff}}\}\). Draw one Gaussian noise vector \(\varepsilon\) shaped like \(x_0\). Mix them with the two coefficients from Section 6.2; hand the result and the number \(k\) to the network \(\varepsilon_\theta\), which returns its guess at the noise; score that guess by squared error against the \(\varepsilon\) you actually drew. \(\mathbb{E}\) means average the score over all the random choices &mdash; in practice, over a minibatch. The network is a denoiser graded on how well it identifies the corruption, and \(k\) is passed in because the answer depends on how much corruption there is.</p></div>
+
+<p>One thing in the code below is a forward reference, so name it now rather than let it puzzle you. You will see an observation \(o\) passed to the network here and in every code block that follows. It is <strong>conditioning</strong>: an extra input the denoiser reads and never generates. It changes nothing about the loss, which is why \(o\) does not appear in \(L_{\text{simple}}\) above. Section 6.6 explains the three ways it gets wired in; until then, treat it as a fixed side input.</p>
+
+<pre class="code"># one training step of a diffusion policy
+o, x0 = batch                        # o: observation; x0: clean action chunk, shape (B, H, d_a)
+k     = randint(1, N_diff + 1, (B,)) # one noise level per sample, uniform over all levels
+eps   = normal(0, 1, x0.shape)       # this is the regression label -- we drew it, so we know it
+a_sig = sqrt(abar[k]).view(B, 1, 1)     # data coefficient; abar precomputed once from the schedule
+a_noi = sqrt(1 - abar[k]).view(B, 1, 1) # noise coefficient (NOT the sampler's sigma[k] below)
+xk   = a_sig * x0 + a_noi * eps      # closed-form jump: the chain is never simulated
+eps_hat = net(xk, k, o)              # k is conditioning too: sinusoidal embedding inside the net
+loss = ((eps - eps_hat) ** 2).mean() # plain MSE. That is all.
+loss.backward(); opt.step(); opt.zero_grad()
+ema.update(net)                      # keep an exponential moving average -- that is what you deploy
+</pre>
+
+<h3>6.3.3 What this is not &mdash; and how it compares to PPO</h3>
+
+<p>Note what is <em>absent</em>, because the absences are why diffusion training is so reliable. No adversary, so no minimax game to balance. No likelihood and no partition function, so nothing to normalize. No sampling inside training, and no chain simulation.</p>
+
+<p>Now hold this next to PPO, which you know from the inside. In PPO the loss estimates an expectation over trajectories that <em>the current policy generates</em>. The moment you update \(\theta\), the data distribution moves, your batch goes stale, and the importance ratio \(\rho_t(\theta)\) drifts &mdash; which is why you need clipping, few epochs per batch, and a value function chasing a moving target. Every stability mechanism in Chapter 3 manages that feedback loop.</p>
+
+<p>The diffusion loss has no feedback loop. The dataset is fixed, the noise levels are fixed, the targets are fixed. It is ordinary supervised regression and behaves like one: shuffle, use a large batch, decay the learning rate, walk away. Chi et al. (2023) report training stability as a headline property of diffusion policies, and this is the mechanical reason. The bill comes due in Chapter 9, when we try to improve such a policy with RL and find that the log-probability PPO needs is no longer available.</p>
+
+<h2>6.4 Sampling</h2>
+
+<h3>6.4.1 The ancestral loop</h3>
+
+<p>Training gave us a network that identifies noise; sampling turns it into a generator. Start at \(x_{N_{\mathrm{diff}}} \sim \mathcal{N}(0,I)\), free to produce, and step down to \(k=0\). This is <strong>ancestral sampling</strong>: walking the chain of conditionals from the last "ancestor" back to the data. The package you now have &mdash; that forward process, the \(\varepsilon\)-prediction loss, and this sampler &mdash; is what everyone calls <strong>DDPM</strong>, for <em>denoising diffusion probabilistic models</em>, after Ho et al. (2020). The name is all over the code below and the config files you will open.</p>
+
+<div class="key-eq">\[
+x_{k-1} \;=\; \frac{1}{\sqrt{\alpha_k}}\left(x_k \;-\; \frac{1-\alpha_k}{\sqrt{1-\bar{\alpha}_k}}\;\varepsilon_\theta(x_k, k)\right) \;+\; \sigma_k z,
+\qquad z \sim \mathcal{N}(0, I).
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+<p>Four operations. Ask the network what noise it sees in the current sample \(x_k\); that answer is \(\varepsilon_\theta(x_k, k)\). Subtract a sized-down slice of it: \(\varepsilon_\theta\) estimates <em>all</em> the noise in \(x_k\), and the coefficient \(\frac{\beta_k}{\sqrt{1-\bar{\alpha}_k}}\) (recall \(1-\alpha_k = \beta_k\)) cuts that estimate to about this one step's worth. Take all of it and you would jump straight to \(\hat{x}_0\) &mdash; which at \(k=1\) is exactly what happens, as the last step of the worked example shows. Divide by \(\sqrt{\alpha_k}\) to undo the shrink this step applied; you now hold the mean of the reverse Gaussian. Add fresh noise \(\sigma_k z\), with \(z\) a new standard Gaussian and \(\sigma_k\) from the schedule &mdash; at \(k=1\) set \(z=0\) and stop. Here \(\alpha_k = 1-\beta_k\), \(\bar{\alpha}_k\) is the running product from Section 6.2, and \(x_{k-1}\) is the cleaner sample you hand to the next iteration.</p></div>
+
+<p>The last term deserves an explanation, because deleting it is a common instinct and it is wrong. We are not maximizing anything; we are <em>sampling</em>, and drawing from a Gaussian means taking its mean and adding a draw from its noise. Drop the noise and you are no longer sampling from \(p_\theta\): the samples come out over-smoothed. There <em>is</em> a correct deterministic sampler, coming shortly; it is just not "this update minus the noise term." Figure 6.2 shows the loop as a whole.</p>
+
+<pre class="code"># DDPM ancestral sampling -- K = N_diff network evaluations
+x = normal(0, 1, (H, d))                     # start from pure noise, same shape as a chunk
+for k in range(N_diff, 0, -1):
+    eps_hat = net(x, k, o)                   # o is FIXED: the observation is never denoised
+    coef = beta[k] / sqrt(1 - abar[k])       # the slice of noise this step is responsible for
+    mean = (x - coef * eps_hat) / sqrt(alpha[k])
+    z = normal(0, 1, x.shape) if k &gt; 1 else 0  # no noise injected on the final step
+    x = mean + sigma[k] * z
+return x                                     # a clean chunk; execute its first rows on the robot
+</pre>
+
+<figure><svg viewBox="0 0 700 296" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch06f2arrB" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#4878a8"/></marker>
+<marker id="ch06f2arrG" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#4a8a5c"/></marker>
+</defs>
+<rect x="150" y="26" width="200" height="46" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+<text x="250" y="46" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">observation o</text>
+<text x="250" y="62" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">images + state, encoded once</text>
+<line x1="250" y1="72" x2="250" y2="108" stroke="#4a8a5c" stroke-width="1.5" marker-end="url(#ch06f2arrG)"/>
+<rect x="24" y="118" width="104" height="58" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="76" y="142" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">pure noise</text>
+<text x="76" y="158" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">one randn draw</text>
+<line x1="130" y1="147" x2="164" y2="147" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch06f2arrB)"/>
+<rect x="172" y="112" width="156" height="70" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="250" y="133" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">denoiser network</text>
+<text x="250" y="151" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4878a8">eps_theta(x, k, o)</text>
+<text x="250" y="168" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">one forward pass</text>
+<line x1="330" y1="147" x2="362" y2="147" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch06f2arrB)"/>
+<rect x="370" y="112" width="172" height="70" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="456" y="133" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">update rule</text>
+<text x="456" y="151" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">remove a slice of the noise,</text>
+<text x="456" y="167" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">rescale, add sigma_k z</text>
+<line x1="544" y1="147" x2="574" y2="147" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch06f2arrB)"/>
+<rect x="582" y="118" width="94" height="58" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+<text x="629" y="142" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">clean chunk</text>
+<text x="629" y="158" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">at k = 0</text>
+<path d="M 456 182 L 456 226 L 250 226 L 250 190" fill="none" stroke="#4878a8" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#ch06f2arrB)"/>
+<text x="353" y="244" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4878a8">repeat for k = N_diff down to 1</text>
+<text x="350" y="272" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">the observation is encoded once and reused by every step; only the noisy chunk changes</text>
+<text x="350" y="288" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">cost of one action chunk = number of loop iterations, each one network evaluation</text>
+</svg><figcaption>Figure 6.2 &mdash; The sampling loop. Notice where the cost is: the dashed feedback arrow is traversed once per denoising step, each traversal a full forward pass of the denoiser, while the observation encoder runs once. That asymmetry is why every latency trick here and in Chapter 12 targets the loop, not the encoder.</figcaption></figure>
+
+<h3>6.4.2 Worked example: one training step and a full three-step sample, by hand</h3>
+
+<p>Toy settings, so every number fits on a line: one scalar action (a normalized gripper command) and \(N_{\mathrm{diff}} = 3\) with an aggressive schedule \(\beta = (0.1,\ 0.5,\ 0.9)\). Then \(\alpha = (0.9,\ 0.5,\ 0.1)\), and the running products are \(\bar{\alpha}_1 = 0.9\), \(\bar{\alpha}_2 = 0.9 \times 0.5 = 0.45\), \(\bar{\alpha}_3 = 0.45 \times 0.1 = 0.045\). Square roots:</p>
+
+\[ \sqrt{\bar{\alpha}} = (0.9487,\ 0.6708,\ 0.2121), \qquad \sqrt{1-\bar{\alpha}} = (0.3162,\ 0.7416,\ 0.9772). \]
+
+<p>Suppose the demonstrations here are bimodal: half the time the demonstrator commands \(-0.5\) (open), half the time \(+0.6\) (closed) &mdash; the mug situation from Chapter 5, in one dimension.</p>
+
+<p><strong>One training step.</strong> Draw a demonstration \(x_0 = 0.60\), a level \(k = 2\), and a noise \(\varepsilon = -0.80\). Build the input:</p>
+
+\[ x_2 = 0.6708 \times 0.60 + 0.7416 \times (-0.80) = 0.4025 - 0.5933 = -0.1908 . \]
+
+<p>Feed \((-0.1908,\ k{=}2,\ o)\) to the network; say it returns \(\varepsilon_\theta = -0.55\). The loss is</p>
+
+\[ (\varepsilon - \varepsilon_\theta)^2 = (-0.80 - (-0.55))^2 = (-0.25)^2 = 0.0625 , \]
+
+<p>and the gradient with respect to the network's output is \(-2(\varepsilon - \varepsilon_\theta) = -2 \times (-0.25) = +0.50\). A positive gradient means descent <em>decreases</em> the output, moving \(-0.55\) toward \(-0.80\). That is the entire training signal.</p>
+
+<p><strong>A full sample, three steps.</strong> Use \(\sigma_k^2 = \tilde{\beta}_k\), giving \(\sigma_3 = 0.7199\), \(\sigma_2 = 0.3015\), \(\sigma_1 = 0\). Draw the starting point \(x_3 = 1.300\) and the two injection noises \(z_3 = 0.60\), \(z_2 = 0.20\).</p>
+
+<p>One convention first, because the direction of travel is what confuses people here. At each step we <em>posit the denoiser's output in clean-data coordinates</em> &mdash; its guess \(\hat{x}_0\) at which gripper command this sample came from, the interpretable quantity &mdash; and then convert to noise coordinates with \(\varepsilon_\theta = (x_k - \sqrt{\bar{\alpha}_k}\,\hat{x}_0)/\sqrt{1-\bar{\alpha}_k}\), because \(\varepsilon_\theta\) is what the update rule consumes. That is the \(\hat{x}_0\) formula from Section 6.3 solved the other way around.</p>
+
+<p>And we do not invent the \(\hat{x}_0\) values, because for a two-mode dataset the ideal denoiser is Bayes' rule: weight each mode by how well it explains the sample. Under mode \(x_0 = m\), the closed-form jump makes \(x_k\) Gaussian with mean \(\sqrt{\bar{\alpha}_k}\,m\) and variance \(1-\bar{\alpha}_k\), so "how well it explains" is that density at the observed \(x_k\), and \(\hat{x}_0\) is the posterior-weighted average of the two modes. A trained network only approximates this; this is what it approximates. Full arithmetic for the first step, quoted for the other two.</p>
+
+<p><em>Step 1, \(k=3\).</em> We have \(\sqrt{\bar{\alpha}_3} = 0.2121\), \(1-\bar{\alpha}_3 = 0.955\), and the sample \(x_3 = 1.300\). Under the closed mode \(x_0 = +0.6\) the predicted mean is \(0.2121 \times 0.6 = 0.1273\), leaving a residual of \(1.300 - 0.1273 = 1.1727\), so the Gaussian exponent is \(-1.1727^2/(2 \times 0.955) = -1.3752/1.910 = -0.7200\). Under the open mode \(x_0 = -0.5\) the mean is \(-0.1061\), the residual is \(1.300 + 0.1061 = 1.4061\), and the exponent is \(-1.4061^2/1.910 = -1.9771/1.910 = -1.0351\). Only the difference of the two exponents matters, because the Gaussian's normalizing constant is the same for both and cancels:</p>
+
+\[
+\begin{aligned}
+\text{difference} \;&=\; -0.7200 - (-1.0351) \;=\; 0.3151, \qquad e^{0.3151} \;=\; 1.370 , \\
+\text{weights} \;&=\; \frac{1.370}{1.370 + 1} = 0.5781 \ \text{on} \ +0.6, \qquad \frac{1}{2.370} = 0.4219 \ \text{on} \ -0.5 , \\
+\hat{x}_0 \;&=\; 0.5781 \times 0.6 \;+\; 0.4219 \times (-0.5) \;=\; 0.3469 - 0.2110 \;=\; 0.136 .
+\end{aligned}
+\]
+
+<p>The denoiser hedges &mdash; 58% closed, 42% open &mdash; and lands on \(0.136\), a value that appears in no demonstration. That is fine here, because we are not done. In noise coordinates that guess is</p>
+
+\[ \varepsilon_\theta = \frac{1.300 - 0.2121 \times 0.136}{0.9772} = \frac{1.300 - 0.0288}{0.9772} = \frac{1.2712}{0.9772} = 1.301 , \]
+
+<p>and the update rule from the start of this section then gives:</p>
+
+\[
+\begin{aligned}
+\text{coefficient} \;&=\; \beta_3/\sqrt{1-\bar{\alpha}_3} \;=\; 0.9/0.9772 \;=\; 0.9210 , \\
+x_3 - 0.9210\,\varepsilon_\theta \;&=\; 1.300 - 0.9210 \times 1.301 \;=\; 1.300 - 1.198 \;=\; 0.102 , \\
+0.102/\sqrt{\alpha_3} \;&=\; 0.102/0.3162 \;=\; 0.3226 , \\
+x_2 \;&=\; 0.3226 + \sigma_3 z_3 \;=\; 0.3226 + 0.7199 \times 0.60 \;=\; 0.3226 + 0.4319 \;=\; 0.7545 .
+\end{aligned}
+\]
+
+<p><em>Step 2, \(k=2\).</em> The sample now sits at \(0.7545\), much closer to \(+0.6\) than to \(-0.5\), and the same computation says so: with \(\sqrt{\bar{\alpha}_2} = 0.6708\) and \(1-\bar{\alpha}_2 = 0.55\), the exponents come out \(-0.1127\) for \(+0.6\) and \(-1.0799\) for \(-0.5\), a difference of \(0.9672\), so \(e^{0.9672} = 2.630\) and the weights are \(2.630/3.630 = 0.7245\) and \(0.2755\). The denoiser has started committing: \(\hat{x}_0 = 0.7245 \times 0.6 + 0.2755 \times (-0.5) = 0.4347 - 0.1378 = 0.297\). Converting and updating:</p>
+
+\[
+\begin{aligned}
+\varepsilon_\theta \;&=\; \frac{0.7545 - 0.6708 \times 0.297}{0.7416} \;=\; \frac{0.7545 - 0.1992}{0.7416} \;=\; \frac{0.5553}{0.7416} \;=\; 0.7487 , \\
+\text{coefficient} \;&=\; 0.5/0.7416 \;=\; 0.6742, \qquad 0.7545 - 0.6742 \times 0.7487 \;=\; 0.7545 - 0.5048 \;=\; 0.2497 , \\
+0.2497/\sqrt{\alpha_2} \;&=\; 0.2497/0.7071 \;=\; 0.3531 , \\
+x_1 \;&=\; 0.3531 + \sigma_2 z_2 \;=\; 0.3531 + 0.3015 \times 0.20 \;=\; 0.3531 + 0.0603 \;=\; 0.4134 .
+\end{aligned}
+\]
+
+<p><em>Step 3, \(k=1\).</em> With \(\sqrt{\bar{\alpha}_1} = 0.9487\) and \(1-\bar{\alpha}_1 = 0.1\), the modes are now far apart relative to the remaining noise, and the arithmetic is emphatic about it: the exponents are \(-0.1214\) and \(-3.9405\), a difference of \(3.8191\), so \(e^{3.8191} = 45.55\) and the weights are \(45.55/46.55 = 0.9785\) and \(0.0215\). The denoiser commits almost fully: \(\hat{x}_0 = 0.9785 \times 0.6 + 0.0215 \times (-0.5) = 0.5871 - 0.0108 = 0.576\). Converting and updating, with \(\sigma_1 = 0\) so no noise is injected:</p>
+
+\[
+\begin{aligned}
+\varepsilon_\theta \;&=\; \frac{0.4134 - 0.9487 \times 0.576}{0.3162} \;=\; \frac{0.4134 - 0.5464}{0.3162} \;=\; \frac{-0.1330}{0.3162} \;=\; -0.4206 , \\
+\text{coefficient} \;&=\; 0.1/0.3162 \;=\; 0.3163, \qquad 0.4134 - 0.3163 \times (-0.4206) \;=\; 0.4134 + 0.1330 \;=\; 0.5464 , \\
+x_0 \;&=\; 0.5464/\sqrt{\alpha_1} \;=\; 0.5464/0.9487 \;=\; 0.5760 .
+\end{aligned}
+\]
+
+<p>The run went \(1.300 \rightarrow 0.7545 \rightarrow 0.4134 \rightarrow 0.576\) and landed on the \(+0.6\) mode, not on the average \(0.05\) of the two. That is behavior a Gaussian policy could never produce; run it again with a different \(x_3\) and you land on \(-0.5\), roughly half the time.</p>
+
+<p>Two things to extract. Watch the implied clean-data guesses: \(0.136 \rightarrow 0.297 \rightarrow 0.576\). The denoiser hedges when the sample is noisy and commits as the noise clears; nobody programmed that coarse-to-fine mode selection, it falls out of training across noise levels. And the last step is special: because \(\bar{\alpha}_1 = \alpha_1\), the update reduces algebraically to \(x_0 = \hat{x}_0\) exactly, so the final denoising step <em>is</em> the conversion from noise prediction to clean-data prediction.</p>
+
+<h3>6.4.3 DDIM: the same network, far fewer steps</h3>
+
+<p>Ancestral sampling costs \(N_{\mathrm{diff}}\) network evaluations &mdash; 100 forward passes per chunk at \(N_{\mathrm{diff}} = 100\). We need this cheaper.</p>
+
+<p><strong>DDIM</strong> (denoising diffusion implicit models; Song et al., 2020) &mdash; a sampler for the DDPM you just built, not a different model &mdash; is the standard answer, and its remarkable property is that it needs <em>no retraining</em>: the authors construct non-Markovian forward processes that share DDPM's training objective, so an existing checkpoint can simply be sampled differently. Mechanically it is two lines. Choose a subsequence of levels \(\{k_1 \lt k_2 \lt \dots \lt k_K\} \subset \{1,\dots,N_{\mathrm{diff}}\}\), typically \(K = 10\) evenly spaced. At each chosen level, estimate the clean sample,</p>
+
+\[ \hat{x}_0 = \frac{x_k - \sqrt{1-\bar{\alpha}_k}\;\varepsilon_\theta(x_k,k)}{\sqrt{\bar{\alpha}_k}} , \]
+
+<p>then re-noise it straight down to \(k'\), the next level <em>below</em> \(k\) in your chosen subsequence &mdash; the subsequence was written in increasing order, so sampling walks it backwards:</p>
+
+\[ x_{k'} = \sqrt{\bar{\alpha}_{k'}}\;\hat{x}_0 + \sqrt{1-\bar{\alpha}_{k'}}\;\varepsilon_\theta(x_k,k) . \]
+
+<p>No fresh noise is injected, which makes the sampler deterministic: one starting noise vector maps to exactly one output. That is the \(\eta = 0\) case, where \(\eta\) is DDIM's one knob &mdash; how much fresh noise to re-inject per step. At \(\eta = 0\) you get the deterministic update above; at \(\eta = 1\) the noise goes back in and you recover DDPM's ancestral update exactly, with everything in between available. Song et al. report comparable quality "10&times; to 50&times; faster in terms of wall-clock time."</p>
+
+<p>Determinism is the under-appreciated half of the win for a controller, but be precise about what is deterministic. DDIM is deterministic <em>as a function of the starting noise vector</em> &mdash; call it \(x_{k_K}\), the draw you make at the top of the subsequence. Fix \(x_{k_K}\) and the same observation returns bit-for-bit the same chunk. It is <em>not</em> deterministic as a function of the observation alone, and that is where the mental model usually goes wrong: draw a fresh \(x_{k_K}\) every control tick, as the pseudocode above and every default implementation do, and DDIM will return a different mode on two near-identical consecutive observations, judder and all.</p>
+
+<p>What determinism buys you is a <em>handle</em>. Reuse one \(x_{k_K}\) across consecutive ticks and the arm commits to a single mode through the reach instead of re-rolling the dice thirty times a second; draw a fresh one per episode and the multimodality is still there, across <em>episodes</em>, where you wanted it. Chapter 7 reuses this handle for flow matching.</p>
+
+<h3>6.4.4 Why the step count is a control-systems problem</h3>
+
+<p>Do the arithmetic, because it explains a design choice you would otherwise find arbitrary. Chi et al. (2023) report that "using DDIM with 100 training iterations and 10 inference iterations enables 0.1s inference latency on a Nvidia 3080 GPU." Run that policy naively &mdash; one action per inference at 30 Hz &mdash; and your budget is \(1/30 = 33\) ms per action against a cost of 100 ms. You are over by a factor of three, and no sampler cleverness closes a 3&times; gap.</p>
+
+<p>Now run it the way Diffusion Policy does. Predict a chunk of \(T_p = 16\) actions and execute the first \(T_a = 8\). At a 10 Hz action rate the chunk spans 1.6 s and you execute 0.8 s of it before re-planning: 0.1 s of planning every 0.8 s, a 12.5% duty cycle, with the rest free for the encoder and the control loop. Same network, same sampler, problem gone. Write this down: <strong>chunking, not sampler speed, is what makes iterative-refinement policies real-time.</strong></p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+<p><strong>Confusing \(k\) with \(t\).</strong> The diffusion index \(k\) and the environment timestep \(t\) are unrelated axes. A full denoising run &mdash; all \(K\) steps &mdash; happens <em>between</em> two environment ticks and produces one chunk covering many values of \(t\). Most codebases put sinusoidal embeddings on both axes; check which one yours indexes before debugging anything else.</p>
+<p><strong>Too few steps.</strong> Dropping \(K\) is the first thing everyone tries when latency hurts. Cut it far enough and samples get coarse and start landing <em>between</em> modes &mdash; the failure you adopted diffusion to avoid. Where that happens depends on your data, so measure it rather than trusting a number: sample one observation 50 times at \(K = 10\), \(5\), and \(2\), and look at the spread.</p></div>
+
+<h2>6.5 The score view, in one section</h2>
+
+<p>There is a second way to describe all of this, and you need it because half the literature and most of the variable names in diffusion codebases come from it.</p>
+
+<p>The <strong>score</strong> of a density \(p\) is the gradient of its log, \(\nabla_x \log p(x)\). Do not overthink it: at any point it is a vector pointing where the density increases fastest, its length saying how steeply &mdash; an uphill arrow toward where the data is dense. It does not involve the normalizing constant of \(p\), because the log makes that constant additive and the gradient kills it, which is how score-based methods sidestep the partition function.</p>
+
+<p>Knowing the score everywhere would be enough to sample: start anywhere, step uphill repeatedly, add a little jitter so you do not collapse onto the single highest peak. That is <strong>Langevin dynamics</strong>. The connection to what we built is exact algebra: since \(x_k = \sqrt{\bar{\alpha}_k}x_0 + \sqrt{1-\bar{\alpha}_k}\,\varepsilon\), the optimal noise predictor satisfies</p>
+
+<div class="key-eq">\[
+\nabla_{x_k}\log q(x_k) \;=\; -\,\frac{\varepsilon_\theta(x_k, k)}{\sqrt{1-\bar{\alpha}_k}} .
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+<p>The left side is the score: the uphill direction of \(q(x_k)\) &mdash; your dataset noised to level \(k\) &mdash; at the point \(x_k\). The right side is the network's noise prediction \(\varepsilon_\theta(x_k,k)\), flipped in sign and divided by \(\sqrt{1-\bar{\alpha}_k}\), the noise coefficient from Section 6.2. The two are the same vector up to a negative scale. The minus sign: the noise you added is exactly what dragged the sample away from the data, so home is the opposite direction. A network trained to answer "which way did you get pushed?" has, unasked, learned "which way is home?" Hence papers use "noise model", "score model", and "denoiser" interchangeably, and hence the DDPM update &mdash; step along \(-\varepsilon_\theta\), then add noise &mdash; looks so much like Langevin dynamics.</p></div>
+
+<p>One more idea completes the picture, and Figure 6.3 illustrates it. Song &amp; Ermon (2019) pointed out that estimating the score of raw data is hopeless: real data sits on a thin sliver of the space, and everywhere else any gradient estimate is garbage. Their fix was to estimate the score of the data <em>blurred at many noise levels</em> and anneal from heavy blur to light. That annealing is what your sampling loop does walking \(k\) down to 1, and what you watched numerically above as the denoiser's guess moved from a hedge at \(0.136\) to a commitment at \(0.576\).</p>
+
+<figure><svg viewBox="0 0 700 282" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch06f3arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4878a8"/></marker>
+</defs>
+<text x="180" y="34" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">high noise (large k): one blurred mode</text>
+<text x="520" y="34" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">low noise (small k): two sharp modes</text>
+<rect x="30" y="50" width="300" height="180" rx="6" fill="none" stroke="#ccc" stroke-width="1"/>
+<rect x="370" y="50" width="300" height="180" rx="6" fill="none" stroke="#ccc" stroke-width="1"/>
+<ellipse cx="180" cy="140" rx="92" ry="58" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.2"/>
+<ellipse cx="180" cy="140" rx="48" ry="30" fill="#d6e5f2" stroke="#4878a8" stroke-width="1.2"/>
+<text x="180" y="144" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">blurred data</text>
+<line x1="58" y1="76" x2="112" y2="112" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="302" y1="76" x2="248" y2="112" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="58" y1="204" x2="112" y2="168" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="302" y1="204" x2="248" y2="168" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="180" y1="62" x2="180" y2="96" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="180" y1="218" x2="180" y2="184" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="44" y1="140" x2="80" y2="140" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="316" y1="140" x2="280" y2="140" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<ellipse cx="440" cy="140" rx="40" ry="46" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.2"/>
+<ellipse cx="600" cy="140" rx="40" ry="46" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.2"/>
+<text x="440" y="144" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">mode A</text>
+<text x="600" y="144" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">mode B</text>
+<line x1="520" y1="60" x2="520" y2="220" stroke="#b04a4a" stroke-width="1.4" stroke-dasharray="5 4"/>
+<line x1="384" y1="86" x2="410" y2="110" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="384" y1="194" x2="410" y2="170" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="380" y1="140" x2="394" y2="140" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="656" y1="86" x2="630" y2="110" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="656" y1="194" x2="630" y2="170" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="660" y1="140" x2="646" y2="140" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="506" y1="90" x2="484" y2="110" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="534" y1="90" x2="556" y2="110" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="506" y1="190" x2="484" y2="170" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<line x1="534" y1="190" x2="556" y2="170" stroke="#4878a8" stroke-width="1.6" marker-end="url(#ch06f3arr)"/>
+<text x="520" y="246" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">watershed: the sampler commits here</text>
+<text x="350" y="270" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">the arrows are the score field; the denoiser learns it at every noise level, and sampling anneals from left to right</text>
+</svg><figcaption>Figure 6.3 &mdash; Why sampling walks from high noise to low. On the left, heavy blur merges the two modes into one broad basin, so the uphill arrows are informative even far from the data. On the right the modes have separated and a red watershed appears: a sample that has drifted slightly left of center is pulled all the way into mode A. Commitment to a mode happens once, at the moment the basin splits.</figcaption></figure>
+
+<div class="box jargon"><div class="box-title">Words you will hear</div>
+<p><strong>NFE</strong> &mdash; "number of function evaluations", denoiser forward passes per sample. Sampler papers report quality against NFE, not wall clock.</p>
+<p><strong>v-prediction</strong> &mdash; a third parameterization with target \(v = \sqrt{\bar{\alpha}_k}\,\varepsilon - \sqrt{1-\bar{\alpha}_k}\,x_0\), blending \(\varepsilon\)- and \(x_0\)-prediction. Better behaved at very low NFE; you meet it as a config flag.</p>
+<p><strong>VP and VE</strong> &mdash; variance-preserving (what we built) versus variance-exploding, where noise is added without shrinking the signal. Two coordinate systems for one family.</p>
+<p><strong>EMA weights</strong> &mdash; a moving average of the parameters, kept during training and used for all evaluation. Not optional here; raw weights sample noticeably worse.</p></div>
+
+<h2>6.6 From images to actions: Diffusion Policy</h2>
+
+<p>Everything so far was generic. Chi et al. (2023) turned it into a robot policy, and their adaptations are what you actually implement.</p>
+
+<h3>6.6.1 What gets diffused, and what does not</h3>
+
+<p>The first design decision is the one people most often get backwards. What is denoised is the <strong>action chunk</strong> &mdash; not pixels, not a latent image, not a single action. In their notation the policy takes the latest \(T_o\) steps of observation data \(O_t\) and predicts \(T_p\) future actions, of which \(T_a\) are executed. The diffusion variable is the whole matrix \(A_t \in \mathbb{R}^{T_p \times d_a}\), where \(d_a\) is the action dimension: sixteen rows, one per future timestep, each row as wide as your action space &mdash; twelve numbers for the bimanual LeHome arms, seven for a single arm, two for the pushT task in the paper. The whole matrix is denoised jointly.</p>
+
+<p>The observation is <em>conditioning</em>: encoded once, fed to the denoiser at every step, never noised or generated. The loss shows the asymmetry:</p>
+
+\[ \mathcal{L} \;=\; \mathrm{MSE}\big(\varepsilon^k,\ \varepsilon_\theta(O_t,\ A_t^0 + \varepsilon^k,\ k)\big) . \]
+
+<p>Read that against \(L_{\text{simple}}\) before you conclude you have misunderstood one of them. Chi et al. write the noisy input schematically as \(A_t^0 + \varepsilon^k\), superscript \(0\) meaning the clean chunk and superscript \(k\) the noise drawn for level \(k\) &mdash; both superscripts are noise levels, not timesteps. Expand \(\varepsilon^k\) with the schedule coefficients and you get exactly the mix \(\sqrt{\bar{\alpha}_k}A_t^0 + \sqrt{1-\bar{\alpha}_k}\varepsilon\) from Section 6.2. The only genuine change from \(L_{\text{simple}}\) is the extra input \(O_t\). Two consequences. The encoder runs once per chunk while the denoiser runs \(K\) times, so compute is dominated by a small network called many times, not a large one called once. And the model has no obligation to predict future images &mdash; it is a policy, not a world model. Chapter 8 shows how LeHome recovers a slice of world-model benefit with auxiliary heads.</p>
+
+<p>A notation bridge, because the field is not consistent: Diffusion Policy's \(T_p\) is this book's chunk horizon \(H\), LeRobot's diffusion config calls it <code>horizon</code>, and \(\pi\)-family configs call it <code>chunk_size</code>.</p>
+
+<h3>6.6.2 How the observation gets in</h3>
+
+<p>"Conditioning" is a word that hides real mechanism, so here are the three ways it is done, cheapest first.</p>
+
+<p><strong>Concatenation.</strong> Flatten the observation into a vector and glue it onto the denoiser's input &mdash; appended to every action token, or stacked along the channel axis. One line, and it works. Its weakness is that in a deep network the signal washes out: modeling the marginal action distribution is easier than attending to extra channels.</p>
+
+<p><strong>FiLM.</strong> Feature-wise Linear Modulation (Perez et al., 2018) is the workhorse, and what Diffusion Policy uses for its CNN denoiser. Concatenate the observation embedding with the embedding of the diffusion step \(k\) and push the pair through a small MLP that outputs a per-channel scale vector and shift vector. Then after each convolution block's normalization apply \(h \leftarrow s \odot h + b\), where \(h\) is the block's activation, \(\odot\) is elementwise multiplication, and \(s, b\) are that scale and shift. (Papers write these as \(\gamma\) and \(\beta\); the collision with the discount and the noise schedule means nothing.) Chi et al. apply this "to every convolution layer, channel-wise", so the observation sets the gain of every feature at every depth.</p>
+
+<p><strong>Cross-attention.</strong> For a transformer denoiser, the action tokens are queries and the observation tokens &mdash; image patches, per-camera features, language tokens &mdash; are keys and values. You need this when conditioning is spatial or sequential rather than one summary vector, and it is what VLAs use in Chapter 8.</p>
+
+<p>One detail traps everyone once. <strong>The diffusion step \(k\) is conditioning too.</strong> It goes through a sinusoidal embedding and an MLP, riding the same path as the observation. Omit it and the network cannot tell a nearly-clean sample from nearly-pure noise, so it learns an average correction and samples come out blurred. If your policy trains to a plausible loss and samples garbage, check this first.</p>
+
+<h3>6.6.3 Receding-horizon execution</h3>
+
+<p>The chunk is predicted, but not all of it is used. Diffusion Policy re-plans continuously and executes only the first \(T_a\) actions, warm-starting the next inference with the previous prediction. Chi et al. found "the action horizon of 8 steps to be optimal for most tasks that we tested", with \(T_o = 2\) and \(T_p = 16\) in the released configs.</p>
+
+<p>Why not the whole chunk? The tail of a long open-loop plan is stale; the world has moved. Why not one step? Latency, as computed in Section 6.4, and temporal consistency: a policy re-sampled every tick can flip modes mid-reach, while a chunked one commits to a coherent motion. Figure 6.4 puts the pipeline together.</p>
+
+<p>Executing a fixed fraction and re-planning is precisely <strong>model-predictive control</strong>, and if you have written an MPC loop the structure will feel familiar. Where it breaks: MPC optimizes at run time against an explicit dynamics model and cost function, and can say why it chose what it chose. The diffusion policy runs no optimization and holds no model; it samples from a distribution fitted offline. You get MPC's robustness to staleness, none of its interpretability.</p>
+
+<figure><svg viewBox="0 0 700 314" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch06f4arrB" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#4878a8"/></marker>
+<marker id="ch06f4arrR" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#b04a4a"/></marker>
+<marker id="ch06f4arrG" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#4a8a5c"/></marker>
+</defs>
+<rect x="20" y="40" width="122" height="40" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+<text x="81" y="65" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">3 cameras, 224px</text>
+<rect x="20" y="90" width="122" height="36" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+<text x="81" y="113" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">joint state</text>
+<line x1="144" y1="82" x2="172" y2="82" stroke="#4a8a5c" stroke-width="1.5" marker-end="url(#ch06f4arrG)"/>
+<rect x="178" y="44" width="140" height="76" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="248" y="66" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">ResNet-18 per camera</text>
+<text x="248" y="83" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">GroupNorm, spatial</text>
+<text x="248" y="98" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">softmax pooling</text>
+<text x="248" y="114" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#4878a8">runs ONCE</text>
+<line x1="320" y1="82" x2="348" y2="82" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch06f4arrB)"/>
+<rect x="354" y="44" width="152" height="76" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="430" y="66" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">1D conv U-Net denoiser</text>
+<text x="430" y="83" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">over the chunk time axis</text>
+<text x="430" y="98" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">FiLM on o and on k</text>
+<text x="430" y="114" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#4878a8">runs K times</text>
+<line x1="508" y1="82" x2="536" y2="82" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch06f4arrB)"/>
+<rect x="542" y="44" width="136" height="76" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+<text x="610" y="70" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">predicted chunk</text>
+<text x="610" y="87" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">16 rows of actions</text>
+<text x="610" y="104" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">emitted together</text>
+<line x1="610" y1="122" x2="610" y2="158" stroke="#4a8a5c" stroke-width="1.5" marker-end="url(#ch06f4arrG)"/>
+<text x="20" y="168" font-family="Noto Sans" font-size="11" fill="#333">Receding-horizon execution of that one chunk:</text>
+<rect x="54" y="192" width="264" height="26" rx="4" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.4"/>
+<rect x="324" y="192" width="288" height="26" rx="4" fill="#f8efe8" stroke="#b0703a" stroke-width="1.4" stroke-dasharray="5 4"/>
+<text x="186" y="209" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">executed: first 8 actions</text>
+<text x="468" y="209" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">discarded / used to warm-start</text>
+<line x1="54" y1="230" x2="660" y2="230" stroke="#666" stroke-width="1"/>
+<line x1="60" y1="224" x2="60" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="96" y1="224" x2="96" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="132" y1="224" x2="132" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="168" y1="224" x2="168" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="204" y1="224" x2="204" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="240" y1="224" x2="240" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="276" y1="224" x2="276" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="312" y1="224" x2="312" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="348" y1="224" x2="348" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="384" y1="224" x2="384" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="420" y1="224" x2="420" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="456" y1="224" x2="456" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="492" y1="224" x2="492" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="528" y1="224" x2="528" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="564" y1="224" x2="564" y2="236" stroke="#666" stroke-width="1"/>
+<line x1="600" y1="224" x2="600" y2="236" stroke="#666" stroke-width="1"/>
+<text x="60" y="252" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">action 1</text>
+<text x="600" y="252" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">action 16</text>
+<text x="655" y="252" text-anchor="end" font-family="Noto Sans" font-size="10" fill="#666">time</text>
+<line x1="270" y1="238" x2="270" y2="264" stroke="#b04a4a" stroke-width="1.5" marker-end="url(#ch06f4arrR)"/>
+<text x="270" y="280" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">re-plan starts here, from a fresh observation, while actions 7-8 are still executing</text>
+<text x="20" y="304" font-family="Noto Sans" font-size="10" fill="#666">At 10 Hz the chunk spans 1.6 s, you execute 0.8 s of it, and the 0.1 s of planning fits inside that window.</text>
+</svg><figcaption>Figure 6.4 &mdash; The full pipeline, with the timing that makes it work. Compare the two "runs" labels in the top row: the expensive vision encoder is evaluated once per chunk, the small denoiser K times, so latency scales with K rather than image resolution. Below, re-planning starts before the executed segment ends &mdash; the robot never waits on the GPU.</figcaption></figure>
+
+<h3>6.6.4 Architectures, and what it bought</h3>
+
+<p>Two denoiser variants are offered: a 1D temporal convolutional U-Net over the action-time axis, FiLM-conditioned, and a transformer with cross-attention to the observation tokens. Their guidance is direct: "we recommend starting with the CNN-based diffusion policy implementation as the first attempt at a new task", reserving the transformer for "task complexity or high-rate action changes", and noting they "found the transformer to be more sensitive to hyperparameters".</p>
+
+<p>The vision encoder is a per-camera ResNet-18 trained end-to-end with the policy, with two substitutions worth copying: GroupNorm instead of BatchNorm, which interacts badly with EMA weights, and spatial-softmax pooling instead of global average pooling, because where a feature is matters more than whether it is there.</p>
+
+<p>The payoff across 12 tasks and 4 benchmarks was "an average improvement of 46.9%" over the prior state of the art, for Chapter 5's reason: diffusion "can express arbitrary normalizable distributions", multimodal ones included, while Gaussian policies average over modes. Two smaller findings that will save you a week: "position-control action space consistently outperforms" velocity control, and the square cosine schedule works best.</p>
+
+<pre class="code"># LeRobot diffusion policy: the fields that matter (check names against your version)
+n_obs_steps        = 2      # T_o -- how many past frames the encoder sees
+horizon            = 16     # T_p -- chunk length that gets denoised (pi-family: "chunk_size")
+n_action_steps     = 8      # T_a -- how many of those rows actually reach the motors
+num_train_timesteps = 100   # N_diff -- levels used to BUILD training batches
+beta_schedule      = "squaredcos_cap_v2"   # the cosine schedule; do not use "linear" at N=100
+prediction_type    = "epsilon"             # eps-prediction, as in Section 6.3
+noise_scheduler_type = "DDIM"              # swap DDPM -> DDIM to decouple sampling from training
+num_inference_steps = 10    # K -- denoiser calls per chunk. Latency scales with THIS, not N_diff.
+</pre>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+<p>You trained this policy on your SO-101 cube episodes in Chapter 5; here you take it apart. <code>num_train_timesteps</code> and <code>num_inference_steps</code> are different knobs &mdash; the first shapes training batches, the second is your latency bill &mdash; so leave training at 100 and swap the sampler from DDPM to DDIM at 10. Time both, and confirm the success rate holds. Then sample one held-out observation 30 times, drawing a fresh noise vector for each of the 30 (that is what produces the clusters), and plot the chunks: identical chunks mean a unimodal fit, distinct clusters mean Chapter 5's multimodality on your own data.</p></div>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+<p>LeHome's policy contains no diffusion &mdash; it is a Gemma-300M flow-matching action expert emitting 30-step chunks with 10 Euler steps (Larchenko, 2026). Yet nearly every structural choice here survives into it: the chunk is the generated object, the observation conditions without being generated, iterative refinement produces the sample, execution is receding-horizon. Even fine detail transfers &mdash; Diffusion Policy warm-starts each inference with the previous chunk, and LeHome's "soft inpainting" between chunks is the same idea, upgraded into a tuned inference-time knob (Chapter 12). Read Chapter 7 as a change of parameterization, not of plan.</p></div>
+
+<h2>6.7 Why we do not stop here</h2>
+
+<p>Diffusion policies work. They are also, once you have built one, more complicated than they need to be. Three complaints, in increasing order of importance.</p>
+
+<p><strong>Bookkeeping.</strong> Count what you must get right: a \(\beta\) schedule, its derived \(\alpha\) and \(\bar{\alpha}\) tables, a choice of \(\sigma_k\), two samplers with a subsequence rule for the second, and an \(\varepsilon\)-versus-\(x_0\)-versus-\(v\) flag. None of it is hard, all of it is surface area for bugs, and none of it is about robots.</p>
+
+<p><strong>Curved paths.</strong> Look at Figure 6.1 again as geometry. The coefficients \(\sqrt{\bar{\alpha}_k}\) and \(\sqrt{1-\bar{\alpha}_k}\) move at very different rates at different \(k\), so the trajectory from data to noise bends. Cutting from 100 steps to 10 approximates that curve with 10 straight segments, with error proportional to how much it bends. This is the real reason few-step sampling degrades; on a straight path a coarse integrator would be nearly exact.</p>
+
+<p><strong>Stochasticity you did not ask for.</strong> The sampler injects fresh noise at every step, and DDIM removes it at no cost in quality &mdash; a sign that the noise was never load-bearing in the first place. Be careful what you conclude from that, though. The other source of randomness, the arbitrary pairing of a noise vector with a data point, is not a diffusion problem: flow matching inherits it unchanged, and Chapter 7 says so plainly rather than pretending otherwise.</p>
+
+<p>Now the wish: a straight-line path from noise to data at constant speed, one loss and one integrator with no schedule tables, ten steps that are accurate because the path they approximate is straight by construction rather than because the schedule was tuned. That is flow matching, and it is Chapter 7 &mdash; a smaller idea than diffusion, which is why the \(\pi\)-family and LeHome use it. Chapter 8 then puts a vision-language model in front of it, Chapter 9 confronts what all this does to PPO, and Chapter 12 returns to the inference-time knobs the receding horizon opened here.</p>
+
+<div class="box checkpoint"><div class="box-title">Checkpoint</div>
+<ul>
+<li>Explain without notation why trading one hard sampling problem for many easy denoising regressions is a good deal, and why destruction needs no learning.</li>
+<li>Write the closed-form jump \(x_k = \sqrt{\bar{\alpha}_k}x_0 + \sqrt{1-\bar{\alpha}_k}\varepsilon\) from memory, name every symbol, and say why training never simulates the chain.</li>
+<li>Implement \(L_{\text{simple}}\) and the ancestral loop, and say what each coefficient in the update undoes.</li>
+<li>Relate noise prediction to the score, and use that to explain why sampling walks from high noise to low.</li>
+<li>Describe what Diffusion Policy diffuses, how the observation conditions the denoiser, and why \(k\) must be conditioning too.</li>
+<li>Compute whether a chunked policy fits a real-time budget, and explain why chunking rather than sampler speed is what makes it fit.</li>
+</ul></div>
+
+<p><strong>Where to go deeper.</strong> Read Ho et al. (2020) for the forward process, \(L_{\text{simple}}\), and Algorithms 1 and 2 &mdash; the two boxes you will implement; skip the ELBO derivation on a first pass, since none of it appears in working code. Then Song et al. (2020) for DDIM and its non-Markovian construction. Chi et al. (2023) is the one to read closely and repeatedly, especially the ablations on action horizon, action space, and architecture. Appendix A gives the full reading order.</p>
+
+</section>

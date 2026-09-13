@@ -1,0 +1,410 @@
+<section class="chapter" id="ch13">
+<h1>Chapter 13 &mdash; Imitation and the human in the loop</h1>
+
+<p>Every chapter so far has assumed a policy already exists and your job is to improve it &mdash; with advantage weights in Chapter 4, with more expressive action distributions in Chapters 6 and 7, with advantage conditioning in Chapter 10, with better rewards in Chapter 11. None of that answers the first question: where does the initial policy come from, and what do you do when it is not good enough?</p>
+
+<p>In practice the answer is a human. Someone teleoperates the robot until there is data to train on, and then someone sits beside the robot while it runs and takes over when it is about to do something stupid. That second activity is the cheapest and highest-leverage resource in robot learning, and it is what this chapter is about.</p>
+
+<p>You already run a pipeline built on exactly this idea: an SO-101 arm, an actor process and a learner process, an Xbox pad in your hands, and a working run in which you were intervening 98% of the time. By the end of this chapter you should understand what each piece is doing, why the intervention rate is the number to watch, and why 98% on an early session is the expected starting point rather than a sign of failure.</p>
+
+<div class="box jargon"><div class="box-title">Words you will hear</div>
+<p><strong>Covariate shift</strong> &mdash; the training inputs and the deployment inputs come from different distributions; in imitation, the demonstrator's states versus the policy's own states. <strong>No-regret</strong> &mdash; a property of an online learning algorithm: as rounds accumulate, its average performance approaches that of the best fixed choice in hindsight; vanilla DAgger inherits it, the human-gated variants of Section 13.3 do not, and they trade it for a labeling cost a person can actually pay. <strong>Gate</strong> &mdash; the switch that decides who is currently commanding the robot, the policy or the human. <strong>Intervention</strong> &mdash; one contiguous segment of human control, from takeover to release. <strong>Replay ratio</strong> (or update-to-data ratio, UTD) &mdash; how many gradient steps the learner takes per new environment transition. <strong>Symmetric sampling</strong> &mdash; forcing every training batch to be half human-sourced data and half fresh online data.</p>
+</div>
+
+<h2>13.1 Behavior cloning and compounding error</h2>
+
+<h3>13.1.1 What we want, and the obvious thing to try</h3>
+
+<p>What we want is a policy that performs the task, and the cheapest route is to record a human performing it and fit a network to the recording. Chapter 4 called this <strong>behavior cloning</strong> (BC): supervised learning on demonstrated observation&ndash;action pairs, identical to AWR's weighted regression with every weight set to one, with no rewards, no rollouts and no credit assignment. Every VLA in Chapter 8 is behavior cloning at scale.</p>
+
+<p>So the obvious thing to try is: collect a hundred demonstrations, train until validation loss stops falling, press run. For short tasks this works better than it has any right to. Then it falls apart, in a way that catches everyone the first time.</p>
+
+<h3>13.1.2 How it fails, step by step</h3>
+
+<p>Supervised learning gives you one guarantee only: low error on the distribution the training data came from &mdash; the states the demonstrator \(\pi_\beta\) visited. Call that set the <em>demo tube</em>, and watch what happens at deployment one step at a time.</p>
+
+<p>At step 0 the robot starts inside the tube, because you reset it the way you always did. The policy predicts an action close to the human's but not identical &mdash; a network trained to a finite loss is never exactly right. Say the gripper ends up one millimeter left of where the human's would have been.</p>
+
+<p>At step 1 the robot is therefore slightly off the tube's centerline. It is still inside the tube, so the policy is still reasonably accurate, but a little less accurate than at the center, because this state is a little less represented in the training data. Its next error is a bit larger &mdash; say 1.8 millimeters. At step 2 the error is about 3 millimeters, and by now the accumulated offset has carried the gripper out near the tube's edge.</p>
+
+<p>Notice how undramatic that is. Nothing alarming happens on any single step, which is exactly why this failure is hard to catch by watching one frame at a time. The compounding is slow at first, and only becomes visible once the accumulated offset has walked the robot out of the region your demonstrations cover.</p>
+
+<p>At step 3 the robot is outside the tube entirely, and the situation is now qualitatively different. The network has never seen anything like this observation, so its output is not "slightly wrong", it is arbitrary. No gradient anywhere in training ever told it what to do here.</p>
+
+<p>The critical property is that <em>this loop feeds itself</em>. Each error moves the robot to a state where the policy is worse, and a worse policy produces a larger error, which moves the robot somewhere worse still. It is not a nuisance that averages out; it is positive feedback. Figure 13.1 is the picture to keep in your head.</p>
+
+<figure>
+<svg viewBox="0 0 690 250" width="690" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch13f1arrO" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#b0703a"/></marker>
+    <marker id="ch13f1arrB" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#4878a8"/></marker>
+  </defs>
+  <path d="M 30,95 C 200,65 430,125 660,85 L 660,150 C 430,190 200,130 30,160 Z" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+  <path d="M 30,127 C 200,97 430,157 660,117" fill="none" stroke="#4a8a5c" stroke-width="1" stroke-dasharray="5,5" opacity="0.6"/>
+  <path d="M 45,124 C 150,118 230,104 300,88 C 360,74 420,55 500,42" fill="none" stroke="#b0703a" stroke-width="2.2" marker-end="url(#ch13f1arrO)"/>
+  <circle cx="150" cy="114" r="3" fill="#b0703a"/>
+  <circle cx="220" cy="104" r="3" fill="#b0703a"/>
+  <circle cx="285" cy="91" r="3" fill="#b0703a"/>
+  <line x1="150" y1="110" x2="150" y2="66" stroke="#999" stroke-width="0.8"/>
+  <line x1="220" y1="100" x2="220" y2="66" stroke="#999" stroke-width="0.8"/>
+  <line x1="285" y1="87" x2="285" y2="66" stroke="#999" stroke-width="0.8"/>
+  <text x="150" y="60" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">1 mm</text>
+  <text x="220" y="60" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">1.8 mm</text>
+  <text x="285" y="60" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">3 mm</text>
+  <path d="M 296,92 L 330,119" fill="none" stroke="#4878a8" stroke-width="2" marker-end="url(#ch13f1arrB)"/>
+  <path d="M 360,74 L 393,113" fill="none" stroke="#4878a8" stroke-width="2" marker-end="url(#ch13f1arrB)"/>
+  <path d="M 398,118 C 460,120 530,116 610,112" fill="none" stroke="#4878a8" stroke-width="1.8" stroke-dasharray="4,4" marker-end="url(#ch13f1arrB)"/>
+  <line x1="128" y1="200" x2="158" y2="154" stroke="#4a8a5c" stroke-width="1" opacity="0.6"/>
+  <text x="30" y="216" font-family="Noto Sans" font-size="12" fill="#4a8a5c">demo tube: the states your demonstrations cover</text>
+  <text x="170" y="20" font-family="Noto Sans" font-size="12" fill="#b0703a">BC rollout: each error a little bigger than the last</text>
+  <text x="440" y="72" font-family="Noto Sans" font-size="12" fill="#b04a4a">outside the tube: no labels exist</text>
+  <text x="306" y="147" font-family="Noto Sans" font-size="12" fill="#4878a8">human correction</text>
+</svg>
+<figcaption>Figure 13.1 &mdash; Covariate shift, drawn. Notice two things. First, the labeled errors along the orange rollout: each one is small, and each is a little bigger than the last, which is why the drift is invisible for a while and then suddenly is not. Second, both blue correction arrows start right at the tube's edge rather than far outside it &mdash; a human who waits until the robot is hopelessly lost is labeling states the policy will never usefully revisit. The dashed blue path is the rollout after a correction: back inside the tube, where the policy is accurate again.</figcaption>
+</figure>
+
+<p>Two different things are going on here, and it is worth separating them before the next section, because they blur together easily. What you just walked through is a <em>mechanism</em>: why one mistake tends to lead to another, larger mistake. The \(T^2\) in the bound below comes from something simpler and more countable &mdash; how many mistakes you expect over an episode, multiplied by how long each one keeps hurting. The walkthrough is the intuition; the counting argument is the proof. So do not read the millimeter numbers as a growth law: a policy whose error truly multiplied by four every step would be off the table inside two seconds, and cloning would never work at all.</p>
+
+<h3>13.1.3 Why the damage is quadratic</h3>
+
+<p>There is a classic result that makes this precise, and it comes in two halves with two different sources: the quadratic side is Ross and Bagnell (2010), and the linear side is the DAgger analysis of Ross et al. (2011), which Section 13.2 comes to. Let \(\epsilon\) be the per-step mistake rate of the learned policy measured on the demonstrator's distribution &mdash; the supervised error rate, which in the imitation literature is universally written \(\epsilon\); this is <em>not</em> the PPO clip parameter of Chapter 3, and the collision of symbols is unfortunate but standard. Let \(T\) be the episode length in steps, and let \(J\) be the expected cost of running a policy for one episode. Then:</p>
+
+<div class="key-eq">
+\[
+J\big(\pi_\theta^{\text{BC}}\big) \;\le\; J(\pi_\beta) + \mathcal{O}\!\left(\epsilon T^{2}\right),
+\qquad
+J\big(\pi_\theta^{\text{DAgger}}\big) \;\le\; J(\pi_\beta) + \mathcal{O}\!\left(\epsilon T\right).
+\]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+<p>\(J\) is the expected cost of one episode &mdash; how much worse than perfect the run is, summed over its steps. \(J(\pi_\beta)\) is the cost of the human demonstrator: the standard you are trying to match. \(\pi_\theta^{\text{BC}}\) is the policy you get from plain behavior cloning, \(\pi_\theta^{\text{DAgger}}\) the one you get from the method in Section 13.2. \(\epsilon\) is how often the learned policy picks a bad action on the <em>demonstrator's</em> states, as a fraction between 0 and 1. \(T\) is the number of steps in an episode. \(\mathcal{O}(\cdot)\) means "grows like, up to a constant factor". So the whole statement reads: cloning can be worse than the human by an amount that grows with the <em>square</em> of the episode length, while the corrected method pays only in proportion to the episode length. Doubling how long the task takes quadruples one penalty and merely doubles the other.</p>
+</div>
+
+<p>Where does the square come from? Two factors of \(T\) multiply. The first is how many mistakes you expect: at rate \(\epsilon\) over \(T\) steps, roughly \(\epsilon T\) of them. The second is what each mistake costs: a mistake at step \(t\) can push you off-distribution, and once off-distribution you may stay there for all \(T - t\) remaining steps, so one mistake is charged for up to \(T\) bad steps rather than one. Multiply and you get \(\epsilon T^2\). DAgger removes the second factor by measuring \(\epsilon\) on the policy's <em>own</em> states, where a mistake is just one bad step in a place the policy was trained &mdash; it does not open a trapdoor.</p>
+
+<h3>13.1.4 A small worked example: how good would BC have to be?</h3>
+
+<p>Put your own numbers on it. Your SO-101 runs autonomously at 30 Hz (Chapter 4's convention: 20 Hz when you are teleoperating through the leader arm, 30 Hz when the policy drives), so a 20-second task is \(T = 600\) steps. Suppose your cloned policy is right 99% of the time on demonstration states, so \(\epsilon = 0.01\). One line below needs a word of justification before you meet it, the average damage per mistake. The prose above said a mistake can cost you up to \(T\) steps, which is the worst case, when it happens on step 1. But a mistake is as likely at step 10 as at step 290, so on average half the episode is still ahead of it, and the expected number of remaining steps is \(T/2\). Step through it:</p>
+
+<pre class="code">expected mistakes per episode   = eps * T          = 0.01 * 600      = 6
+average damage per mistake      ~ half the horizon = 600 / 2         = 300 steps
+total expected damage (BC)      = 6 * 300                            = 1800 step-units
+                                  (this is the eps*T^2/2 term: 0.01 * 360000 / 2 = 1800)
+total expected damage (DAgger)  = eps * T                            = 6 step-units
+ratio                           = 1800 / 6                           = 300x
+</pre>
+
+<p>Cost here is scaled so a perfectly bad step costs 1, which caps a 600-step episode at 600 no matter what the policy does. A bound of 1800 is therefore three times larger than the worst thing that can possibly happen, and the natural reading of that is wrong. It does not say the episode is 1.5 times lost. It says the guarantee has gone <em>vacuous</em>: still true, since 1800 does bound a cost of at most 600, but carrying no information, because you knew the answer was under 600 before doing any analysis. That is the real content of the \(T^2\) at this horizon &mdash; cloning comes with no useful promise at all. Now run the question backwards. How accurate would cloning have to be for the expected damage to stay near 6 steps, the level DAgger reaches at \(\epsilon = 0.01\)? Solve \(\epsilon \cdot T^2 / 2 = 6\):</p>
+
+\[ \epsilon \;=\; \frac{2 \times 6}{600^2} \;=\; \frac{12}{360{,}000} \;=\; 3.3 \times 10^{-5}. \]
+
+<p>That is one mistake per 30,000 frames &mdash; fifty consecutive flawless episodes. No behavior-cloned policy on a real arm is that accurate. Note also which lever is which: \(\epsilon\) is what more demonstrations improve, and it enters the bound linearly, while \(T\) enters it quadratically. On long-horizon tasks, data volume loses that race. The fix cannot be "train harder"; it has to be "train somewhere else".</p>
+
+<h3>13.1.5 An analogy, and where it breaks</h3>
+
+<p>You have met a version of this on the rover. Dead reckoning integrates wheel encoders to estimate position; a one-degree heading bias over five meters puts you about nine centimeters off, and the error accumulates the longer you go without an external fix. Compounding error in BC feels the same: small per-step inaccuracies that integrate into a large end-of-episode failure.</p>
+
+<p>Now the limit, and it matters. In dead reckoning the error lives in your <em>estimate</em>; the world is unchanged, and the size of the next error does not depend on how wrong you already are, so the error grows linearly (or as a square root, for a random walk). In behavior cloning the error changes <em>which state you are actually in</em>, and the state determines the accuracy of the next prediction. That is a feedback loop, not an integrator, and it is why the growth is quadratic. A drifting odometer gives you a bad map; a drifting policy gives you a robot in a configuration no one has ever labeled.</p>
+
+<h3>13.1.6 What it looks like on a real arm</h3>
+
+<p>Physically this is mundane and easy to miss. The approach is two centimeters left of every demonstration you recorded. The policy does not explode or thrash; it freezes, or oscillates gently, or closes the gripper on air a centimeter short of the cloth, or drives into the table with mild constant force. Watch it and you think "it almost has it". It does not. It is in a state where its output is arbitrary, and it will stay there until you reset.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+<p>&ldquo;More demos will fix it&rdquo; &mdash; usually not. Compounding error is about <em>where</em> the data lives, not how much of it there is; 500 extra demonstrations thicken the tube without covering the states your policy drifts into. Two more quiet ways to make interactive imitation worse than plain BC: training at full weight on the frames just before a takeover (they <em>are</em> the mistake &mdash; ramp them to zero, Section 13.4), and discarding earlier rounds when you aggregate (the policy then oscillates between failure modes instead of accumulating fixes).</p>
+</div>
+
+<h2>13.2 DAgger: label where the policy actually goes</h2>
+
+<p>The fix is not more demonstrations. It is demonstrations <em>in the right places</em> &mdash; specifically, in the states your current policy actually reaches. <strong>DAgger</strong> (Dataset Aggregation; Ross et al., 2011) is the algorithm that does this, and it is four steps repeated:</p>
+
+<ol>
+<li><strong>Roll out the current policy</strong> \(\pi_\theta\) and record the states it visits. The original algorithm mixes in the expert with a coefficient that decays over rounds, so early rounds stay near the demonstrator's distribution and later rounds are fully autonomous.</li>
+<li><strong>Ask the expert for the correct action</strong> at each visited state &mdash; what the human <em>would</em> have done there, not what the policy did.</li>
+<li><strong>Aggregate</strong>: append those new (state, expert action) pairs to everything collected in all previous rounds.</li>
+<li><strong>Retrain</strong> the policy on the whole aggregated dataset, and go back to step 1.</li>
+</ol>
+
+<p>After a few rounds the training distribution converges toward the one the policy actually induces. Once the two agree, the supervised error rate \(\epsilon\) is measured on exactly the states where the policy will be asked to act, and the quadratic blow-up collapses to the linear rate. That is what "DAgger is a no-regret algorithm" buys you.</p>
+
+<p>Step 3 is the one people cut, and it is the one you must not. Train each round only on that round's fresh corrections and the policy fixes the current failure while forgetting the previous one, then fixes that and reintroduces the first. You see it as a success rate that oscillates and never converges. The aggregated dataset is the memory of the process.</p>
+
+<h3>13.2.1 The honest cost</h3>
+
+<p>Here is the part papers state politely and practitioners feel immediately. Vanilla DAgger requires the expert's action in <em>every</em> visited state. On your SO-101 that means the system pauses on a frame and asks: what should the action have been here? The answer is a 12-dimensional vector of joint commands, and no human can write that down. Re-teleoperating the robot back to each visited state so you can demonstrate from there costs about as much as demonstrating from scratch, so you have saved nothing.</p>
+
+<p>A software analogy: your demonstrations are a test suite whose inputs you chose yourself, so they pass and tell you nothing about what production sees; DAgger is fuzzing in production and turning every crash into a new test case. The analogy breaks at the expensive part. A fuzzer detects failures automatically and you write the fix once, whereas DAgger needs a human to supply the correct 12-dimensional output for every frame collected. Automatic discovery, manual labeling. Every interactive variant below exists to spend that human effort only where it pays.</p>
+
+<h2>13.3 HG-DAgger: the human as the gate</h2>
+
+<p><strong>HG-DAgger</strong> (Human-Gated DAgger; Kelly et al., 2019) makes one change, and it is the change that made interactive imitation practical on real robots. It throws away the mixing schedule and replaces it with human judgment. The policy runs autonomously while a human watches. The human takes control only when the robot is heading somewhere bad, drives it back to safety, and releases. Writing \(\pi_H\) for the human policy &mdash; the same demonstrator \(\pi_\beta\) from Section 13.1, now acting online instead of from a recording:</p>
+
+\[
+\pi_{\text{HG}}(a \mid s) \;=\;
+\begin{cases}
+\pi_H(a \mid s) &amp; \text{human engaged} \\
+\pi_\theta(a \mid s) &amp; \text{otherwise.}
+\end{cases}
+\]
+
+<div class="box plain"><div class="box-title">In plain words</div>
+<p>\(\pi_{\text{HG}}(a \mid s)\) is the policy that is actually commanding the robot right now: the probability of taking action \(a\) in state \(s\). It is defined by cases. When the human has the gate engaged &mdash; your finger on the trigger, a pedal down &mdash; the commands come from \(\pi_H\), the human. When the gate is released, they come from \(\pi_\theta\), the network you are training. That is the entire equation, and its content is organizational rather than mathematical: there is no blending coefficient, no schedule, and no randomness deciding who drives. A person decides, moment by moment, and the switch is instantaneous and total.</p>
+</div>
+
+<p>The labeling rule is the second half of the idea, and it is not the obvious one. Only the intervention segments &mdash; states visited while the human was engaged, paired with the human's actions &mdash; are added to the training set. Autonomous states are never relabeled. You might expect that to be a compromise forced by the cost of labeling. It is better than that.</p>
+
+<p>Consider where interventions land. A human takes over when, and only when, two things are true at once: the policy reached this state on its own, <em>and</em> the policy is handling it badly. That intersection is the current policy's failure boundary. Frames sampled uniformly from an autonomous rollout are mostly frames where the policy is already fine, and training on them teaches it what it already knows. Intervention frames are the most information-dense imitation data you can collect per unit of human time.</p>
+
+<p>Two consequences follow. First, the intervention rate is a live gauge of policy quality that costs nothing to measure &mdash; Kelly et al. turn intervention statistics into an explicit risk estimate. Second, you get a curriculum for free: each round's corrections target whatever the previous round still gets wrong, with nobody designing a lesson plan.</p>
+
+<h3>13.3.1 What HG-DAgger gives up</h3>
+
+<p>Now the price, and be explicit about it, because it is easy to carry Section 13.1's guarantee forward without noticing that it stopped applying. The \(\mathcal{O}(\epsilon T)\) half of that bound is a theorem about vanilla DAgger, and its proof leans on two things HG-DAgger deliberately does not do: roll out a controlled mixture of expert and learner, and obtain the expert's action at <em>every</em> visited state. HG-DAgger keeps neither. A person takes over when they judge it necessary, and only the states they drove through get labeled. So the intervention-segments-only rule is a well-motivated heuristic, not a theorem, and the same caveat applies to HIL-SERL in Section 13.5, which gates the same way. If you run the pipeline in this chapter, you are not running the algorithm the linear bound was proved about.</p>
+
+<p>What survives is the part that was doing the work. The bound was pointing at a mechanism &mdash; train on the states the policy actually reaches, not the states the demonstrator reached &mdash; and human gating implements that mechanism faithfully, just on a human-chosen subset of those states. You trade a proof for a labeling cost a person can actually pay. On a real arm that is almost always the right trade, but it is a trade, and you should know you made it.</p>
+
+<h3>13.3.2 &ldquo;But won't splicing corrections in create multimodal targets?&rdquo;</h3>
+
+<p>This worry stops a lot of people, and you should have it, because Chapter 5 spent a whole chapter on why a policy that averages two valid behaviors produces a third invalid one. If your dataset contains both the policy's own trajectories and human corrections, are you not training on two different behaviors and asking the network to split the difference?</p>
+
+<p>No, and the reason is worth being careful about. The policy learns \(\pi_\theta(a \mid o)\) &mdash; the action <em>conditioned on the observation</em>. Every correction is recorded in the drifted, off-distribution state where it was actually given, and that state is by construction one the original demonstrations never covered. So at that observation there is exactly one label in the dataset: the correction. At the observations the demonstrations do cover there are no corrections, because the human had no reason to intervene. The two sources occupy different regions of observation space rather than competing for the same one.</p>
+
+<p>Genuine multimodality is something else: two <em>different</em> actions labeled at the <em>same</em> state. Two operators folding the same flat shirt, one starting with the left sleeve and one with the right, both looking at an identical overhead image. That is real, it is common in demonstration data, and it is a large part of why Chapters 6 and 7 exist. But gated corrections do not manufacture it. If anything they reduce it, since a correction commits decisively to one recovery from a state where the policy was dithering between several.</p>
+
+<p>The honest caveat: this argument depends on the observation distinguishing the drifted state from the nominal one. If the observation is a low-resolution overhead image and the drift is two millimeters of gripper position, the network cannot tell them apart, and you do get conflicting labels at effectively the same observation. The fix is a better observation &mdash; wrist cameras exist for this &mdash; not a different training rule.</p>
+
+<h2>13.4 Intervention signals as a quasi-advantage</h2>
+
+<p>So far an intervention has been a source of labels. It is more than that: it is a <em>verdict</em>. By keeping their hands off the controller for a hundred consecutive frames, the human implicitly scored those hundred policy actions as acceptable; by taking over at frame 101, they scored the recent actions as bad and supplied better ones. You paid a human to evaluate the policy in real time, so it is wasteful to keep the labels and discard the evaluation.</p>
+
+<p>Chapter 4 gave you the machinery. AWR turns an advantage estimate into a per-sample weight on a supervised loss; here the human's gate stands in for the critic:</p>
+
+<div class="key-eq">
+\[
+P(\text{sample } i) \;\propto\; \exp\!\big(\hat{A}^{\text{hum}}_i / \beta\big),
+\qquad
+\hat{A}^{\text{hum}}_i =
+\begin{cases}
+A_{\text{corr}} &amp; i \in \text{correction segment} \\
+0 &amp; i \text{ autonomous, far from takeovers} \\
+-c\,m_i &amp; i \text{ in the pre-takeover window,}
+\end{cases}
+\]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+<p>The left side is the probability that frame \(i\) gets drawn into a training batch: \(\propto\) means "proportional to", so these numbers are normalized across the dataset to sum to one. \(\hat{A}^{\text{hum}}_i\) is a stand-in advantage for frame \(i\), inferred from what the human did rather than from a critic, and \(\beta\) is the AWR temperature: small \(\beta\) makes the exponential sharp so only the best frames get drawn, large \(\beta\) flattens it toward uniform sampling. The three cases say: frames where the human was driving get a fixed positive score \(A_{\text{corr}} \gt 0\), so \(\exp(A_{\text{corr}}/\beta)\) is a weight above one. Ordinary autonomous frames get zero, so \(\exp(0) = 1\), the baseline weight &mdash; the human let them pass, so they are neither exemplary nor wrong. Frames in the window just before a takeover get \(-c\,m_i\), where \(c\) is a large positive constant and \(m_i\) is a ramp multiplier that climbs from 0 at the start of the window to 1 at the moment of takeover; the weight \(\exp(-c\,m_i/\beta)\) therefore decays from 1 down toward 0 as the takeover approaches. In practice you can skip the exponential for that last case and ramp the weight itself linearly &mdash; the shape is what matters, not the parameterization.</p>
+<p>Two notes on letters, because this section is crowded with them. This \(\beta\) is the AWR temperature of Chapter 4, and it has nothing to do with the \(\beta\) subscript in \(\pi_\beta\), which names the demonstrator; they are different objects sharing a Greek letter, and both spellings are standard. And the ramp multiplier is written \(m_i\) here rather than the \(\lambda_i\) some papers use, to keep it clear of the GAE \(\lambda\) of Chapter 3 &mdash; if you meet \(\lambda_i\) in an intervention-weighting paper, expect it to mean this ramp.</p>
+</div>
+
+<p>The third case is the one people get wrong, so be explicit about why it is there. The frames immediately before a takeover are the frames in which the policy was doing the thing that made the human reach for the controller. They <em>are</em> the mistake. Train on them at full weight and you will faithfully clone the approach that was about to knock the garment off the table &mdash; having paid a human to help you do it. Ramping them to zero says: this segment is not a positive example, so rather than scoring how bad it was, stop learning from it.</p>
+
+<p>Note also where the weights are applied. As in Chapter 4, putting them in the <em>sampler</em> rather than the loss is equivalent in expectation &mdash; drawing a frame twice as often and doubling its gradient do the same thing on average &mdash; but the sampler version is far cheaper, because a near-zero-weight frame is never loaded from disk or decoded. When each frame is three camera images, that is the difference between a data loader that keeps up with the GPU and one that does not.</p>
+
+<pre class="code">import numpy as np
+
+def frame_weights(is_interv, ramp=30, w_corr=4.0, w_auto=1.0):
+    """Per-frame sampling weights for one episode. is_interv: bool array."""
+    w = np.full(len(is_interv), w_auto, dtype=np.float32)
+    w[is_interv] = w_corr
+    # a takeover begins where the flag goes False -> True
+    prev = np.concatenate(([False], is_interv[:-1]))
+    starts = np.flatnonzero(is_interv &amp; ~prev)
+    for s in starts:
+        lo = max(0, s - ramp)
+        n = s - lo
+        if n == 0:
+            continue
+        # descending 1.0 -> ~0 over the frames leading INTO the takeover
+        ramp_w = np.linspace(1.0, 0.0, n, endpoint=False)
+        # only touch frames the POLICY was driving: an earlier correction
+        # segment caught inside this window must keep its w_corr
+        auto = ~is_interv[lo:s]
+        # minimum() so overlapping ramps can lower a weight, never raise one
+        w[lo:s] = np.where(auto, np.minimum(w[lo:s], ramp_w), w[lo:s])
+    return w
+</pre>
+
+<p>The two guards in that loop exist for a case you will hit constantly, not an exotic one. Early in training you correct almost continuously, so takeovers land closer together than <code>ramp</code> frames and each ramp window opens on top of the previous correction segment. The <code>auto</code> mask is what stops that: frames the human was driving keep their full weight no matter whose window they fall inside. Where two windows overlap on genuinely autonomous frames, <code>minimum</code> keeps the lower value, so a frame implicated in two nearby takeovers is discounted by the harsher of them.</p>
+
+<p>Drop the mask and the scheme inverts itself exactly where you need it most. At the 98% intervention rate that is normal on a first session, nearly every ramp window lands on the preceding correction, so nearly every correction gets crushed from 4.0 down to a ramp value below 1.0: you would train hardest on the frames you meant to discard and discard the frames you paid a human to produce, and nothing in the loss curve would tell you. Worth a unit test &mdash; two takeovers ten frames apart, and assert the first correction segment still comes back at <code>w_corr</code>.</p>
+
+<h3>13.4.1 Worked example: weighting one DAgger round</h3>
+
+<p>You run 100 episodes at 30 Hz, 300 steps each &mdash; ten seconds of autonomous running apiece. Total frames:</p>
+
+\[ 100 \times 300 = 30{,}000 \text{ frames}. \]
+
+<p>The human intervened 20 times over those 100 episodes. Each intervention contributes a 50-frame correction segment and a 30-frame pre-takeover ramp in front of it. Sort every frame into one of three buckets:</p>
+
+<pre class="code">bucket        frames                            weight   sampling mass
+corrections   20 * 50            =  1,000        4.0      1,000 * 4.0 =  4,000
+ramps         20 * 30            =    600        0.5        600 * 0.5 =    300
+clean auto    30,000-1,000-600   = 28,400        1.0     28,400 * 1.0 = 28,400
+                                   ------                              ------
+total                              30,000                              32,700
+</pre>
+
+<p>The ramp weight of 0.5 is the average of a linear ramp from 1 down to 0 across the 30 frames. Sampling mass is simply frames times weight. Note that a ramp is a duration, not a frame count: 30 frames at 30 Hz is one second of discounted run-up, and if you change the control rate you must rescale it. LeHome used a five-second window, which on its rig is a far longer ramp than this example's.</p>
+
+<p>With a batch size of 256, the expected number of slots each bucket claims is its share of the total mass times 256:</p>
+
+<pre class="code">corrections : 256 * 4,000  / 32,700 = 1,024,000 / 32,700 =  31.31 slots  (12.2%)
+ramps       : 256 *   300  / 32,700 =    76,800 / 32,700 =   2.35 slots  ( 0.9%)
+clean auto  : 256 * 28,400 / 32,700 = 7,270,400 / 32,700 = 222.34 slots  (86.9%)
+check       :  31.31 + 2.35 + 222.34 = 256.00
+</pre>
+
+<p>Compare that with uniform sampling, where corrections would get their raw share of the dataset:</p>
+
+\[ \frac{1{,}000}{30{,}000} = 0.0333 = 3.3\%, \qquad 256 \times 0.0333 \approx 8.5 \text{ slots}. \]
+
+<p>So the weighting oversamples corrections by \(12.2 / 3.3 \approx 3.7\times\). That is the whole effect of the scheme, in one number.</p>
+
+<p>And the knob runs backwards just as easily. If 12% is not enough and you want corrections to be a full quarter of every batch, set the correction mass \(1{,}000\,w\) against the \(600 \times 0.5 + 28{,}400 = 28{,}700\) that everything else contributes, solve \(1{,}000w / (1{,}000w + 28{,}700) = 0.25\), and you get \(w = 9.57\). That is the practical reason to prefer sampling weights over an opaque loss coefficient: you state your intent as a batch composition and back out the number.</p>
+
+<h2>13.5 HIL-SERL: the same gate, wrapped in an RL loop</h2>
+
+<h3>13.5.1 The ceiling everything so far has been built under</h3>
+
+<p>Stop and notice what every method in this chapter has in common. In behavior cloning, in DAgger, in HG-DAgger, and in the weighting scheme you just worked through, every training target is a human action. The network is asked, over and over, to predict what the person would have done here. Section 13.4 did not change that; it only decided which human actions to count more heavily. So there is a ceiling, and the ceiling is the human. A policy trained this way can approach the demonstrator and, with luck, average away some of their jitter. It cannot beat them, because nothing in the objective knows what "better" would even mean &mdash; no term in a weighted regression loss prefers a fast insertion to a slow one.</p>
+
+<p>That ceiling is lower than it sounds, and the way to feel it is to teleoperate the task yourself. Drive the SO-101 through a connector insertion with the gamepad and watch what you actually do. You approach slowly, because you cannot feel contact through the pad. You stop short and creep the last two millimeters by eye. You back off and retry when the pin catches. A faithful clone learns all of it &mdash; the caution, the pauses, the retries &mdash; because those frames are in the dataset and every one is labeled correct. You did not demonstrate the task; you demonstrated your best attempt at it through a laggy interface with no force feedback, and the policy inherits your handicap with no way to discover that a firmer, faster approach would have worked.</p>
+
+<p>Breaking the ceiling needs a signal that says something other than "match this action" &mdash; one that says "this outcome was good", so the policy can search for its own route to good outcomes, including routes no human ever showed it. That signal is reward, and turning reward into policy improvement is what Chapters 3 and 4 were about. The open questions are practical: how do you get a reward on a real robot without instrumenting the world, and how does the robot survive the exploration?</p>
+
+<h3>13.5.2 The four ingredients</h3>
+
+<p><strong>HIL-SERL</strong> (Luo et al., 2024) answers both by putting the same human gate inside a full reinforcement learning loop instead of a supervised one. This is the pipeline you already run, so the goal here is to name each piece you have on disk. Four ingredients:</p>
+
+<ol>
+<li><strong>A handful of teleoperated demonstrations</strong> seeding an offline buffer. Not hundreds &mdash; tens. They give the critic something other than failure to look at in the first minutes.</li>
+<li><strong>A reward classifier</strong>: a small network trained on human-labeled success and failure images, whose output \(\hat{p}_{succ}\) is thresholded into the sparse reward \(r_t\). This is how you get a reward function on a real robot without instrumenting the world &mdash; you label a few hundred frames instead.</li>
+<li><strong>Human interventions during autonomous rollouts</strong>, stored in the demonstration buffer as corrections, exactly as in HG-DAgger above.</li>
+<li><strong>An off-policy learner</strong>: <strong>RLPD</strong> (Ball et al., 2023), an actor&ndash;critic in the style of SAC (soft actor-critic: an off-policy method training a Q-function alongside an entropy-regularized Gaussian actor, so the policy is rewarded for staying stochastic rather than collapsing early). RLPD adds a high update-to-data ratio &mdash; many gradient steps per collected transition, which is how an hour of robot time suffices &mdash; plus critic ensembling (several Q-networks whose minimum is used) to fight <strong>off-policy overestimation</strong>: a critic trained on its own bootstrapped targets tends to drift upward, because taking a maximum over actions systematically selects whichever \(Q\) value happens to be over-estimated, and that inflated number then becomes the target for the next update. It is a new failure mode if your RL experience is on-policy PPO, and it is the reason most of these tricks exist. Layer normalization on the critic (rescaling each layer's activations to zero mean and unit variance) keeps the same drift bounded as the update-to-data ratio climbs. The fourth addition is <strong>symmetric sampling</strong>.</li>
+</ol>
+
+<div class="key-eq">
+\[
+\mathcal{B} \;=\; \tfrac{1}{2}\,\mathcal{B}_{\text{demo+interv}} \;+\; \tfrac{1}{2}\,\mathcal{B}_{\text{online}},
+\qquad
+y \;=\; r_t + \gamma\, \mathbb{E}_{a' \sim \pi_\theta}\!\Big[ \min_i Q_i(s_{t+1}, a') \Big].
+\]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+<p>The first equation describes how one training batch \(\mathcal{B}\) is assembled: half its samples are drawn from \(\mathcal{B}_{\text{demo+interv}}\), the buffer holding your seed demonstrations and every human correction, and half from \(\mathcal{B}_{\text{online}}\), the replay buffer of transitions the policy has generated recently. The proportion is fixed at one half regardless of how large either buffer has grown &mdash; that is the point, since online data will eventually outnumber human data thousands to one and would otherwise drown it out. The second equation is the ordinary temporal-difference target for the critic: \(y\) is the number \(Q(s_t,a_t)\) is regressed toward, \(r_t\) is the reward from the classifier at this step, \(\gamma\) is the discount, \(s_{t+1}\) is the next state, and \(a'\) is an action <em>resampled</em> from the current policy \(\pi_\theta\) at that next state. \(\min_i Q_i\) takes the smallest estimate across the ensemble of critics, a deliberate pessimism that keeps the bootstrap from inflating itself.</p>
+</div>
+
+<p>The actor/learner split you run in project hil-serl is the structural point, and Chapter 14 scales this same asynchronous pattern up. The actor executes on the arm and streams transitions; the learner consumes them, takes many gradient steps, and ships weights back; the human sits beside the robot with a gamepad. Interventions do double duty here in a way they do not in pure DAgger: they are imitation targets for the actor <em>and</em> on-policy evidence about failure states for the critic. Figure 13.2 draws the cycle.</p>
+
+<figure>
+<svg viewBox="0 0 690 250" width="690" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch13f2arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#666"/></marker>
+  </defs>
+  <rect x="40" y="30" width="185" height="56" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+  <text x="132" y="53" font-family="Noto Sans" font-size="12" fill="#333" text-anchor="middle" font-weight="bold">Policy acts</text>
+  <text x="132" y="72" font-family="Noto Sans" font-size="11" fill="#666" text-anchor="middle">sends actions to the arm</text>
+  <rect x="435" y="30" width="215" height="56" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+  <text x="542" y="53" font-family="Noto Sans" font-size="12" fill="#333" text-anchor="middle" font-weight="bold">Human monitors</text>
+  <text x="542" y="72" font-family="Noto Sans" font-size="11" fill="#666" text-anchor="middle">gate: take over only if needed</text>
+  <rect x="435" y="162" width="215" height="60" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+  <text x="542" y="187" font-family="Noto Sans" font-size="12" fill="#333" text-anchor="middle" font-weight="bold">Replay buffer</text>
+  <text x="542" y="206" font-family="Noto Sans" font-size="11" fill="#666" text-anchor="middle">flagged auto / intervention</text>
+  <rect x="40" y="162" width="185" height="60" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+  <text x="132" y="187" font-family="Noto Sans" font-size="12" fill="#333" text-anchor="middle" font-weight="bold">Learner</text>
+  <text x="132" y="206" font-family="Noto Sans" font-size="11" fill="#666" text-anchor="middle">RL, or weighted BC</text>
+  <line x1="225" y1="58" x2="431" y2="58" stroke="#666" stroke-width="1.5" marker-end="url(#ch13f2arr)"/>
+  <text x="328" y="48" font-family="Noto Sans" font-size="11" fill="#666" text-anchor="middle">live behavior, cameras</text>
+  <line x1="542" y1="86" x2="542" y2="158" stroke="#666" stroke-width="1.5" marker-end="url(#ch13f2arr)"/>
+  <text x="534" y="126" font-family="Noto Sans" font-size="11" fill="#666" text-anchor="end">intervention flag per frame</text>
+  <line x1="435" y1="192" x2="229" y2="192" stroke="#666" stroke-width="1.5" marker-end="url(#ch13f2arr)"/>
+  <text x="330" y="182" font-family="Noto Sans" font-size="11" fill="#666" text-anchor="middle">50% demo+interv, 50% online</text>
+  <line x1="132" y1="162" x2="132" y2="90" stroke="#666" stroke-width="1.5" marker-end="url(#ch13f2arr)"/>
+  <text x="142" y="128" font-family="Noto Sans" font-size="11" fill="#666">deploy new weights</text>
+</svg>
+<figcaption>Figure 13.2 &mdash; The human-in-the-loop cycle shared by HG-DAgger and HIL-SERL. Follow the flag: every frame enters the buffer tagged with who was driving, and that single bit is what lets the learner sample asymmetrically later. The only box that changes between the two methods is the learner &mdash; off-policy RL with a critic in HIL-SERL, weighted behavior cloning in DAgger-on-a-VLA &mdash; which is why the same rig and the same gamepad serve both.</figcaption>
+</figure>
+
+<p>The reported results are why this pipeline is worth the trouble. Across real tasks spanning dynamic manipulation, precision assembly (RAM and SSD insertion, timing-belt assembly, IC-chip insertion) and dual-arm coordination, HIL-SERL reaches near-100% success on nearly all of them within <strong>1 to 2.5 hours</strong> of real-world training per task, averaging roughly <strong>2&times;</strong> the success rate and <strong>1.8&times;</strong> the execution speed of imitation-learning baselines. Single-digit hours on a physical robot, not days. Note the qualifier: <em>nearly all</em>. The hardest tasks in the paper are the ones that do not get there, and if one of your own tasks plateaus at 80% that is a normal outcome rather than evidence you have misconfigured something.</p>
+
+<p>Look again at that speed number, because it is the ceiling argument made numerical. The trained policy runs the task about 1.8 times faster than the demonstrations it was seeded from. No amount of weighted cloning produces that, at any weight, with any sampler, because the demonstrations are the target and the demonstrations are slow. A policy paid for outcomes rather than for imitation is free to find a faster route to the same outcome. That is what "exceeding the demonstrator" looks like with a figure on it, and it is why HIL-SERL is not just a more complicated DAgger.</p>
+
+<h3>13.5.3 The intervention rate is the metric</h3>
+
+<p>Early in training the human intervenes constantly; late in training, almost never. That trajectory is the primary diagnostic, and it is more informative than the reward curve, which on a sparse-reward real task is mostly zeros for a while. The human is a hard-negative miner that smoothly retires. Figure 13.3 shows what the curve should look like, and what it means when it does not.</p>
+
+<figure>
+<svg viewBox="0 0 700 300" width="700" xmlns="http://www.w3.org/2000/svg">
+  <line x1="70" y1="40" x2="70" y2="240" stroke="#666" stroke-width="1.2"/>
+  <line x1="70" y1="240" x2="565" y2="240" stroke="#666" stroke-width="1.2"/>
+  <line x1="70" y1="40" x2="565" y2="40" stroke="#ddd" stroke-width="1"/>
+  <line x1="70" y1="140" x2="565" y2="140" stroke="#ddd" stroke-width="1"/>
+  <text x="62" y="44" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">100%</text>
+  <text x="62" y="144" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">50%</text>
+  <text x="62" y="244" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">0%</text>
+  <text x="70" y="26" font-family="Noto Sans" font-size="11" fill="#333">fraction of frames under human control</text>
+  <text x="318" y="270" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">training session</text>
+  <text x="70" y="256" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">1</text>
+  <text x="210" y="256" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">3</text>
+  <text x="350" y="256" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">5</text>
+  <text x="490" y="256" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">7</text>
+  <polyline points="70,44 140,64 210,96 280,130 350,160 420,184 490,204 560,216" fill="none" stroke="#4a8a5c" stroke-width="2.2"/>
+  <circle cx="70" cy="44" r="3.5" fill="#4a8a5c"/>
+  <circle cx="140" cy="64" r="3.5" fill="#4a8a5c"/>
+  <circle cx="210" cy="96" r="3.5" fill="#4a8a5c"/>
+  <circle cx="280" cy="130" r="3.5" fill="#4a8a5c"/>
+  <circle cx="350" cy="160" r="3.5" fill="#4a8a5c"/>
+  <circle cx="420" cy="184" r="3.5" fill="#4a8a5c"/>
+  <circle cx="490" cy="204" r="3.5" fill="#4a8a5c"/>
+  <circle cx="560" cy="216" r="3.5" fill="#4a8a5c"/>
+  <polyline points="70,46 140,50 210,44 280,52 350,46 420,50 490,46 560,50" fill="none" stroke="#b04a4a" stroke-width="2" stroke-dasharray="6,4"/>
+  <line x1="92" y1="141" x2="74" y2="52" stroke="#999" stroke-width="0.8"/>
+  <text x="88" y="152" font-family="Noto Sans" font-size="11" fill="#333">session 1 at 98% is normal</text>
+  <text x="574" y="42" font-family="Noto Sans" font-size="11" fill="#b04a4a">flat: corrections</text>
+  <text x="574" y="56" font-family="Noto Sans" font-size="11" fill="#b04a4a">are not reaching</text>
+  <text x="574" y="70" font-family="Noto Sans" font-size="11" fill="#b04a4a">the learner</text>
+  <text x="574" y="206" font-family="Noto Sans" font-size="11" fill="#4a8a5c">healthy: each</text>
+  <text x="574" y="220" font-family="Noto Sans" font-size="11" fill="#4a8a5c">session needs</text>
+  <text x="574" y="234" font-family="Noto Sans" font-size="11" fill="#4a8a5c">you less</text>
+  <text x="240" y="196" font-family="Noto Sans" font-size="11" fill="#666">steepest drop is usually sessions 2-4</text>
+</svg>
+<figcaption>Figure 13.3 &mdash; The intervention-rate curve, the single most useful plot in a human-in-the-loop run. The green curve is what success looks like: a very high starting rate, a steep drop once the first few corrections land, then a long tail. The red dashed curve is the alarm &mdash; if you are still driving 95% of the time after several sessions, suspect the data path (are intervention frames actually flagged and reaching the buffer?) before you suspect the algorithm.</figcaption>
+</figure>
+
+<p>So your 98% intervention rate on an early run is the expected starting point. On session one the policy has seen a handful of demonstrations and nothing else; of course you are driving. What matters is whether that number falls between sessions. If it does, the loop is working and your job is to keep sitting there. If it is dead flat across four or five sessions, check the plumbing before touching a hyperparameter.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+<p>Your gate is RB on the Xbox pad; Y and B label success and failure for the reward classifier. You have already met the silent failure this design invites: release RB a moment early and the pipeline logs neutral (zero) actions as though a human deliberately chose them, poisoning both buffers with "do nothing" at exactly the states that matter most. The general lesson is bigger than the bug &mdash; instrument the data path. Log the intervention flag on every frame, histogram actions by source, and alert when the neutral bin spikes. Every human-in-the-loop pipeline has a bug like this; the good ones make it visible. And do not read a high early intervention rate as failure: 98% on session one is normal.</p>
+</div>
+
+<h2>13.6 Choosing between HIL-RL and DAgger on a VLA</h2>
+
+<p>You now have two loops that share a rig, a gamepad and a diagram, and differ only in the learner. Which do you run? The answer depends on three things, none of which is "which is more advanced".</p>
+
+<p><strong>Choose HIL-RL (HIL-SERL) when</strong> you are training a small, task-specific policy from scratch; when your policy class has tractable log-probabilities, so a SAC-style actor can be updated and a critic bootstrapped; when you have a rig you can occupy for hours at a stretch and resets cheap enough for hundreds of episodes; and when success is visually obvious enough for a reward classifier to learn from a few hundred labeled frames. Your SO-101 on a fixed task satisfies all of these, which is why it is the right choice for project hil-serl.</p>
+
+<p><strong>Choose DAgger on a pretrained VLA when</strong> you start from a strong generalist prior that already almost does the task; when robot time is measured in days, so every human minute must refine the policy rather than train a critic from scratch; and &mdash; decisively &mdash; when the policy is a flow-matching model whose log-probability you cannot evaluate (Chapter 7). That last one rules out the SAC actor update HIL-SERL needs: that update requires evaluating \(\log \pi_\theta(a \mid s)\) for the entropy term and differentiating through a reparameterized sample, and a flow-matching policy gives you neither. It rules out PPO's importance ratio \(\rho_t\) too, for the same underlying reason &mdash; see Chapter 9 &mdash; but that is a separate algorithm, and the two are worth keeping apart in your head: there is no importance ratio anywhere in SAC. The update here is plain weighted behavior cloning with the weights of Section 13.4, with no critic on-robot at all.</p>
+
+<p>The LeHome real-world final is the textbook case for the second: one week of robot time, a flow-matching VLA, and no tractable density to build a policy gradient from, so Larchenko (2026) made human-gated DAgger the main real-world tactic. Chapter 15's capstone will have you make this same choice deliberately, rather than inheriting it.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+<p>DAgger was the backbone of the real-round week: <strong>471 DAgger episodes against 321 plain teleop episodes</strong>, on a bimanual rig where the leader arms continuously track the followers so a foot-pedal takeover is jump-free &mdash; no lurch when control changes hands. Per-frame quasi-advantage weights followed Section 13.4: human-correction frames highest, distant autonomous frames low, and the five seconds before each takeover ramped to zero. In simulation, by contrast, DAgger underperformed &mdash; the policy had outgrown the operator, and teleoperating through a simulator is genuinely hard &mdash; so the sim flywheel instead minimized human idle time with parallel simulators and queued hard states.</p>
+</div>
+
+<div class="box checkpoint"><div class="box-title">Checkpoint</div>
+<ul>
+<li>Explain covariate shift as a feedback loop, not merely as "the test set differs from the training set", say where the \(T^2\) in the behavior-cloning regret bound comes from, and say why a bound of 450 on a 300-step episode has gone vacuous rather than tight.</li>
+<li>State the four steps of DAgger, say why aggregating all previous rounds matters, and explain in one sentence why vanilla DAgger is impractical on a 12-DOF arm.</li>
+<li>Write down the HG-DAgger gate equation, say which frames enter the training set, and answer the multimodality objection: corrections are state-conditioned, and genuine multimodality means conflicting actions at the <em>same</em> observation. Say also what HG-DAgger gives up relative to vanilla DAgger's guarantee, and what survives the trade.</li>
+<li>Assign per-frame sampling weights to a recorded session &mdash; corrections up, clean autonomous frames at baseline, the pre-takeover window ramped to zero &mdash; and compute what fraction of a batch each bucket will claim.</li>
+<li>Explain why any loop whose training targets are human actions caps the policy at the demonstrator's skill, and why reward is what lifts the cap &mdash; with HIL-SERL's 1.8&times; execution speed as the concrete evidence.</li>
+<li>Name HIL-SERL's four ingredients, explain symmetric sampling and why the 50/50 split is fixed rather than proportional, read an intervention-rate curve well enough to distinguish "learning" from "the corrections are not reaching the learner", and decide for a given policy and rig whether HIL-RL or DAgger-on-a-VLA is the right loop &mdash; justified by log-probability tractability, robot time, and whether a critic can be trained on-robot.</li>
+</ul>
+</div>
+
+<p><strong>Where to go deeper.</strong> Read Ross et al. (2011) for the DAgger analysis and Kelly et al. (2019) for HG-DAgger; between them they contain everything in Sections 13.2 and 13.3. Luo et al. (2024) documents the exact HIL-SERL pipeline you are running, and is worth reading with your own config file open beside it. Larchenko (2026), Section 9, details the bimanual DAgger rig and its intervention weighting in the real round. Appendix A sequences those four; the quadratic-regret setup (Ross and Bagnell, 2010) and RLPD (Ball et al., 2023) are optional background beyond the guide.</p>
+
+</section>

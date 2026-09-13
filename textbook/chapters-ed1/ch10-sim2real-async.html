@@ -1,0 +1,180 @@
+<section class="chapter" id="ch10">
+<h1>Chapter 10 &mdash; Simulation, sim-to-real, and the asynchronous RL loop</h1>
+
+<p>The previous chapters treated data as given: transitions arrive, advantages get computed, the policy improves. This chapter is about the factory that produces the transitions. It has three rooms: the simulator, where most robot RL data is actually made; the bridge between simulation and reality, which decides whether any of it transfers; and the asynchronous training loop that keeps the factory running around the clock. Figure 10.1 shows the machine we are building toward.</p>
+
+<figure>
+<svg viewBox="0 0 700 280" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch10f1ab" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#4878a8"/></marker>
+    <marker id="ch10f1ao" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#b0703a"/></marker>
+    <marker id="ch10f1ag" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#666"/></marker>
+  </defs>
+  <!-- Learner -->
+  <rect x="25" y="85" width="135" height="78" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+  <text x="92" y="112" font-family="Noto Sans" font-size="13" font-weight="bold" fill="#333" text-anchor="middle">Learner</text>
+  <text x="92" y="130" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">one GPU, samples</text>
+  <text x="92" y="144" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">the training mix</text>
+  <!-- Hub -->
+  <rect x="285" y="80" width="130" height="88" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+  <text x="350" y="112" font-family="Noto Sans" font-size="13" font-weight="bold" fill="#333" text-anchor="middle">Hugging Face</text>
+  <text x="350" y="129" font-family="Noto Sans" font-size="13" font-weight="bold" fill="#333" text-anchor="middle">Hub</text>
+  <text x="350" y="147" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">storage bus</text>
+  <!-- Workers (stacked) -->
+  <rect x="548" y="74" width="130" height="76" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <rect x="541" y="81" width="130" height="76" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <rect x="534" y="88" width="130" height="76" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+  <text x="599" y="113" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333" text-anchor="middle">Rollout workers</text>
+  <text x="599" y="130" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">any number, preemptible</text>
+  <text x="599" y="144" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">Isaac Sim / MuJoCo</text>
+  <!-- Evaluator -->
+  <rect x="288" y="205" width="124" height="52" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+  <text x="350" y="227" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333" text-anchor="middle">Evaluator</text>
+  <text x="350" y="244" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">unbiased success rate</text>
+  <!-- Arrows learner/hub -->
+  <line x1="162" y1="103" x2="282" y2="103" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch10f1ab)"/>
+  <text x="222" y="96" font-family="Noto Sans" font-size="10" fill="#4878a8" text-anchor="middle">checkpoints</text>
+  <line x1="282" y1="142" x2="162" y2="142" stroke="#b0703a" stroke-width="1.5" marker-end="url(#ch10f1ao)"/>
+  <text x="222" y="158" font-family="Noto Sans" font-size="10" fill="#b0703a" text-anchor="middle">rollout datasets</text>
+  <!-- Arrows hub/workers -->
+  <line x1="418" y1="103" x2="531" y2="103" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch10f1ab)"/>
+  <text x="474" y="96" font-family="Noto Sans" font-size="10" fill="#4878a8" text-anchor="middle">checkpoints</text>
+  <line x1="531" y1="142" x2="418" y2="142" stroke="#b0703a" stroke-width="1.5" marker-end="url(#ch10f1ao)"/>
+  <text x="474" y="158" font-family="Noto Sans" font-size="10" fill="#b0703a" text-anchor="middle">episodes</text>
+  <!-- Arrows hub/evaluator -->
+  <line x1="330" y1="171" x2="330" y2="202" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch10f1ab)"/>
+  <text x="322" y="190" font-family="Noto Sans" font-size="10" fill="#4878a8" text-anchor="end">checkpoints</text>
+  <line x1="372" y1="202" x2="372" y2="171" stroke="#666" stroke-width="1.5" marker-end="url(#ch10f1ag)"/>
+  <text x="380" y="190" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="start">metrics</text>
+  <text x="350" y="274" font-family="Noto Sans" font-size="10.5" fill="#666" text-anchor="middle">no shared clock: each component pulls the newest artifact whenever it is ready</text>
+</svg>
+<figcaption>Figure 10.1 &mdash; The asynchronous RL loop. A learner, K rollout workers, and an evaluator communicate only through a storage hub: checkpoints flow outward, datasets and metrics flow back, and no component ever waits on another.</figcaption>
+</figure>
+
+<h2>10.1 Why simulate at all</h2>
+
+<p>Run the tally for a real robot. Every episode ends with a human resetting the scene &mdash; you know this from hil-serl, where you are the reset mechanism. Wall-clock speed is fixed at 1&times;. One robot means one data stream. The reward signal needs a learned success classifier or a human finger on a button (Chapter 9). And an exploring policy can strip gears, knock over objects, or hurt someone. Simulation inverts every line of that tally.</p>
+
+<p><strong>Resets</strong> become a function call &mdash; and, more powerfully, you can save a full physics snapshot at any timestep and restore it later, which Section 10.5 turns into a curriculum device. <strong>Speed and parallelism</strong>: a simulator can run faster than real time, and K instances give K independent streams; when an episode costs ~30 seconds of wall-clock even in sim, as garment folding does in Isaac Sim (a ~600-step, 20-second control horizon at 30 Hz, per Chapter 7, plus reset), parallelism is where throughput actually comes from. <strong>Ground-truth state</strong>: the simulator knows the true state \(s\), not merely the observation \(o\). Chapter 7 built dense rewards out of keypoint distances; on hardware those keypoints must be estimated or replaced by a classifier, but in sim they are a query. The LeHome success checker is literally a conjunction of pairwise keypoint-distance thresholds, evaluated exactly on every frame, for free. That is what &ldquo;the simulator gives you keypoints&rdquo; means: the whole reward-engineering toolkit of Chapter 7 &mdash; intermediate checkpoints, potential shaping on completion, tightness bonuses &mdash; becomes cheap because its inputs are exact. <strong>Safety</strong>: the policy can flail through millions of bad actions without consequence.</p>
+
+<p>The stack landscape in one paragraph. <strong>MuJoCo</strong> (Todorov et al., 2012) is the fast, CPU-friendly rigid-body workhorse &mdash; it is what you ported the rover to, and it remains the default for contact-rich rigid manipulation and for anything that must run on a laptop. <strong>NVIDIA Isaac Sim</strong>, with the Isaac Lab RL layer on top, trades setup simplicity for GPU-parallel physics, photorealistic rendering, and deformable bodies &mdash; cloth in particular, which is why LeHome&rsquo;s garments live there. Genesis, SAPIEN/ManiSkill, and PyBullet fill other niches. Choose by the physics your task cannot fake (deformables force your hand) and by how much rendering fidelity your observations require.</p>
+
+<h2>10.2 Two levers for any domain gap</h2>
+
+<p>Every sim-to-real problem is a <strong>domain gap</strong>: the joint distribution over observations and dynamics seen in training is not the one seen at deployment. Everything you can do about it is one of two levers (Figure 10.2). Lever one: <strong>make the domains more similar</strong>. This is <strong>system identification</strong> &mdash; measure real masses, friction, motor response, and control latency, then set the sim parameters to match &mdash; plus camera alignment (pose, intrinsics, exposure) and asset matching (scan or rebuild the actual objects). Lever two: <strong>make the training data more diverse</strong>. This is <strong>domain randomization</strong> (Tobin et al., 2017; Peng et al., 2018): randomize colors, patterns, textures, lighting, camera pose and intrinsics, and physics parameters, and stack heavy image augmentation on top. Formally, randomization replaces one MDP with a distribution over MDPs indexed by randomization parameters \(\xi\):</p>
+
+<div class="key-eq">
+\[
+J(\theta) \;=\; \mathbb{E}_{\xi \sim p(\xi)}\;\mathbb{E}_{\tau \sim p_{\xi}(\tau \mid \pi_\theta)}\big[\,G_0\,\big],
+\qquad G_0 = \textstyle\sum_{t} \gamma^{t} r_t .
+\]
+</div>
+
+<p>A policy that must succeed for every \(\xi\) it will ever meet is forced to rely on features that are invariant across the randomization &mdash; and if the ranges are wide enough, the real world becomes just another sample of \(\xi\).</p>
+
+<p>When does each lever pay off? Align when the mismatch is measurable and cheap to fix: a camera three centimeters off, an action scale wrong by a constant factor, forty milliseconds of unmodeled latency. Fixing these removes the gap exactly and costs no policy capacity. Diversify when the mismatch is unmeasurable or high-dimensional: fabric dynamics, room lighting, texture and wear. Diversification is not free &mdash; the policy is solving a harder problem, so peak performance in any single domain drops. The working rule: align what you can measure, randomize what you cannot. You have already pulled both levers: the rover&rsquo;s MuJoCo port randomized dynamics parameters before the 3D-printed rover ever ran the policy. LeHome scales the same lever up &mdash; garment texture swaps, LAB color remaps, camera pose and focal-length jitter, dome-light changes at the episode level, color tints per step.</p>
+
+<figure>
+<svg viewBox="0 0 700 235" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch10f2ab" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#4878a8"/></marker>
+    <marker id="ch10f2ao" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#b0703a"/></marker>
+  </defs>
+  <line x1="350" y1="15" x2="350" y2="220" stroke="#ccc" stroke-dasharray="4 4"/>
+  <!-- Left: align -->
+  <text x="170" y="26" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333" text-anchor="middle">Lever 1 &#8212; align: move the domains together</text>
+  <ellipse cx="105" cy="125" rx="62" ry="42" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+  <text x="105" y="129" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#4878a8" text-anchor="middle">sim</text>
+  <ellipse cx="238" cy="138" rx="62" ry="42" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+  <text x="238" y="142" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#b0703a" text-anchor="middle">real</text>
+  <line x1="148" y1="112" x2="184" y2="118" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch10f2ab)"/>
+  <line x1="196" y1="150" x2="160" y2="144" stroke="#b0703a" stroke-width="1.5" marker-end="url(#ch10f2ao)"/>
+  <text x="170" y="207" font-family="Noto Sans" font-size="10.5" fill="#666" text-anchor="middle">system ID &#183; camera alignment &#183; asset matching</text>
+  <!-- Right: diversify -->
+  <text x="525" y="26" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333" text-anchor="middle">Lever 2 &#8212; diversify: widen sim over real</text>
+  <ellipse cx="525" cy="132" rx="140" ry="70" fill="#eaf1f8" fill-opacity="0.35" stroke="#4878a8" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="525" y="80" font-family="Noto Sans" font-size="10.5" fill="#4878a8" text-anchor="middle">randomized sim, &#958; ~ p(&#958;)</text>
+  <ellipse cx="468" cy="140" rx="46" ry="30" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+  <text x="468" y="144" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#4878a8" text-anchor="middle">sim</text>
+  <ellipse cx="586" cy="146" rx="46" ry="30" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+  <text x="586" y="150" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#b0703a" text-anchor="middle">real</text>
+  <line x1="452" y1="112" x2="435" y2="92" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch10f2ab)"/>
+  <line x1="428" y1="130" x2="402" y2="120" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch10f2ab)"/>
+  <line x1="438" y1="162" x2="415" y2="180" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch10f2ab)"/>
+  <text x="525" y="222" font-family="Noto Sans" font-size="10.5" fill="#666" text-anchor="middle">randomization widens training until real is inside it</text>
+</svg>
+<figcaption>Figure 10.2 &mdash; The two levers for any domain gap: push the sim and real distributions together (align), or widen the training distribution until it covers the deployment one (diversify).</figcaption>
+</figure>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Randomize too hard and the task becomes unsolvable &mdash; you saw this on the rover when overly wide dynamics ranges made some sampled worlds effectively undrivable. Audit solvability: run a scripted expert (or replay a known success) under each freshly sampled \(\xi\); if the expert&rsquo;s success rate collapses, the range is teaching noise, not robustness. Widen randomization only as fast as some policy can still win.</div>
+
+<h2>10.3 Real-to-real: the forgotten gap</h2>
+
+<p>Sim-to-real is only half the story, because &ldquo;real&rdquo; is not one domain either. Cheap robots vary per unit: two SO-101s differ in servo offsets, backlash, and cable tension; cameras and 3D-printed mounts differ by millimeters and by color response. In any competition or deployment, <strong>the evaluation rig is not your rig</strong>. Larchenko faced the full chain &mdash; policies trained in Isaac Sim, fine-tuned on his own bimanual rig, evaluated on the organizers&rsquo; rig that he never touched &mdash; and only on assembling his physical setup discovered that the garments were kids&rsquo;-sized (Larchenko, 2026).</p>
+
+<p>Three tools close this gap. First, <strong>alignment tooling</strong>: a camera-overlay tool that drives the robot to a dataset frame&rsquo;s recorded joint state and overlays the live camera image on the stored frame, so you can nudge mounts until the two images coincide; the same trick overlays sim renders on real views. It worked well enough that the organizers adopted it to calibrate the official evaluation arenas &mdash; the align lever, applied real-to-real. Second, <strong>per-source speed factors</strong>: datasets recorded on different rigs by different operators move at different tempos, and a policy trained on the raw mixture inherits an incoherent one. The fix is to resample each source&rsquo;s time axis to a common motion intensity &mdash; in the LeHome real mix, organizer demonstrations at 1.0&times;, home teleoperation sped up 1.5&times;, DAgger corrections 2.0&times;, and sim data slowed to 0.65&times;. Third, <strong>format conversion</strong>: sim success replays were rendered into the real data format &mdash; same camera layout, resolution, and normalization &mdash; so sim experience could sit in the same training mix as real episodes. That mix used three buckets with fixed batch shares: organizer demonstrations 60%, own teleop plus DAgger 30%, converted sim replays 10%. The recipe also started from a late-but-not-latest checkpoint (the latest being the most sim-overfit) and stripped the sim-privileged machinery &mdash; the keypoint head (the cheap world-model stand-in of Chapter 5), advantage conditioning, guidance &mdash; and froze the success-style heads, since none of their targets has ground truth on hardware.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Sim-format data can leak sim-only visual cues: the policy learns &ldquo;this looks like sim, act like the sim policy&rdquo; and splits into two modes. Larchenko&rsquo;s auxiliary heads could even distinguish two image-resize pipelines (640&rarr;224 versus 640&rarr;320&rarr;224), and success dropped accordingly. Keep the sim-format share small (10% in LeHome), augment it hardest, and check that behavior does not change when you restyle the input.</div>
+
+<h2>10.4 The asynchronous RL loop</h2>
+
+<p>Chapter 3&rsquo;s PPO is a lockstep algorithm. The importance ratio \(\rho_t(\theta) = \pi_\theta(a_t|s_t)/\pi_{\theta_{old}}(a_t|s_t)\) is meaningful only while \(\theta\) stays near \(\theta_{old}\), so PPO must alternate: freeze \(\theta_{old}\), collect a batch with it, take a few clipped epochs, discard the batch. Collection and learning are welded together, every worker must run the current policy, and everything waits at the barrier. Chapter 4&rsquo;s AWR family removes the weld: the update is weighted maximum likelihood on whatever data exists, with weights from advantages you can recompute at any time. Data from a checkpoint three hours old is still usable &mdash; mildly off-policy, and priced in. <strong>Off-policy tolerance is what makes asynchrony possible.</strong></p>
+
+<p>The loop in Figure 10.1 has three roles. The <strong>learner</strong> (one GPU) cycles: download new rollouts, recompute advantages over all datasets, train on the sampled mix, upload a checkpoint. The <strong>rollout workers</strong> pull the latest checkpoint &mdash; whatever it happens to be &mdash; run simulator instances behind a shared stateless policy server, and upload finished episodes as datasets. The <strong>evaluator</strong> runs unbiased episodes under fixed conditions and publishes success rates: the only numbers anyone is allowed to believe. All three communicate exclusively through a storage hub &mdash; in Larchenko&rsquo;s system, literally the Hugging Face Hub (there the evaluator was not a separate process: the unbiased random/full/curriculum rollouts doubled as the evaluation stream, and a manual DAgger station formed the third worker), with background sync daemons and no synchronization barrier anywhere.</p>
+
+<pre class="code"># learner (one GPU)
+while True:
+    hub.download_new_rollout_datasets()
+    recompute_advantages(all_datasets)        # Chapter 7 blend
+    for _ in range(1000):
+        train_step(sample_mix())              # per-source shares
+    hub.upload_checkpoint()   # once per cycle (real system: every ~500 steps via background sync)
+
+# rollout worker (any number, preemptible)
+while True:
+    ckpt = hub.latest_checkpoint()            # may be minutes old
+    eps  = run_episodes(ckpt, strategy=pick())  # Section 10.5
+    attach_values(eps)                        # frozen at collection
+    hub.upload_dataset(eps)</pre>
+
+<p>The payoff is operational. Every component <strong>scales independently</strong>: more throughput means starting another rollout machine, with zero coordination. Every component <strong>dies independently</strong>: workers can run on spot instances, and a preemption costs throughput but never correctness, while the learner restarts from its last uploaded checkpoint. And because datasets are immutable artifacts rather than transient queues, each episode stores the values predicted at collection time &mdash; exactly the stale-value anchor Chapter 7&rsquo;s advantage blend consumes.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+You already run this pattern at N = 1. HIL-SERL&rsquo;s actor and learner are two processes streaming transitions one way and parameters the other (Luo et al., 2024). The async loop swaps that live link for a storage bus of immutable artifacts, so components need not even be online at the same time. When you scale beyond one SO-101 or one sim instance in Chapter 11, you change the transport, not the architecture.</div>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+One H200 learner uploaded a checkpoint roughly every 40 minutes; rollout machines each ran 3&ndash;5 Isaac Sim instances behind one stateless policy server; a manual DAgger station was a third, human-paced worker. Everything flowed through the Hugging Face Hub; datasets were never merged, just sampled with rollout-dataset shares decaying 0.98&times; per iteration (BC share fixed). Over ~140 sessions this produced ~12,500 kept episodes (~4.3M frames) &mdash; with occasional checkpoint rollbacks to escape local optima.</div>
+
+<h2>10.5 Rollout collection as a curriculum</h2>
+
+<p>Once workers can restore snapshots and choose tasks, collection becomes a curriculum problem: which episodes are worth the ~30 wall-clock seconds (rollout plus reset) they cost? The guiding fact comes from Chapter 7&rsquo;s group-baselined advantages. With a binary outcome and an empirical per-task baseline, an episode&rsquo;s advantage is one of two values, and the learning signal available from a task with success probability \(\hat{p}_{succ}\) scales with their spread:</p>
+
+<div class="key-eq">
+\[
+\hat{A}_{\mathrm{ep}} \in \{\,1-\hat{p}_{succ},\; -\hat{p}_{succ}\,\},
+\qquad
+\operatorname{std}\big(\hat{A}_{\mathrm{ep}}\big) = \sqrt{\hat{p}_{succ}\,(1-\hat{p}_{succ})}\,,
+\]
+</div>
+
+<p>which is maximized at \(\hat{p}_{succ} = \tfrac{1}{2}\) and vanishes at both ends. A garment the policy always folds teaches nothing; one it never folds teaches nothing either; the frontier carries the gradient. Sun et al. (2025) make this precise for GRPO-style RL &mdash; targeting moderate-difficulty items and replaying recent rollouts cut fine-tuning time by 23&ndash;62% &mdash; and LeHome&rsquo;s <strong>curriculum</strong> strategy generalizes it: prefer task instances whose running success rate sits near a configurable target.</p>
+
+<p>Physics snapshots buy sharper strategies. <strong>Success replay</strong>: restore an early snapshot of a successful episode and re-run it under much heavier randomization, keeping the successes &mdash; a machine for manufacturing positives, with snapshots saved with probability \(1-\hat{p}_{succ}\) so hard tasks are overrepresented. <strong>Semi-success replay</strong>: restore a near-success state by replaying the old actions open-loop, then hand control to the live policy &mdash; endgame practice on partial-credit rollouts that almost worked. <strong>Hard mining</strong>: snapshot the state whenever the smoothed success-head prediction drops sharply from its running maximum (Chapter 5&rsquo;s auxiliary value head moonlighting as a difficulty detector), then restore those failure precursors for targeted practice. Two hygiene rules bind it together. Only unbiased strategies (random, full, curriculum) may update success statistics &mdash; replayed episodes are hopelessly biased samples. And the buffer must stay fresh: each rollout dataset&rsquo;s sampling share decays per iteration, and as a dataset ages its collection-time value predictions drift off-policy &mdash; which is precisely why Chapter 7 fades stale GAE advantages toward the outcome-only segment advantage as the share falls.</p>
+
+<p><strong>Worked example: one training mix.</strong> Suppose the learner draws batches of 200 frames from four buckets:</p>
+
+<table>
+<tr><th>Bucket</th><th>Share</th><th>Frames</th><th>What it contributes</th></tr>
+<tr><td>Success replays</td><td>40%</td><td>80</td><td>Dense positive supervision; keeps \(\hat{p}_{succ}\)-style heads calibrated; heavy augmentation turns wins into robustness data</td></tr>
+<tr><td>Semi-success replays</td><td>20%</td><td>40</td><td>Endgame practice at states the unaided policy rarely reaches</td></tr>
+<tr><td>Fresh on-policy</td><td>25%</td><td>50</td><td>The only unbiased view of the current policy; feeds curriculum statistics and anchors the advantage blend</td></tr>
+<tr><td>DAgger corrections</td><td>15%</td><td>30</td><td>Human labels on the failure boundary (Chapter 9); highest value per frame, scarcest supply</td></tr>
+</table>
+
+<p>Watch what happens if the replay buckets creep upward &mdash; say success replays to 60%. The mix drifts toward behavior cloning of a past self: \(\hat{p}_{succ}\) estimates go stale, curriculum targets are computed against the wrong policy, and measured improvement stalls even while training loss falls. The shares are a knob you audit, not a constant you set once.</p>
+
+<p><strong>Where to go deeper.</strong> Sun et al. (2025) is the difficulty-targeted selection paper behind Section 10.5, and Larchenko (2026), sections 2&ndash;3 and 9, documents the Hub-based flywheel, the rollout strategies, and the one-week sim-to-real sprint in engineering detail &mdash; Appendix A places both in reading order. The canonical domain-randomization papers &mdash; Tobin et al. (2017), Peng et al. (2018), and OpenAI et al. (2019) at its automated extreme &mdash; are optional context beyond the guide.</p>
+
+</section>

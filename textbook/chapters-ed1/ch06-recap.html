@@ -1,0 +1,168 @@
+<section class="chapter" id="ch06">
+<h1>Chapter 6 &mdash; Learning by conditioning: RECAP</h1>
+
+<h2>6.1 Tell the policy the advantage</h2>
+
+<p>Chapter 4 improved a policy by <em>reweighting</em>: clone everything, but louder where the advantage is high. The AWR weight \( w_i = \exp(\hat{A}_i/\beta) \) does exactly that &mdash; and it has a hidden cost. Data far below average gets weight near zero, so your failures are effectively discarded. Yet failures carry information: what a stalled fold looks like, which grasp slips, where the policy hesitates. Worse, weighting is invisible to the model &mdash; the policy just sees good behavior more often; it is never told <em>which</em> behavior was good.</p>
+
+<p>The conditioning idea flips this. Instead of reweighting the data, <em>annotate</em> it. Train an <strong>advantage-conditioned policy</strong> \( \pi_\theta(a_{t:t+H} \mid o_t, c) \), where the extra input \(c\) encodes the advantage of the data the sample came from &mdash; a binary indicator, a small set of bins, or a learned token. Training is now plain supervised learning on <em>all</em> the data at equal weight: successes teach the model what \(c = {+}\) behavior looks like, failures teach it what \(c = {-}\) behavior looks like, and by contrast each sharpens the other. Nothing is wasted (Figure 6.1). The standard label is an indicator thresholded at \(\epsilon_A\) (not the PPO clip \(\epsilon\) of Chapter 3), trained jointly with an unconditioned branch:</p>
+
+<div class="key-eq">
+\[ c_i \;=\; \mathbb{1}\!\left(\hat{A}_i \gt \epsilon_A\right), \qquad
+\min_\theta \; \mathbb{E}_{(o_i,\,a_i,\,c_i)\sim D}\Big[ -\log \pi_\theta(a_i \mid o_i) \;-\; \eta \, \log \pi_\theta(a_i \mid o_i, c_i) \Big] \]
+</div>
+
+<p>with \(a_i\) a chunk \(a_{t:t+H}\), \(\hat{A}_i\) its estimated advantage, and \(\eta\) a mixing weight. At inference you fix \(c = {+}\) and sample. You are asking the model a counterfactual query: <em>&ldquo;in this state, act the way the above-threshold data acted.&rdquo;</em> Because the model has seen both conditionals, the \(c={+}\) distribution concentrates on the better modes of the data (Figure 6.2). Improvement happens at query time, not in the loss. This is sometimes called <strong>upside-down RL</strong>: turn reinforcement learning into supervised learning plus a well-chosen question.</p>
+
+<p>Why does this matter so much for the generative policies of Chapter 5? Flow-matching policies have no tractable log-probability, so PPO-style gradients &mdash; which need \(\rho_t(\theta)\) and push probability <em>away</em> from bad actions &mdash; are unavailable, and approximating them tends to shove predictions off the narrow manifold of coherent chunks. Conditioning asks nothing of the loss: for a flow-matching policy, each \(-\log \pi_\theta\) term in the objective above stands in for the tractable surrogate you already train &mdash; the flow-matching regression of Chapter 5 &mdash; so intractability rules out ratio-based gradients, not maximum-likelihood-style surrogates. The regression target is untouched; \(c\) simply joins \(o\) as an input to \(v_\theta(a^u, u, o, c)\). The honest caveat is the same as AWR&rsquo;s: conditioning redistributes probability mass within the support of the data. It selects; it does not explore. To keep improving, you re-collect rollouts with the improved policy and iterate.</p>
+
+<figure>
+<svg viewBox="0 0 690 270" width="690" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch06f1arr" markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#666"/>
+    </marker>
+  </defs>
+  <text x="107" y="26" font-family="Noto Sans" font-size="12" font-weight="600" fill="#333" text-anchor="middle">replay buffer (all data)</text>
+  <!-- chunk rows -->
+  <rect x="20" y="40" width="120" height="24" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="80" y="56" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">chunk 1: A = +1.8</text>
+  <rect x="150" y="42" width="44" height="20" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="172" y="56" font-family="Noto Sans" font-size="11" fill="#4a8a5c" text-anchor="middle">c = +</text>
+
+  <rect x="20" y="74" width="120" height="24" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="80" y="90" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">chunk 2: A = +0.6</text>
+  <rect x="150" y="76" width="44" height="20" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="172" y="90" font-family="Noto Sans" font-size="11" fill="#4a8a5c" text-anchor="middle">c = +</text>
+
+  <rect x="20" y="108" width="120" height="24" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="80" y="124" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">chunk 3: A = +0.1</text>
+  <rect x="150" y="110" width="44" height="20" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="172" y="124" font-family="Noto Sans" font-size="11" fill="#4a8a5c" text-anchor="middle">c = +</text>
+
+  <rect x="20" y="142" width="120" height="24" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <text x="80" y="158" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">chunk 4: A = &#8722;0.2</text>
+  <rect x="150" y="144" width="44" height="20" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <text x="172" y="158" font-family="Noto Sans" font-size="11" fill="#b0703a" text-anchor="middle">c = &#8722;</text>
+
+  <rect x="20" y="176" width="120" height="24" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <text x="80" y="192" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">chunk 5: A = &#8722;0.9</text>
+  <rect x="150" y="178" width="44" height="20" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <text x="172" y="192" font-family="Noto Sans" font-size="11" fill="#b0703a" text-anchor="middle">c = &#8722;</text>
+
+  <rect x="20" y="210" width="120" height="24" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="80" y="226" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">chunk 6: A = +0.3</text>
+  <rect x="150" y="212" width="44" height="20" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="172" y="226" font-family="Noto Sans" font-size="11" fill="#4a8a5c" text-anchor="middle">c = +</text>
+
+  <!-- arrows buffer -> critic -->
+  <line x1="200" y1="64" x2="236" y2="112" stroke="#666" marker-end="url(#ch06f1arr)"/>
+  <line x1="200" y1="127" x2="236" y2="127" stroke="#666" marker-end="url(#ch06f1arr)"/>
+  <line x1="200" y1="192" x2="236" y2="143" stroke="#666" marker-end="url(#ch06f1arr)"/>
+
+  <!-- critic / labeling box -->
+  <rect x="240" y="94" width="150" height="66" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="315" y="115" font-family="Noto Sans" font-size="12" font-weight="600" fill="#333" text-anchor="middle">critic labels chunks</text>
+  <text x="315" y="133" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">A from Chapter 7</text>
+  <text x="315" y="150" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">c = 1(A &gt; &#949;<tspan font-size="8" dy="3">A</tspan><tspan dy="-3">)</tspan></text>
+
+  <!-- arrow critic -> policy -->
+  <line x1="390" y1="127" x2="464" y2="127" stroke="#666" marker-end="url(#ch06f1arr)"/>
+  <text x="428" y="112" font-family="Noto Sans" font-size="11" fill="#666" text-anchor="middle">(o, c, a) pairs</text>
+
+  <!-- policy box -->
+  <rect x="470" y="84" width="200" height="86" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="570" y="108" font-family="Noto Sans" font-size="12" font-weight="600" fill="#333" text-anchor="middle">one conditioned policy</text>
+  <text x="570" y="128" font-family="Noto Sans" font-size="12" fill="#333" text-anchor="middle">&#960;(a | o, c)</text>
+  <text x="570" y="148" font-family="Noto Sans" font-size="11" fill="#666" text-anchor="middle">trained on all chunks,</text>
+  <text x="570" y="162" font-family="Noto Sans" font-size="11" fill="#666" text-anchor="middle">equal weight</text>
+
+  <text x="570" y="196" font-family="Noto Sans" font-size="11" fill="#b04a4a" text-anchor="middle">condition dropout: c &#8594; &#8709;</text>
+  <text x="570" y="212" font-family="Noto Sans" font-size="11" fill="#b04a4a" text-anchor="middle">~30% of samples (for CFG, Ch. 8)</text>
+</svg>
+<figcaption>Figure 6.1 &mdash; Training by conditioning. Every chunk in the buffer &mdash; successes and failures alike &mdash; gets an advantage label from the critic and feeds the same policy. The label is an input, not a weight; the numbers shown are the worked example of Section 6.4.</figcaption>
+</figure>
+
+<h2>6.2 Where it comes from: Pi*0.6 and RECAP</h2>
+
+<p>The method is the backbone of Physical Intelligence&rsquo;s <strong>Pi*0.6</strong> (Physical Intelligence, 2025b), whose recipe is called <strong>RECAP</strong>: <em>RL with Experience and Corrections via Advantage-conditioned Policies</em>. The model itself is the Pi0.5 architecture of Chapter 5 scaled up &mdash; a Gemma 3 4B vision-language backbone with an 860M-parameter flow-matching action expert &mdash; plus one new input: the advantage indicator, inserted literally as a text token, &ldquo;Advantage: positive&rdquo; or &ldquo;Advantage: negative.&rdquo;</p>
+
+<p>The value function is a separate, smaller model: a 670M-parameter Gemma 3 VLM trained as a <em>distributional</em> critic, predicting a categorical distribution \( p_\phi(V \mid o_t, \ell) \) over 201 discretized value bins with a cross-entropy loss against the Monte Carlo return-to-go of each episode (no bootstrapping; \(\ell\) is the task command). Advantages derived from this critic are binarized with a per-task threshold \(\epsilon_A\) (the paper writes \(\epsilon_\ell\)), set at the 30th percentile of the critic&rsquo;s outputs for that task &mdash; which keeps the fraction of negative labels roughly stable as the critic&rsquo;s scale drifts. The policy is trained with the joint conditioned-plus-unconditioned objective shown above.</p>
+
+<p>Three data streams feed one per-task dataset. <em>Demonstrations</em> are assumed good: forced \(c = {+}\). <em>On-policy autonomous rollouts</em> get labels computed from the critic &mdash; this is where failures enter and earn their keep. <em>Expert teleoperated corrections</em> &mdash; interventions during autonomous execution, exactly the RB-takeover pattern you know from HIL-SERL (Chapter 9) &mdash; are forced \(c = {+}\): the expert&rsquo;s fix is presumed advantageous. The pipeline runs in stages: offline-RL pre-training of critic and policy on the multi-task demo corpus, then repeatable task-specific iterations &mdash; fine-tune critic, fine-tune policy, deploy under expert monitoring, fold new rollouts and corrections back in, repeat.</p>
+
+<p>The headline numbers justify the machinery: more than double the task throughput (successful completions per hour) on the hardest laundry items and on espresso making, failure rates roughly halved, success in the 90%+ range on most tasks, a 13-hour uninterrupted autonomous espresso run, and doubled box-assembly throughput after two iterations.</p>
+
+<h2>6.3 Family resemblances</h2>
+
+<p><strong>Return-conditioned policies.</strong> Conditioning on outcomes and then querying the good outcome is the upside-down RL and Decision Transformer lineage (Srivastava et al., 2019; Kumar et al., 2019; Chen et al., 2021), which conditioned on return-to-go \(G_t\). RECAP&rsquo;s refinement is to condition on <em>advantage</em> instead: raw return conflates action quality with state difficulty (a mediocre action from an easy state outscores a brilliant recovery from a bad one), whereas \(\hat{A}\) is state-relative &mdash; the label means &ldquo;better than typical <em>from here</em>.&rdquo; Binarizing at a percentile additionally shrugs off critic miscalibration.</p>
+
+<p><strong>AWR versus RECAP.</strong> Weighting moves the training distribution; conditioning keeps the distribution and moves the query. They are complementary and combinable: nothing stops you from sampling data with probability proportional to \(\exp(\hat{A}_i/\beta)\) <em>and</em> attaching an advantage label to whatever gets sampled. Larchenko&rsquo;s LeHome solution does exactly both &mdash; AWR implemented through the data sampler (Chapter 4) plus RECAP-style conditioning on top. Weighting biases what the model practices; conditioning hands you a control knob at inference.</p>
+
+<p><strong>Classifier-free guidance.</strong> Because \(c\) is just an input, you can drop it: during training, replace \(c\) with a neutral null token on a fraction of samples, so the same network learns both the conditioned and unconditioned velocity fields. At inference the two can be blended and <em>extrapolated</em> past the positive conditional with a guidance scale \(g \gt 1\), amplifying whatever separates high-advantage behavior from the rest &mdash; classifier-free guidance (Ho and Salimans, 2022), transplanted from image diffusion. Chapter 8 derives the guided velocity field and treats \(g\) as an inference-time knob; Pi*0.6 runs the same extrapolation but anchors it at the negative conditional \(v_\theta(a^u, u, o, c{=}{-})\) rather than a null token &mdash; &ldquo;steering toward actions the model learned were improvements.&rdquo; The prerequisite is set <em>now</em>, at training time: no condition dropout, no guidance later.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+Larchenko implements the conditioning not as text bins but as a single gated learned advantage token in its own attention group, plus an advantage vector injected through AdaRMS conditioning (adaptive RMS-norm &mdash; per-layer normalization modulated by a conditioning vector). Gating doubles as dropout: chunks with \(\hat{A} \lt 0\) always get the neutral token; positive chunks are masked stochastically, with neutral probability ramping from 0.5 at \(\hat{A}=0\) down to 0.1 at \(\hat{A}\ge 2\). That stochastic masking is what unlocks CFG at inference &mdash; where his bandit drove \(g\) to a startling 7&ndash;9.</div>
+
+<h2>6.4 Practical mechanics and a worked example</h2>
+
+<p>Turning this into a working pipeline takes four steps. First, <em>score every chunk in the buffer</em>: each stored chunk needs an \(\hat{A}_i\) from your critic &mdash; Chapter 7 builds that estimator (success-probability heads, damped baselines \(\alpha V\), GAE over shaped rewards); here we treat it as given. Recompute labels whenever the critic improves &mdash; Larchenko recomputes advantages over the whole rollout pool before every training iteration. Second, <em>discretize</em>: a binary indicator thresholded at a fixed percentile per task is the robust default; finer bins carry more information, but each bin sees less data and inference only ever queries the top one. Third, <em>choose a dropout rate</em>: somewhere between 10% and 50% of samples should train the unconditioned branch (Pi*0.6 gets this from its joint two-term loss; Larchenko from advantage-dependent masking). Fourth, <em>audit for leakage</em>: the label must supply information the observation does not already carry, and both labels must appear across all visually distinct slices of the data &mdash; more on this in the pitfall box.</p>
+
+<p>Here is the whole machine on a toy buffer of six chunks &mdash; the same six drawn in Figure 6.1. Sort the advantages, put the threshold at the 30th percentile (between \(-0.2\) and \(+0.1\); take \(\epsilon_A = -0.05\)), and label:</p>
+
+<pre class="code">A-hat:   +1.8  +0.6  +0.1  -0.2  -0.9  +0.3
+sorted:  -0.9  -0.2  +0.1  +0.3  +0.6  +1.8   -&gt;  eps_A = 30th pct = -0.05
+labels:    +     +     +     -     -     +        (4 positive, 2 negative)
+
+train:   (o1,+)-&gt;a1   (o2,+)-&gt;a2   (o3,+)-&gt;a3
+         (o4,-)-&gt;a4   (o5,-)-&gt;a5   (o6,+)-&gt;a6
+         + dropout copies (oi, null)-&gt;ai on ~30% of draws
+
+test:    sample a ~ pi(. | o, c=+)      # never c=-, never null
+         (unless blending with CFG     -&gt; Chapter 8)</pre>
+
+<p>Note what the threshold did: chunk 3, with a barely positive \(\hat{A}=+0.1\), and even a mildly negative chunk would land on the \(+\) side &mdash; the percentile decides, not zero. All six chunks contribute gradient; the two failures teach the \(c={-}\) conditional, and at test time the query \(c={+}\) steers sampling toward the modes the four positive chunks demonstrated, as sketched in Figure 6.2.</p>
+
+<figure>
+<svg viewBox="0 0 660 240" width="660" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch06f2arr" markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#666"/>
+    </marker>
+  </defs>
+  <!-- shaded high-advantage region -->
+  <rect x="350" y="45" width="220" height="150" rx="6" fill="#ecf5ee" opacity="0.7"/>
+  <text x="452" y="186" font-family="Noto Sans" font-size="10" fill="#4a8a5c" text-anchor="middle">high-advantage actions</text>
+
+  <!-- axis -->
+  <line x1="50" y1="195" x2="620" y2="195" stroke="#666" marker-end="url(#ch06f2arr)"/>
+  <text x="335" y="222" font-family="Noto Sans" font-size="11" fill="#666" text-anchor="middle">action (one dimension of the chunk)</text>
+
+  <!-- unconditioned mixture: bimodal, larger bump under the c=+ mode (4 of 6 chunks are positive) -->
+  <path d="M 60 194 C 110 190, 125 152, 178 152 C 228 152, 248 184, 300 176 C 358 167, 383 110, 445 110 C 507 110, 540 190, 605 194" fill="none" stroke="#4878a8" stroke-width="2"/>
+  <text x="108" y="114" font-family="Noto Sans" font-size="11" fill="#4878a8" text-anchor="middle">&#960;(a | o, &#8709;)</text>
+  <text x="108" y="129" font-family="Noto Sans" font-size="11" fill="#4878a8" text-anchor="middle">(all data)</text>
+
+  <!-- c = minus, dashed -->
+  <path d="M 60 194 C 115 190, 135 120, 190 120 C 245 120, 270 190, 330 194" fill="none" stroke="#b0703a" stroke-width="2" stroke-dasharray="5 4"/>
+  <text x="190" y="142" font-family="Noto Sans" font-size="11" fill="#b0703a" text-anchor="middle">c = &#8722;</text>
+
+  <!-- c = plus -->
+  <path d="M 290 194 C 355 190, 380 62, 445 62 C 510 62, 535 190, 600 194" fill="none" stroke="#4a8a5c" stroke-width="2.5"/>
+  <text x="447" y="48" font-family="Noto Sans" font-size="11" fill="#4a8a5c" text-anchor="middle">&#960;(a | o, c = +)</text>
+
+  <!-- shift arrow -->
+  <path d="M 235 125 C 290 82, 340 60, 393 72" fill="none" stroke="#666" marker-end="url(#ch06f2arr)"/>
+  <text x="330" y="38" font-family="Noto Sans" font-size="11" fill="#666" text-anchor="middle">condition on c = +</text>
+</svg>
+<figcaption>Figure 6.2 &mdash; Inference by conditioning. The unconditioned policy reproduces the whole data mixture; querying \(c={+}\) shifts the action distribution toward what above-threshold data did in this state. The gap between conditionals is exactly what classifier-free guidance amplifies (Chapter 8).</figcaption>
+</figure>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Two silent failures. <em>Conditioning collapse:</em> if labels correlate with something visible &mdash; one garment type mostly fails, or demos come from one camera setup &mdash; the model infers the label from pixels and ignores the token; flipping \(c\) at inference then changes nothing. Use per-task percentile thresholds and check both labels occur within every visual slice. <em>Skipping condition dropout:</em> without a trained unconditioned or negative branch there is nothing to contrast against, and CFG in Chapter 8 is dead on arrival.</div>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+Your HIL-SERL setup already produces RECAP&rsquo;s raw material: chunks, a binary success signal from the reward button, and RB-takeover corrections. A minimal experiment on the SO-101: label every chunk of successful episodes \(c={+}\), failures \(c={-}\), force \(c={+}\) on intervention frames, feed the label as one extra input to your BC policy with 30% dropout, and deploy conditioned on \(c={+}\). That is RECAP minus the critic; Chapter 7 upgrades the labels to real advantages.</div>
+
+<p><strong>Where to go deeper.</strong> The primary source is the Pi*0.6 paper (Physical Intelligence, 2025b), which is short on ceremony and precise about the critic, thresholds, and data streams; Ho and Salimans (2022) covers the guidance math picked up in Chapter 8, and Larchenko (2026), Section 4.3, documents the gated-token variant used throughout this book&rsquo;s capstone &mdash; Appendix A sequences all three. The Decision Transformer (Chen et al., 2021) and upside-down RL (Srivastava et al., 2019), which show what advantage-conditioning fixes, are optional context beyond the guide.</p>
+</section>

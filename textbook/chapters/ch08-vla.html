@@ -1,0 +1,411 @@
+<section class="chapter" id="ch08">
+<h1>Chapter 8 &mdash; Vision-language-action models</h1>
+
+<p>Chapter 7 gave you a policy that can represent anything: a flow-matching model that turns Gaussian noise into a one-second chunk of joint commands, with no averaging between modes. That solved the <em>representation</em> problem. It did nothing for the problem that decides whether a robot works in a house it has never entered.</p>
+
+<p>That problem is knowledge. A policy trained on your demonstrations knows what your demonstrations contain and nothing else. This chapter bolts it onto a model that has already read the internet. You will meet the architecture in pieces &mdash; what a vision-language model is, how tokens, attention and caches work, how actions attach, what \(\pi_0\) and \(\pi_{0.5}\) do &mdash; then one idea that matters as much: the <strong>trunk</strong>, the shared stack of weights every output hangs off, can predict how the episode is going as well as what to do next. That is a value function for free, and Chapters 10 through 12 all spend it.</p>
+
+<h2>8.1 What a VLA is for</h2>
+
+<p><strong>What we want.</strong> A policy that folds a shirt it has never seen, in a room it has never seen, when told "put the laundry away" in words the training set never used. Not a policy that folds <em>your</em> gray t-shirt on <em>your</em> table under <em>your</em> lamp. Generalization along all three axes: new objects, new scenes, new phrasings.</p>
+
+<p><strong>The obvious thing to try.</strong> Collect more demonstrations and train a bigger policy from scratch. Your rover instincts say more data, more capacity, more randomization. Take the flow-matching policy of Chapter 7, randomly initialize its vision encoder and trunk, and train it on 500 teleoperated episodes of shirt folding.</p>
+
+<p><strong>Exactly how it fails.</strong> Suppose your 500 episodes are all gray cotton t-shirts. The vision encoder learns whatever distinguishes one gray shirt configuration from another: fabric shading, the collar shadow, sleeve edges against the table. Nothing forced it to learn a general notion of "garment". Now put a red striped polo on the table. The stripes are edge patterns the encoder has never seen, so its features land somewhere arbitrary &mdash; not near "shirt lying flat", just somewhere. The expert reads them and emits an arbitrary chunk: the arm reaches for a stripe boundary as if it were a sleeve edge.</p>
+
+<p>Now the language axis. Your policy has no language input, or at best a task index. Ask it for "the sock, not the shirt" and there is no mechanism by which "sock" could mean anything: that embedding was initialized randomly and updated only by episodes where nobody said "sock". A bigger network does not fix this. The information is absent from the data.</p>
+
+<p>There is a measured version of this failure. \(\pi_{0.5}\) was trained with progressively more home environments in the mixture &mdash; 3, then 12, 22, 53, 82, 104 locations &mdash; and evaluated on following instructions about objects it had not been trained on. At the small end of that sweep, success was around 20%; at the large end, around 60% (Physical Intelligence, 2025a). The small end is roughly where your 500 episodes live.</p>
+
+<p><strong>The fix.</strong> Start from a <strong>vision-language model (VLM)</strong> &mdash; a transformer pre-trained on hundreds of millions of web images paired with text, for tasks like captioning ("a red striped polo shirt on a wooden table"), visual question answering, and object localization. Then attach an action-producing module, train it on robot data, and keep training on web data alongside. That combination is a <strong>vision-language-action model (VLA)</strong>.</p>
+
+<p><strong>Why the fix works.</strong> The captioning objective forced the pre-trained encoder to build features in which "striped polo" and "gray t-shirt" sit near each other and far from "ceramic mug", because a model that confused them would caption badly and be penalized. Those features exist before your first teleoperated episode, so your robot data only has to learn the mapping from features to motor commands. And "sock" already has a meaning wired to visual appearance.</p>
+
+<p>Be precise about the division of labor, though, because this is where people over-claim. The VLM supplies semantics and robustness; it supplies no motor skill whatsoever, since nothing on the internet tells you the joint velocities that flatten a sleeve. What it shrinks is not how much robot data you need, but how narrow that data may be.</p>
+
+<p>Before the pieces, the whole. Figure 8.1 is the thing this chapter builds. Look at it now without trying to understand it, and come back after each of the next four sections, when one more of its boxes has acquired a meaning.</p>
+
+<figure><svg viewBox="0 0 700 320" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch08f1arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#666"/></marker>
+<marker id="ch08f1arrG" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4a8a5c"/></marker>
+<marker id="ch08f1arrO" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#b0703a"/></marker>
+</defs>
+<rect x="12" y="48" width="118" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8"/><text x="71" y="65" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">scene camera</text>
+<rect x="12" y="84" width="118" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8"/><text x="71" y="101" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">wrist cameras</text>
+<rect x="12" y="120" width="118" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8"/><text x="71" y="137" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">task prompt</text>
+<line x1="130" y1="61" x2="166" y2="61" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f1arr)"/>
+<line x1="130" y1="97" x2="166" y2="97" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f1arr)"/>
+<line x1="130" y1="133" x2="166" y2="133" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f1arr)"/>
+<rect x="170" y="40" width="180" height="130" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="260" y="82" text-anchor="middle" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333">VLM backbone</text>
+<text x="260" y="102" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">vision encoder + LM</text>
+<text x="260" y="120" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">~3B params</text>
+<text x="260" y="138" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">web + robot co-training</text>
+<path d="M 350 62 C 384 62, 382 30, 414 29" fill="none" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f1arr)"/>
+<text x="382" y="50" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">low rate</text>
+<rect x="418" y="14" width="230" height="30" rx="6" fill="none" stroke="#4878a8" stroke-dasharray="4 3"/>
+<text x="533" y="33" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">subtask text: "pick up the shirt"</text>
+<line x1="533" y1="44" x2="533" y2="68" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f1arr)"/>
+<line x1="350" y1="105" x2="414" y2="105" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f1arr)"/>
+<text x="382" y="98" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">KV cache</text>
+<rect x="418" y="72" width="230" height="76" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="533" y="94" text-anchor="middle" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333">action expert</text>
+<text x="533" y="112" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">flow matching, ~300M</text>
+<text x="533" y="130" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">K = 10 Euler steps</text>
+<text x="662" y="62" text-anchor="end" font-family="Noto Sans" font-size="10" fill="#666">z ~ N(0, I)</text>
+<line x1="652" y1="66" x2="632" y2="74" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f1arr)"/>
+<line x1="533" y1="148" x2="533" y2="172" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f1arr)"/>
+<rect x="428" y="176" width="212" height="38" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+<text x="534" y="192" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">action chunk: H x 12 numbers</text>
+<text x="534" y="206" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">about 1 s of motion</text>
+<rect x="8" y="224" width="684" height="92" rx="6" fill="none" stroke="#666" stroke-dasharray="5 4"/>
+<line x1="260" y1="170" x2="75" y2="232" stroke="#4a8a5c" stroke-width="1.2" marker-end="url(#ch08f1arrG)"/>
+<line x1="260" y1="170" x2="209" y2="232" stroke="#4a8a5c" stroke-width="1.2" marker-end="url(#ch08f1arrG)"/>
+<line x1="260" y1="170" x2="343" y2="232" stroke="#4a8a5c" stroke-width="1.2" marker-end="url(#ch08f1arrG)"/>
+<line x1="260" y1="170" x2="477" y2="232" stroke="#4a8a5c" stroke-width="1.2" marker-end="url(#ch08f1arrG)"/>
+<path d="M 650 120 C 694 150, 694 205, 630 231" fill="none" stroke="#b0703a" stroke-width="1.2" marker-end="url(#ch08f1arrO)"/>
+<rect x="12" y="236" width="126" height="38" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+<text x="75" y="251" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">success</text>
+<text x="75" y="265" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">probability</text>
+<rect x="146" y="236" width="126" height="38" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+<text x="209" y="251" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">completion</text>
+<text x="209" y="265" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">fraction</text>
+<rect x="280" y="236" width="126" height="38" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+<text x="343" y="251" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">garment</text>
+<text x="343" y="265" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">type</text>
+<rect x="414" y="236" width="126" height="38" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+<text x="477" y="251" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">keypoint</text>
+<text x="477" y="265" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">distances</text>
+<rect x="548" y="236" width="126" height="38" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+<text x="611" y="251" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">Q-like head</text>
+<text x="611" y="265" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">scores a chunk</text>
+<text x="350" y="293" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">LeHome only &mdash; not part of the &pi;0.5 architecture</text>
+<text x="350" y="308" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">four linear probes off one learned query token; the fifth reads the candidate chunk (Section 8.5)</text>
+</svg><figcaption>Figure 8.1 &mdash; The whole architecture on one page. Read the spine first: cameras and prompt enter a ~3B VLM backbone, which writes a subtask in text at low rate and hands its KV cache to a ~300M action expert; the expert integrates the flow from noise \(z\) and emits a chunk (\(\pi_{0.5}\): \(H = 50\) at 50 Hz; LeHome: \(H = 30\) at 30 Hz). Then the heads: four green ones seeing the current frame only, and an orange one on the expert's tail seeing a candidate chunk &mdash; a \(Q\) to the green heads' \(V\). One attribution, because the picture invites the wrong reading: the spine is \(\pi_0\)/\(\pi_{0.5}\), but all five heads are LeHome's addition, which is why they sit inside the dashed box, and \(\pi^*_{0.6}\) uses a separate critic instead (Section 8.5).</figcaption></figure>
+
+<div class="box jargon"><div class="box-title">Words you will hear</div>
+<strong>Prefix / suffix.</strong> The part of the token sequence processed once and cached (images, state, prompt) versus the part re-processed on every denoising step (the action tokens). <strong>Linear probe.</strong> A single matrix mapping a frozen-or-shared feature vector to a prediction; "probe" signals that it adds no capacity of its own. <strong>Stop-gradient</strong> (written \(\mathrm{sg}(\cdot)\), <code>detach()</code> in PyTorch): use a value in the forward pass but block gradients from flowing back through it. <strong>Embodiment.</strong> A specific robot body; <em>cross-embodiment</em> data mixes bodies with different arms and action spaces. <strong>Knowledge insulation.</strong> Stopping action-expert gradients from reaching the backbone so it keeps its web knowledge.</div>
+
+<h2>8.2 A VLM, for someone who has never used one</h2>
+
+<p>Build the mental model from where you already are. Your PPO rover policy was a multilayer perceptron: a fixed-length vector of floats in (lidar ranges, heading error, speed), two hidden layers, a mean and a log-standard-deviation out. Fixed input size, fixed output size, one shot.</p>
+
+<p><strong>The obvious extension, and why it stalls.</strong> To handle a camera you would bolt on a small convolutional network, flatten its output, concatenate that with the proprioceptive vector and feed the MLP. Most from-scratch robot policies do exactly this. But it gives you no way to accept a variable-length sentence, no way to let image features and words interact before the final layer, and no way to inherit pre-trained weights, because the world's vision-language knowledge is stored in transformers.</p>
+
+<h3>8.2.1 Tokens</h3>
+
+<p>A <strong>token</strong> is one element of a sequence, a vector of fixed width \(d\) (2048 for the Gemma-2B backbone the \(\pi\)-family uses). Everything becomes tokens. An image goes through a <strong>vision encoder</strong> &mdash; a separately pre-trained network, SigLIP-So400m/14 in \(\pi_0\) and its descendants (Zhai et al., 2023) &mdash; which cuts a 224&times;224 image into 14&times;14-pixel patches (\(224/14 = 16\) per side, \(16 \times 16 = 256\) total) and maps each patch to one vector, so one camera frame is 256 tokens. Text goes through a <strong>subword tokenizer</strong>, a fixed table of a few tens of thousands of common character sequences in which a frequent word is one entry and a rare one is spelled from two or three pieces; an embedding table then turns each entry into a vector, and "pick up the shirt" becomes perhaps five tokens. Joint state becomes tokens too: LeHome bins each of the 12 joint values into one of 256 levels and looks the level up in an embedding table (Larchenko, 2026). Once everything is a sequence of \(d\)-dimensional vectors, one architecture processes all of it.</p>
+
+<h3>8.2.2 Attention</h3>
+
+<p>A transformer layer's job is to let every token gather information from other tokens. It gives each token three roles. From token \(i\)'s vector it computes, by learned linear maps, a <em>query</em> \(q_i\) ("what am I looking for?"), a <em>key</em> \(k_i\) ("what do I offer?"), and a <em>value</em> \(v_i\) ("what do I hand over if chosen?"). Stack these as matrices \(Q, K, V\) with one row per token, and the layer computes (Vaswani et al., 2017):</p>
+
+<div class="key-eq">\[
+\mathrm{Attention}(Q, K, V) \;=\; \mathrm{softmax}\!\left(\frac{Q K^{\top}}{\sqrt{d_k}}\right) V .
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+Every token asks every other token "how relevant are you to me?" The dot product of my query row \(q_i\) with your key row \(k_j\) is that relevance score, and \(QK^{\top}\) is the whole table of scores, one row per asking token, one column per answering token. Dividing by \(\sqrt{d_k}\), the square root of the key width, keeps those dot products from growing large merely because the vectors are long, which would saturate the next step. <code>softmax</code> turns each row into weights that are positive and sum to one &mdash; a mixing recipe. Multiplying by \(V\) applies it: my output is an average of everyone's value vectors, weighted by how relevant I judged them.</div>
+
+<p>That is the entire mechanism. A transformer is this operation, plus a per-token MLP, plus normalization, repeated \(L\) times (18 layers for Gemma-2B). You can work with these models without knowing positional encodings or normalization placement; you cannot skip the idea that every token's output is a learned weighted average over other tokens' values.</p>
+
+<h3>8.2.3 KV cache and prefix</h3>
+
+<p>Notice what the equation implies about reuse. Token \(j\)'s contribution to the layer is captured entirely by its key \(k_j\) and value \(v_j\). If \(j\) is an image patch and the image has not changed, \(k_j\) and \(v_j\) do not change either, no matter how many new tokens ask about them. So compute them once and store them. That store is the <strong>KV cache</strong>: for every layer, the keys and values of every token already processed.</p>
+
+<p>The <strong>prefix</strong> is the part you process once and cache: images, robot state, prompt. The <strong>suffix</strong> is what comes after and gets re-processed. This is valid only if the attention mask is directional, meaning prefix tokens never attend to suffix tokens. If they could, adding a suffix token would change the prefix outputs and the cache would be stale.</p>
+
+<div class="box plain"><div class="box-title">In plain words &mdash; why the cache matters here</div>
+The action expert of Section 8.3 runs \(K = 10\) times per control decision. Without a cache, each of those ten passes would re-encode three camera images through a 3B-parameter backbone: ten full vision passes per decision, several decisions per second. With the cache, the images are encoded once per decision, and the ten passes run only the small expert over its own short suffix, reading stored keys and values for everything before it. That one engineering fact is what makes a 3B model usable for closed-loop control at all. Section 8.7 does the arithmetic.</div>
+
+<p>It also buys the two tricks Chapter 12 spends. <strong>Classifier-free guidance</strong> runs the expert twice on the same prefix, once with the conditioning and once without, then extrapolates between the two predicted velocities to sharpen the result. <strong>Best-of-\(N\)</strong> samples \(N\) candidate chunks and keeps the one a scoring head rates highest. Both multiply expert passes and neither touches the prefix, so both ride on one cached encoding of the images.</p>
+
+<p><strong>An analogy, with its limit.</strong> The KV cache is memoization: a pure function of the prefix, computed once, reused by every later caller. The analogy is exact about <em>why</em> it is legal &mdash; the cached result cannot depend on the later calls &mdash; and about the speedup. Where it breaks: memoized results usually persist, keyed by their inputs, whereas this cache is thrown away the instant the camera frame changes, which is every control decision. There is no cross-decision reuse, so do not budget memory as if the cache accumulates.</p>
+
+<h3>8.2.4 How it produces output</h3>
+
+<p>Everything so far describes a sequence going in, and nothing describes anything coming out. After the last layer, every token has an output vector of width \(d\); take the one belonging to the last token. A learned output matrix maps its 2048 numbers to one score per entry in the <strong>vocabulary</strong>, the fixed list of subword pieces the tokenizer can produce, and softmax turns those scores into a probability distribution. You sample one token from it.</p>
+
+<p>That is one token. To get a second, append it and run again. That loop &mdash; sample, append, run again &mdash; is what <strong>autoregressive</strong> means, and training it by cross-entropy against the token that actually came next is what <strong>next-token prediction</strong> means. Here the cache pays off: the second pass does not re-encode the image tokens and the words already written, since their keys and values are stored, so only the new token is encoded and appended. Each extra token costs one token's worth of arithmetic instead of a whole sequence's.</p>
+
+<h2>8.3 Bolting actions onto a language model</h2>
+
+<p><strong>What we want.</strong> The same transformer that consumed images and text should produce 30 timesteps of 12 joint deltas: 360 continuous numbers, at 30 Hz control, from a multimodal distribution (Chapter 5).</p>
+
+<p><strong>The first obvious thing: make actions into words.</strong> A language model already emits discrete tokens from a vocabulary. So discretize actions and emit them the same way. This is the RT-2 recipe (Brohan et al., 2023): bin each action dimension into, say, 256 levels, assign each bin a token, and predict the tokens autoregressively with the ordinary next-token-prediction loss.</p>
+
+<p><strong>Where the naive version fails.</strong> Count the tokens. A chunk of \(H = 30\) steps with 12 dimensions is \(30 \times 12 = 360\) tokens, and autoregressive decoding means one forward pass per token. With the KV cache each pass is cheap in arithmetic: one token against a stored cache. What you cannot cache away is that the passes are strictly sequential, because token 360 cannot start until token 359 exists. At a realistic 5 to 10 ms per decode step, one chunk takes 2 to 4 seconds against the 167 ms budget Section 8.7 derives. That is the wall, and it is latency, not FLOPs. The <strong>FAST tokenizer</strong> (Pertsch et al., 2025) attacks the count: a discrete cosine transform along time concentrates smooth motion into a few low-frequency coefficients, quantized and entropy-coded, giving tens of tokens instead of hundreds. That makes training practical, but not high-rate closed-loop decoding, and quantization still puts a floor under action precision.</p>
+
+<p><strong>The second approach: a continuous action expert.</strong> Attach a separate, smaller set of transformer weights &mdash; the <strong>action expert</strong> &mdash; that takes \(H\) noisy action tokens as its suffix, attends to the backbone's cached prefix, and outputs the flow-matching velocity field \(v_\theta(a^u, u, o)\) of Chapter 7. Name those symbols again, because one is the collision this book most wants you to avoid. \(u\) is the <em>flow time</em>, an internal axis running 0 to 1 inside a single control decision, with no relation to the environment timestep \(t\). \(a^u\) is the partially denoised chunk at that flow time, pure noise at \(u = 0\) and the chunk you execute at \(u = 1\). \(o\) is the current observation. All \(H\) action tokens come out in parallel each pass, so you need \(K = 10\) passes, not 360, and the flow handles multimodality as Chapter 7 described.</p>
+
+<p>What each buys. Discrete tokens buy one objective for everything, since captioning, subtask text and actions all become next-token prediction. The continuous expert buys speed and precision at inference, at the cost of weights that inherit nothing from pre-training.</p>
+
+<p><strong>So \(\pi_{0.5}\) uses both, at different stages.</strong> This detail confuses everyone reading the paper for the first time, so read it slowly. During pre-training &mdash; 280k gradient steps &mdash; there is no action expert at all; actions are FAST tokens and the loss is pure next-token prediction. During post-training &mdash; 80k steps &mdash; the flow-matching expert is added from scratch and the loss becomes a weighted sum of both objectives (Physical Intelligence, 2025a):</p>
+
+<div class="key-eq">\[
+\mathcal{L}_{\text{post}}(\theta) \;=\; \mathcal{L}_{\text{NTP}}(\theta) \;+\; \alpha\, \mathcal{L}_{\text{FM}}(\theta), \qquad \alpha = 10 .
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The total post-training loss has two parts. \(\mathcal{L}_{\text{NTP}}\) is next-token prediction: the cross-entropy of the backbone's predicted token against the true next token, over web text, subtask annotations and FAST-encoded actions. \(\mathcal{L}_{\text{FM}}\) is the flow-matching regression of Chapter 7, the squared error between the expert's predicted velocity and the target \(a - z\). The coefficient \(\alpha = 10\) weights the flow term ten times as heavily, because that is the term producing the actions you execute; the token term is kept on to hold the backbone's representation in place. \(\theta\) covers backbone and expert together: the flow-matching gradients do reach the backbone here.</div>
+
+<p>Two warnings about letters. This \(\alpha\) is the \(\pi_{0.5}\) paper's loss weight; the \(\alpha\) of Chapter 11 is a different quantity, the damping coefficient on the value baseline. And the \(\lambda\) weights of Section 8.5 are per-head loss coefficients, unrelated to GAE's \(\lambda\). Both clashes are inherited from the source papers.</p>
+
+<p>The LeHome solution keeps a related trick: FAST action tokens sit in its prefix as a <em>training-only</em> representation shaper, and are stripped out before the action expert runs at inference (Larchenko, 2026). Figure 8.2 shows the resulting sequence layout.</p>
+
+<figure><svg viewBox="0 0 700 300" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch08f2arrN" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#666"/></marker>
+</defs>
+<text x="12" y="22" font-family="Noto Sans" font-size="12" fill="#333">Prefix &mdash; one backbone pass per control decision, then cached</text>
+<rect x="12" y="36" width="166" height="62" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="95" y="57" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">3 cameras, 224x224</text>
+<text x="95" y="74" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">= 768 image tokens</text>
+<text x="95" y="91" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">+ current query</text>
+<rect x="188" y="36" width="150" height="62" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="263" y="57" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">state: 12 joints</text>
+<text x="263" y="74" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">as 256-bin tokens</text>
+<text x="263" y="91" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">+ garment token</text>
+<rect x="348" y="36" width="104" height="62" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="400" y="57" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">advantage</text>
+<text x="400" y="74" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">token</text>
+<text x="400" y="91" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">LeHome only</text>
+<rect x="462" y="36" width="226" height="62" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5" stroke-dasharray="5 3"/>
+<text x="575" y="57" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">FAST action tokens</text>
+<text x="575" y="74" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">+ FAST query</text>
+<text x="575" y="91" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">(training only)</text>
+<line x1="95" y1="98" x2="95" y2="116" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f2arrN)"/>
+<line x1="263" y1="98" x2="263" y2="116" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f2arrN)"/>
+<line x1="400" y1="98" x2="400" y2="116" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f2arrN)"/>
+<line x1="575" y1="98" x2="575" y2="116" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f2arrN)"/>
+<rect x="12" y="120" width="676" height="28" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="350" y="139" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">KV cache: keys and values for every prefix token, in every layer</text>
+<line x1="520" y1="148" x2="520" y2="182" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f2arrN)"/>
+<rect x="400" y="184" width="288" height="74" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="544" y="205" text-anchor="middle" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333">action expert (the suffix)</text>
+<text x="544" y="223" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">30 noisy action tokens + FM query</text>
+<text x="544" y="241" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">K = 10 passes, one per Euler step</text>
+<text x="12" y="190" font-family="Noto Sans" font-size="11" font-weight="bold" fill="#333">Who attends to whom</text>
+<text x="12" y="209" font-family="Noto Sans" font-size="10" fill="#333">&bull; action tokens read every prefix token</text>
+<text x="12" y="226" font-family="Noto Sans" font-size="10" fill="#333">&bull; prefix tokens never read action tokens</text>
+<text x="12" y="243" font-family="Noto Sans" font-size="10" fill="#333">&bull; so one prefix pass serves all K steps,</text>
+<text x="12" y="260" font-family="Noto Sans" font-size="10" fill="#333">&nbsp;&nbsp;all N candidates, both guidance passes</text>
+<text x="12" y="286" font-family="Noto Sans" font-size="10" fill="#666">At inference the dashed group is stripped; in LeHome there is no text prompt at all.</text>
+</svg><figcaption>Figure 8.2 &mdash; The token sequence, in groups. Notice that the expensive part, 768 image tokens through a 3B backbone, sits entirely in the prefix and is computed once, while the part that runs ten times is a 31-token suffix through a 300M expert. The directional mask is not a detail: it is what makes the cache reusable, and therefore what makes Chapter 12 cheap. Two prefix entries are LeHome's own rather than \(\pi_{0.5}\)'s &mdash; the garment token and the advantage token of Chapter 10.</figcaption></figure>
+
+<h2>8.4 \(\pi_0\) and \(\pi_{0.5}\), concretely</h2>
+
+<p>\(\pi_0\) (Black et al., 2024) set the template. A PaliGemma backbone of about 3B parameters &mdash; roughly a 400M SigLIP vision encoder feeding a ~2B Gemma language transformer &mdash; plus an action expert of about 300M parameters that attends to the backbone's KV cache and is trained by flow matching to emit 50-step chunks for 50 Hz control, one second of motion per query.</p>
+
+<p>\(\pi_{0.5}\) (Physical Intelligence, 2025a) keeps that skeleton and changes the recipe, which is where the generalization comes from. Its numbers, worth memorizing because Chapter 15 asks you to reproduce a descendant of them:</p>
+
+<ul>
+<li><strong>Pre-training, 280k gradient steps</strong>, everything as discrete tokens (\(\alpha = 0\); no action expert yet). The mixture: about 400 hours of mobile-manipulator data from roughly 100 homes; static-arm data from more homes; cross-embodiment lab data including Open X-Embodiment; annotated subtask descriptions for all robot data; and web data &mdash; captioning, visual question answering, object localization.</li>
+<li><strong>The statistic that explains the model</strong>: 97.6% of first-phase training examples are <em>not</em> mobile-manipulator household data. That household data is a 2.4% slice of what the model learned from.</li>
+<li><strong>Post-training, 80k steps</strong>: mobile-manipulator and multi-environment data filtered to successful, short-enough episodes; subtask annotations; verbal-instruction data where expert users speak step-by-step commands; web data retained; lab data dropped. The flow-matching expert is added from scratch and the hybrid loss above is used.</li>
+</ul>
+
+<p><strong>What we want from language.</strong> A robot you can command in one sentence &mdash; "clean up the kitchen" &mdash; that works out the rest for itself.</p>
+
+<p><strong>The obvious thing to try.</strong> Condition the action expert on that sentence directly, and ask it for the next second of motion.</p>
+
+<p><strong>Exactly how it fails.</strong> The chunk must now encode a plan and a motion at once. Stand the robot at a counter holding a plate, a mug and a sponge. "Clean up the kitchen" is satisfied by picking up any of the three, so the demonstrations hold quite different chunks for near-identical observations, differing at the level of <em>intent</em> rather than motor detail. That is the multimodality of Chapter 5 one level up, and it bites harder, because the modes are half a meter apart rather than a centimeter. A flow model can represent the mixture, but nothing holds it to one branch across decisions: the arm commits to the plate now and the sponge five decisions later. And you have nowhere to look, because the choice existed only as a direction in a 2048-dimensional vector. Meanwhile the expert must learn task decomposition from motor data, the narrowest data you own.</p>
+
+<p><strong>The fix: hierarchical inference.</strong> One model runs at two rates. First the backbone autoregressively writes a subtask <em>in plain text</em>, using the loop of Section 8.2 and all four cameras: \(\hat{\ell} \sim \pi_\theta(\cdot \mid o_t, \ell)\), where \(\ell\) is the overall command you gave the robot ("clean up the kitchen"), \(o_t\) is the current observation, and \(\hat{\ell}\) is the subtask the model writes for itself ("pick up the plate"). Then the action expert, conditioned on that subtask and on the forward and wrist views, integrates \(K = 10\) Euler steps and emits \(a_{t:t+H} \sim \pi_\theta(\cdot \mid o_t, \hat{\ell})\), far more often than the high-level step runs.</p>
+
+<p><strong>Why it works.</strong> Conditioning on \(\hat{\ell}\) removes the intent-level multimodality: given "pick up the plate", the remaining spread over chunks is motor detail, which is what flow matching is good at. The decomposition is learned from annotated subtask text, cheap to label and trained by the same next-token loss as web data, rather than from joint trajectories. And \(\hat{\ell}\) is a string, so the plan is something you can print, log, evaluate or overwrite. Figure 8.1 shows the arrangement; the curved arrow into the dashed box is this low-rate path.</p>
+
+<p><strong>Why co-training keeps semantics from washing out.</strong> Here is the failure it prevents. Take a pre-trained VLM and fine-tune it for 80k steps on shirt-folding episodes alone. Every gradient step pulls every weight toward the loss on that narrow distribution. The features that distinguished "sock" from "spatula" were useful for captioning and are useless for this loss, so nothing preserves them: they drift and get overwritten, the standard catastrophic-forgetting story. You would still measure excellent shirt folding, which is why this is easy to miss until you test out of distribution.</p>
+
+<p>The fix is to keep web data in the mixture during post-training, so each minibatch contains both kinds of example. The averaged gradient then carries a term that punishes any weight change which breaks captioning: directions that improve folding at the cost of semantics are opposed, and only directions that do both survive.</p>
+
+<p><strong>Knowledge insulation, and which recipe it belongs to.</strong> A follow-up recipe from the same group goes further. <em>Knowledge insulation</em> blocks the action expert's gradients from reaching the backbone entirely, so the backbone trains on discrete-token losses alone and motor learning cannot damage the language model at all. It is not part of the \(\pi_{0.5}\) post-training above; it is a later variant, carried into \(\pi^*_{0.6}\) (Physical Intelligence, 2025b). Keep the three cases apart. In plain \(\pi_{0.5}\) post-training &mdash; the \(\alpha = 10\) equation &mdash; flow-matching gradients do reach the backbone, which is why \(\theta\) covers both. Knowledge insulation severs that path. LeHome uses neither it nor any stop-gradient into the trunk, and Section 8.5 depends on that.</p>
+
+<p><strong>What the recipe bought.</strong> \(\pi_{0.5}\) cleans kitchens and bedrooms in homes never seen in training, over runs of 10&ndash;15 minutes, with individual multi-stage tasks taking 2&ndash;5 minutes; it was evaluated in three real kitchens and three real bedrooms, ten trials per task. Success rises smoothly as training locations go from 3 to 104, and at the top of that curve it matches a control model trained directly on the test homes: co-training closed the in-domain gap. The language-following numbers of Section 8.1 come from the same sweep. The practical consequence, which Chapter 15 depends on: fine-tune a pre-trained VLA, do not train one from scratch.</p>
+
+<h2>8.5 Auxiliary heads: the policy is its own value function</h2>
+
+<p><strong>What we want.</strong> Everything in Chapters 10 through 12 needs a value estimate. Advantages need \(V(s)\) (Chapter 11). RECAP's advantage conditioning needs advantages (Chapter 10). Best-of-\(N\) chunk selection needs a score for a candidate chunk (Chapter 12). Without a value function, none of it runs.</p>
+
+<p><strong>The obvious thing to try.</strong> Train a critic, as PPO does. You have done this: in Stable-Baselines3 the actor and critic shared one feature extractor and the value head was two extra layers, essentially free. Scaled up, that becomes the \(\pi^*_{0.6}\) design: a separate 670M-parameter Gemma 3 VLM trained as a <strong>distributional critic</strong>, meaning it predicts a probability over a grid of possible values rather than regressing a single number, which trains more stably. It predicts \(p_\phi(V \mid o_t, \ell)\) over \(B = 201\) value bins, with cross-entropy against the empirical <strong>return-to-go</strong> \(G_t = \sum_k \gamma^k r_{t+k}\), computed from the episode that actually happened, this frame to the end (Physical Intelligence, 2025b). Two symbols: \(\phi\) is the critic's own parameters, written apart from the policy's \(\theta\) because it is a separate model, and \(\ell\) is the language command of Section 8.4. It works &mdash; and that critic is one component of RECAP, the method that roughly halves failure rate on the hardest tasks; Chapter 10 takes the whole method apart.</p>
+
+<p><strong>Where it hurts on one workstation.</strong> Count what a separate critic costs. A second checkpoint to store, load and version. A second forward pass over the same three camera images every time you want a value, competing with the policy for the GPU during rollouts. And it must learn from scratch a representation of "how is this fold going" &mdash; the representation the policy already built, from the same data, only with less of it, since the critic sees observations and returns alone. You pay twice for one perception system. Figure 8.3 makes the duplication visible.</p>
+
+<h3>8.5.1 The four current-frame heads</h3>
+
+<p><strong>The fix.</strong> Do not build a second model. Add one learned <strong>query token</strong> to the backbone's input &mdash; a single trainable vector that participates in attention like any other token &mdash; and hang small heads off its output. Each head is a <strong>linear probe</strong>: one matrix mapping that token's 2048-dimensional output to a handful of numbers, plus an activation. In the LeHome solution the current-frame heads are (Larchenko, 2026):</p>
+
+<ul>
+<li><strong>Success probability</strong> \(\hat{p}_{succ}\): sigmoid output, binary cross-entropy against whether the episode eventually succeeded, trained on RL rollouts. Two refinements that matter: labels are smoothed toward the per-garment mean success rate (coefficient 0.05), and the last 20 frames of successful episodes get 20&times; the BCE weight, because the end of an episode is where the prediction must be sharp.</li>
+<li><strong>Completion fraction</strong>: sigmoid, MSE against the target \(t/T\) &mdash; how far through the episode this frame is &mdash; trained on successful episodes only.</li>
+<li><strong>Garment type</strong>: a 4-way softmax over long tops, short tops, long pants, shorts. Above 99% accurate late in training, which matters because the evaluator never tells the policy which garment it is facing.</li>
+<li><strong>Keypoint distances</strong>: a raw linear head emitting 21 numbers. Unpack this one, because those numbers are the task's own definition of success. Every LeHome garment carries labelled <strong>keypoints</strong> &mdash; collar, cuffs, hems, waistband &mdash; and the success checker is a conjunction of pairwise conditions on them: certain pairs must come within a threshold, others must stay beyond one. So \(\mathrm{dist}_i\) is the current distance for condition \(i\), \(\mathrm{threshold}_i\) is that condition's pass radius, and \(d^{(i)} = \mathrm{dist}_i / \mathrm{threshold}_i\) falls below 1 exactly when condition \(i\) is met. The official checker uses 5 conditions for tops and 4 for pants; for his own dense reward Larchenko expanded long pants from 4 conditions to 7, so his head covers 5 for long tops, 5 for short tops, 7 for long pants and 4 for shorts &mdash; \(5 + 5 + 7 + 4 = 21\). The head emits every garment's slice at once, the others masked out as NaN. When later chapters say "five conditions for tops, four for pants" they mean the official checker; the 21 here is his expanded set. These targets exist only in simulation, where privileged state is available.</li>
+</ul>
+
+<p>One design detail is worth more than it looks. The query token sits inside the <em>image</em> group of the attention layout, not the state group, so every head must read its answer out of pixels alone: no proprioceptive shortcut, no copying the garment-type input token. That keeps the probes honest and makes them useful as a training signal for the trunk.</p>
+
+<h3>8.5.2 The action-conditional head</h3>
+
+<p>The fifth head is different in kind. A separate query token sits at the <em>tail of the action expert's suffix</em>, where it can attend to the partially denoised action chunk. Because it sees a candidate action, it is a \(Q\)-like head rather than a \(V\)-like one. It predicts three things about the world after that chunk has been executed: the keypoint distance ratios \(H\) steps in the future, the completion fraction at that point, and a success residual</p>
+
+\[
+\Delta_{succ} \;=\; y \;-\; \mathrm{sg}\!\left(\hat{p}_{succ}\right),
+\]
+
+<p>where \(y\) is the episode's actual binary outcome and \(\mathrm{sg}\) is the stop-gradient. <strong>Stop-gradient in plain words</strong>: in the forward pass use \(\hat{p}_{succ}\) as it is; in the backward pass treat it as a constant, so no gradient reaches the success head through it. Without that, the \(Q\)-like head could cut its own loss by pushing \(\hat{p}_{succ}\) around, corrupting the \(V\)-like estimate Chapter 11 depends on. With it, the residual head can only improve by learning what this <em>particular chunk</em> adds to the baseline the observation already implies. In PyTorch it is one <code>.detach()</code>, and forgetting it is a bug you will not notice for days.</p>
+
+<h3>8.5.3 One loss, several jobs</h3>
+
+<p>All of this is one weighted sum:</p>
+
+<div class="key-eq">\[
+\begin{aligned}
+\mathcal{L}(\theta) \;=\;& \mathcal{L}_{\text{FM}} \;+\; \lambda_{succ}\mathcal{L}_{succ} \;+\; \lambda_{comp}\mathcal{L}_{comp} \;+\; \lambda_{gar}\mathcal{L}_{gar} \;+\; \lambda_{kp}\mathcal{L}_{kp} \\[2pt]
+&+\; \lambda_{Q,succ}\mathcal{L}_{Q,succ} \;+\; \lambda_{Q,comp}\mathcal{L}_{Q,comp} \;+\; \lambda_{Q,kp}\mathcal{L}_{Q,kp} .
+\end{aligned}
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+One network, one optimizer, one backward pass, several jobs. \(\mathcal{L}_{\text{FM}}\) is the flow-matching action loss at weight 1.0: producing good actions is the job. The next four terms are the current-frame heads &mdash; success, completion, garment type, keypoints &mdash; and the last three are the action-conditional head's targets, which is what the \(Q\) subscript marks. Each \(\lambda\) says how much the network may care about that side job relative to actions. LeHome's simulation values: \(\lambda_{succ} = 0.05\), \(\lambda_{comp} = \lambda_{gar} = \lambda_{kp} = 0.02\), \(\lambda_{Q,succ} = 0.1\), \(\lambda_{Q,comp} = 0.05\), \(\lambda_{Q,kp} = 0.02\). All small, deliberately: the heads <em>shape</em> the shared features rather than dominating training. Gradients do reach the backbone &mdash; no stop-gradient into the trunk.</div>
+
+<h3>8.5.4 What it buys</h3>
+
+<p><strong>Four payoffs, in order of how much they matter.</strong> First, the value function sees what the policy sees, updates when the policy updates, and ships in the same checkpoint at near-zero extra cost; Chapter 11 builds its estimate as \(V(s_t) = \hat{p}_{succ} - R_{acc}\), where \(R_{acc}\) is the reward already banked earlier in the episode by the checkpoint scheme of Chapter 11 &mdash; expected total minus already collected leaves what is still ahead, which is what a value is. Second, the auxiliary losses shape the trunk: predicting keypoint distances forces geometric task state into the features the action expert reads, which tends to help the actions too. Third, the keypoint head is a cheap world model &mdash; instead of future pixels it predicts the handful of numbers the reward depends on. Fourth, the \(Q\)-like head can score candidate chunks at inference, which makes best-of-\(N\) possible in Chapter 12 with no extra model; the current-frame heads cannot, since they see only the observation and would score every candidate alike.</p>
+
+<p><strong>The full inventory, for when you read the report.</strong> Five heads carry every idea in this book, and those are the five taught here. The tech report's list is slightly longer: alongside the success head sit checkpoint and time-to-completion (TTC) probes, minor siblings trained the same way, and there are <em>two</em> future-prediction queries rather than one &mdash; a training-only query on the FAST token stream, stripped before the action expert ever runs, plus the flow-matching \(Q\)-like query described above. Chapter 14's deployment recipe names all of them, because stripping a policy for real hardware means deciding what to do with each.</p>
+
+<figure><svg viewBox="0 0 700 310" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch08f3arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#666"/></marker>
+<marker id="ch08f3arrO" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#b0703a"/></marker>
+</defs>
+<line x1="350" y1="10" x2="350" y2="300" stroke="#ccc" stroke-width="1" stroke-dasharray="5 4"/>
+<text x="175" y="22" text-anchor="middle" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333">Separate critic model</text>
+<rect x="105" y="36" width="140" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8"/><text x="175" y="54" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">camera images</text>
+<line x1="160" y1="62" x2="100" y2="86" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f3arr)"/>
+<line x1="190" y1="62" x2="250" y2="86" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f3arr)"/>
+<rect x="20" y="90" width="150" height="96" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="95" y="112" text-anchor="middle" font-family="Noto Sans" font-size="11" font-weight="bold" fill="#333">policy VLA</text>
+<text x="95" y="130" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">backbone 4B</text>
+<text x="95" y="148" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">+ expert 860M</text>
+<text x="95" y="166" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">own vision pass</text>
+<rect x="180" y="90" width="150" height="96" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="255" y="112" text-anchor="middle" font-family="Noto Sans" font-size="11" font-weight="bold" fill="#333">critic VLM</text>
+<text x="255" y="130" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">670M, separate</text>
+<text x="255" y="148" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">201 value bins</text>
+<text x="255" y="166" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">own vision pass</text>
+<line x1="95" y1="186" x2="95" y2="204" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f3arr)"/>
+<line x1="255" y1="186" x2="255" y2="204" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f3arr)"/>
+<rect x="20" y="208" width="150" height="30" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/><text x="95" y="228" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">action chunk</text>
+<rect x="180" y="208" width="150" height="30" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/><text x="255" y="228" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">value estimate</text>
+<text x="175" y="262" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">two passes over the same pixels,</text>
+<text x="175" y="278" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">two representations, two checkpoints</text>
+<text x="525" y="22" text-anchor="middle" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333">Auxiliary heads</text>
+<rect x="455" y="36" width="140" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8"/><text x="525" y="54" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">camera images</text>
+<line x1="525" y1="62" x2="525" y2="86" stroke="#666" stroke-width="1.2" marker-end="url(#ch08f3arr)"/>
+<rect x="400" y="90" width="250" height="96" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="525" y="112" text-anchor="middle" font-family="Noto Sans" font-size="11" font-weight="bold" fill="#333">one VLA trunk</text>
+<text x="525" y="130" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">backbone + action expert</text>
+<text x="525" y="148" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">one vision pass</text>
+<text x="525" y="166" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">one checkpoint</text>
+<line x1="500" y1="186" x2="402" y2="204" stroke="#4a8a5c" stroke-width="1.2" marker-end="url(#ch08f3arr)"/>
+<line x1="510" y1="186" x2="484" y2="204" stroke="#4a8a5c" stroke-width="1.2" marker-end="url(#ch08f3arr)"/>
+<line x1="540" y1="186" x2="566" y2="204" stroke="#4a8a5c" stroke-width="1.2" marker-end="url(#ch08f3arr)"/>
+<line x1="550" y1="186" x2="648" y2="204" stroke="#4a8a5c" stroke-width="1.2" marker-end="url(#ch08f3arr)"/>
+<rect x="365" y="208" width="74" height="30" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/><text x="402" y="227" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">success</text>
+<rect x="447" y="208" width="74" height="30" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/><text x="484" y="227" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">completion</text>
+<rect x="529" y="208" width="74" height="30" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/><text x="566" y="227" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">garment</text>
+<rect x="611" y="208" width="74" height="30" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/><text x="648" y="227" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">keypoints</text>
+<path d="M 656 186 C 688 212, 684 238, 652 252" fill="none" stroke="#b0703a" stroke-width="1.2" marker-end="url(#ch08f3arrO)"/>
+<rect x="470" y="252" width="180" height="32" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="560" y="272" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">Q-like head (scores a chunk)</text>
+<text x="525" y="302" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#4a8a5c">one pass, ~0 extra parameters, same checkpoint</text>
+</svg><figcaption>Figure 8.3 &mdash; The same value function, two ways. On the left the critic is a whole second model that re-encodes the same frames and must rediscover the representation the policy already has; on the right the value estimate is a linear map off a token the policy computes anyway. The left design keeps one advantage the figure cannot show &mdash; a critic independent of the policy cannot be corrupted by policy-loss gradients &mdash; which is why a well-resourced lab may still prefer it.</figcaption></figure>
+
+<pre class="code"># heads hanging off one shared trunk (schematic)
+h_img  = trunk_out[query_idx]        # 1 x 2048, the learned query token
+p_succ = sigmoid(W_succ  @ h_img)    # V-like: P(episode succeeds)
+comp   = sigmoid(W_comp  @ h_img)    # progress t/T, successes only
+gtype  = softmax(W_gar   @ h_img)    # 4 garment classes
+kp     = W_kp @ h_img                # 21 distance ratios, NaN-masked
+
+h_act  = expert_out[fm_query_idx]    # tail of the action expert suffix
+d_succ = W_qs @ h_act                # residual on top of p_succ
+kp_fut = W_qk @ h_act                # the same 21 ratios, H steps ahead
+comp_f = sigmoid(W_qc @ h_act)       # completion fraction, H steps ahead
+target = y - p_succ.detach()         # stop-grad: protects the V-like head
+
+loss = loss_fm + 0.05*loss_succ + 0.02*loss_comp \
+     + 0.02*loss_gar + 0.02*loss_kp \
+     + 0.1*mse(d_succ, target) + 0.05*loss_q_comp + 0.02*loss_q_kp</pre>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Three that cost real days. (1) Forgetting the stop-gradient: the residual head drags \(\hat{p}_{succ}\) toward whatever makes its own loss small, and your Chapter 11 advantages quietly degrade while every training curve still looks fine. (2) Head weights too high: at \(\lambda \approx 1\) the trunk optimizes for prediction instead of action, and success rate drops with no obvious culprit. (3) Assuming a head that predicts well is useful downstream &mdash; LeHome's \(Q\)-like head had roughly zero correlation with outcomes yet still improved best-of-\(N\), because it caught rare catastrophic chunks, not average quality.</div>
+
+<h2>8.6 What this costs</h2>
+
+<p>Parameters first. \(\pi_{0.5}\)-class: about 3B backbone plus about 300M expert, call it 3.3B. \(\pi^*_{0.6}\): a Gemma 3 4B backbone, an 860M action expert, and the 670M critic on top &mdash; over 5.5B across two checkpoints.</p>
+
+<p>Now memory, with the arithmetic visible. In bfloat16 weights cost 2 bytes each, so 3.3B parameters are \(3.3 \times 10^9 \times 2 = 6.6\) GB. That is inference. Training with Adam is a different order. Count the bytes held per trainable parameter in a normal mixed-precision setup: fp32 master weight 4, fp32 gradient 4, Adam's first moment 4, Adam's second moment 4, and \(4 + 4 + 4 + 4 = 16\) bytes. So \(3.3 \times 10^9 \times 16 = 53\) GB before a single activation. Add activations and you are asking for an 80 GB card at minimum. Larchenko trained on one H200: batch 192, bf16, frozen vision encoder, cosine learning rate 1e-4 to 1e-5, a 20k-step behavior-cloning warm-up, about 300k steps in total.</p>
+
+<p>On a 24 GB consumer GPU, full fine-tuning of a 3B VLA is not available. Here is what is. Freeze the vision encoder, which LeHome does anyway, and freeze most or all of the backbone, training the expert plus heads. Use <strong>LoRA</strong> adapters: instead of updating a weight matrix, train a small low-rank matrix alongside the frozen one, so optimizer state covers a few million parameters rather than billions. Turn on <strong>gradient checkpointing</strong>: discard most activations on the forward pass and recompute them on the backward pass, trading roughly 30% more compute for a large memory saving. Cut the batch size, then recover the effective batch with <strong>gradient accumulation</strong>: run several small batches, sum their gradients, take one optimizer step at the end, and the update behaves like a large batch while peak memory stays small. Inference is comfortable &mdash; 6.6 GB of weights plus a KV cache of tens of megabytes.</p>
+
+<p>Which is the real argument of this section. Nobody outside a well-funded lab reproduces 280k steps over that corpus, and nobody has to: the checkpoints are released, so the expensive 97.6% is already paid for. Your job is the last 80k steps.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+LeRobot ships ports of both \(\pi_0\) and \(\pi_{0.5}\); your <code>hil-serl</code> checkout already has them under the policies package, next to <code>act</code> and <code>diffusion</code>. Before fine-tuning anything, spend an evening reading one config: chunk size \(H\), <code>n_action_steps</code> (actions executed before re-query &mdash; the \(n_e\) of Chapter 12), denoising steps \(K\), the tokenizer, the image resize. Then load a pre-trained checkpoint and run inference on a few frames of your SO-101 teleop dataset &mdash; not for good actions, but to see the shapes move and to time one query on your GPU. That number sets your control rate.</div>
+
+<h2>8.7 One inference call, end to end</h2>
+
+<p>Now trace a single control decision through the LeHome-configured model, with shapes and numbers at every stage. Assume three RGB cameras at 224&times;224 (one overhead, one per wrist), a 12-joint bimanual SO-101, \(H = 30\) at 30 Hz, \(K = 10\).</p>
+
+<p><strong>Stage 1: tokenize the observation.</strong> Each image is cut into 14&times;14 patches: \(224/14 = 16\) per side, \(16 \times 16 = 256\) tokens per image. Three cameras give \(3 \times 256 = 768\) image tokens. Add the learned current-query token: 769. The 12 joint values are each discretized into one of 256 bins, giving 12 state tokens: 781. Add the garment-type token: 782. Add the advantage token of Chapter 10: 783. (A \(\pi_{0.5}\)-style prompt such as "clean up the kitchen" would add roughly five more; LeHome uses no language at all.)</p>
+
+<p><strong>Stage 2: the prefix pass.</strong> All 783 tokens go through the backbone once. Estimating compute with the usual rule of about \(2\) FLOPs per parameter per token:</p>
+
+<pre class="code">vision encoder:  2 x 0.4e9 params x 768 tokens = 0.61 TFLOP
+Gemma-2B trunk:  2 x 2.0e9 params x 783 tokens = 3.13 TFLOP
+prefix total                                   = 3.74 TFLOP
+
+KV cache (bf16, 18 layers, one 256-wide KV head per layer):
+  2 (K and V) x 18 x 783 x 256 x 2 bytes       = 14.4 MB
+  (with full 2048-wide K and V it would be 8x  = 115 MB)</pre>
+
+<p><strong>Stage 3: the high-level step, if you have one.</strong> \(\pi_{0.5}\) would now decode a subtask such as "pick up the plate" &mdash; five or so tokens, autoregressively, at roughly 1 Hz rather than every decision. LeHome skips this stage entirely: no language input, no subtask text.</p>
+
+<p><strong>Stage 4: integrate the flow.</strong> The suffix is 30 noisy action tokens (one per chunk timestep, each a 12-dimensional action projected to the expert's width) plus the FM query token: 31 tokens. Start from \(z \sim \mathcal{N}(0, I)\) of shape \(30 \times 12\) and take ten Euler steps at \(u = 0, 0.1, \ldots, 0.9\) &mdash; \(u\) is the flow time, an axis internal to this one decision, not the environment clock &mdash; each step being \(a \leftarrow a + \tfrac{1}{10} v_\theta(a, u, o)\):</p>
+
+<pre class="code">one expert pass:  2 x 0.3e9 params x 31 tokens = 0.019 TFLOP
+K = 10 steps:     10 x 0.019                   = 0.19  TFLOP
+share of the decision: 0.19 / 3.74             = 5.1 %
+
+with CFG (2 passes) and best-of-N = 3 candidates:
+  6 x 0.19 = 1.14 TFLOP; total 3.74 + 1.14     = 4.88 TFLOP
+  versus 3.74 + 0.19 = 3.93 without            = +24 %</pre>
+
+<p>That 5.1% is the number to remember &mdash; but remember it as a <em>FLOP</em> share, not a time share. At batch size one, which is what a robot runs, arithmetic is not the bottleneck: the denoising loop is ten short sequential passes, each too small to saturate the GPU and each paying kernel-launch and memory-bandwidth overhead that the FLOP count does not see. So the loop costs more wall-clock than 5.1% suggests. Chapter 12 measures the real budget, and there the six-fold expert loop that guidance and candidate selection require comes to roughly three quarters of a decision's latency (Section 12.3.4). The FLOP arithmetic tells you the expert is cheap to <em>train</em> around; the latency budget tells you what it costs to <em>run</em>.</p>
+
+<p><strong>Stage 5: execute and re-query.</strong> The output is \(30 \times 12 = 360\) numbers &mdash; joint deltas for the next second. LeHome executes only the first \(n_e\) of them: 5 for tops, 3 for pants. At 30 Hz, \(n_e = 5\) is \(5/30 = 0.167\) s of motion, so the model is re-queried at \(30/5 = 6\) Hz. Each decision therefore has a 167 ms budget. LeHome deploys with guidance and candidate selection on, so a decision costs the 4.88 TFLOP computed above, a sustained \(6 \times 4.88 \approx 29\) TFLOP/s; turn both off and you drop to the 3.93 TFLOP floor, \(6 \times 3.93 \approx 24\) TFLOP/s. Either way you are inside a modern GPU's bfloat16 throughput, provided you get decent utilization at batch size one, which is its own engineering problem.</p>
+
+<p><strong>Why throw away 25 of the 30 actions?</strong> Because the chunk was planned from an observation that is now stale, and its later actions are the most speculative. Executing a short prefix of a long plan gives you the temporal consistency of chunking with the reactivity of frequent replanning. Chapter 12 treats \(n_e\) as a tunable knob.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+The stack is exactly Figure 8.1, sized down: a frozen SigLIP-So400m/14 encoder, a Gemma-2B prefix transformer, and a Gemma-300M flow-matching expert emitting 30&times;12 joint-delta chunks at 30 Hz in simulation (20 Hz in the real round), from three 224&times;224 cameras, with <em>no language input at all</em> &mdash; the VLM earns its place through visual representation, not instruction following. FAST tokens live in the prefix as a training-only shaper. All five heads are present, and the garment-type head does real work, since the evaluator never reveals the garment (Larchenko, 2026).</div>
+
+<p><strong>A second analogy, with its limit.</strong> Think of the auxiliary heads as instrumentation on a service you already run: metrics scraped from data structures that exist anyway, versus standing up a parallel service that re-parses every request to compute the same metrics. That captures the cost argument precisely. It breaks on one point, the important one: real instrumentation is read-only, whereas these heads emit gradients that change the trunk's weights. That is a feature &mdash; payoff number two &mdash; but it means a badly weighted head is not a harmless dashboard. It is a second objective quietly competing with your policy.</p>
+
+<div class="box checkpoint"><div class="box-title">Checkpoint</div>
+<ul>
+<li>Explain what a VLM contributes to a robot policy and what it does not &mdash; semantics and robustness yes, motor skill no &mdash; with the \(\pi_{0.5}\) numbers supporting both halves.</li>
+<li>Define token, attention, KV cache and prefix from memory, describe how the model generates a token at a time, and say why the directional mask is what makes the cache legal.</li>
+<li>Describe the two ways actions attach to a language model, why serial token decoding misses a 167 ms budget, and why \(\pi_{0.5}\) uses tokens in pre-training and a flow expert in post-training.</li>
+<li>Explain why co-training on retained web data prevents catastrophic forgetting, in terms of what the averaged gradient penalizes, and where knowledge insulation differs.</li>
+<li>List the five auxiliary heads with their targets, say why the query token sits in the image group, and explain what the stop-gradient in \(\Delta_{succ} = y - \mathrm{sg}(\hat{p}_{succ})\) protects.</li>
+<li>Estimate the compute split of one inference call, and state what fraction the denoising loop consumes &mdash; the fact Chapter 12 spends.</li>
+</ul>
+</div>
+
+<p><strong>Where to go deeper.</strong> Read Black et al. (2024) for \(\pi_0\) and the action-expert design, then Physical Intelligence (2025a) for the \(\pi_{0.5}\) co-training recipe; the 97.6% statistic and the scaling curve are the parts to sit with. Pertsch et al. (2025) explains FAST tokenization properly, and Brohan et al. (2023) is the original case for discrete action tokens. For the auxiliary heads as an engineering artifact, Larchenko (2026) Section 5 lists every head, target and loss weight. Chapter 9 next puts PPO and VLA-RL side by side.</p>
+
+</section>

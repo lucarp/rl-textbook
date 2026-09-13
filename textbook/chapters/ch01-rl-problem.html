@@ -1,0 +1,413 @@
+<section class="chapter" id="ch01">
+<h1>Chapter 1 &mdash; The reinforcement learning problem</h1>
+
+<p>Every method in this book answers one underlying problem. The PPO agent that drove your rover attacks it &mdash; PPO is proximal policy optimization, developed in Chapters 2 and 3. So does the HIL-SERL loop on your SO-101 (human-in-the-loop sample-efficient robot RL, Chapter 13). So does the flow-matching policy (a generative action model: one that samples actions from a learned distribution instead of emitting a single number per joint &mdash; Chapter 7) that folded garments well enough to take first place in the LeHome Challenge's online round and second in its real-robot final. They differ in what they assume and what they cost, not in the problem they answer.</p>
+
+<p>This chapter states that problem precisely, fixes the notation later chapters reuse, explains why physical robots make it far harder than a benchmark suggests, and draws the map you will navigate by. If you have trained a PPO agent, some of this is familiar. Read it anyway: Chapters 5 through 10 bend this vocabulary into unfamiliar shapes.</p>
+
+<h2>1.1 From supervised learning to decisions</h2>
+
+<p>Start with something concrete. Put a wooden cube on the table in front of your SO-101 and ask the arm to pick it up. Thirty times a second, some piece of software must choose six numbers &mdash; target angles, or deltas from the current angles &mdash; and send them to the servos. A three-second reach is ninety such decisions, five hundred and forty numbers. Nobody writes those by hand. This book is about where they come from.</p>
+
+<h3>1.1.1 The obvious thing to try, and where it breaks</h3>
+
+<p>The obvious first answer, and a good one, is supervised learning. Teleoperate with the leader arm, record fifty successful grasps, and you have a dataset of (camera image, joint command) pairs; train a network to map one to the other. This is <strong>behavior cloning</strong> &mdash; supervised learning of a controller from recorded demonstrations, treating each frame as an independent labeled example. It is the honest starting point for almost every robot learning project, LeHome included, and Chapter 4 develops it properly.</p>
+
+<p>Two comforts hide in that setup, and control removes both. First, the feedback is <strong>instructive</strong>: the label says exactly what you should have produced, so the error is a vector pointing at the right answer. Second, mistakes have no consequences. Mislabel one ImageNet image and the next arrives unchanged; the data does not care what your model thinks.</p>
+
+<p>Now watch behavior cloning fail on the cube, in the way it always fails. Your policy closes the gripper two centimeters early. The cube tips and rolls four centimeters left. The next camera frame shows a scene appearing nowhere in your fifty demonstrations, because all fifty succeeded and no successful demonstration contains a tipped cube. The network extrapolates, a polite word for guesses, and the error compounds: each wrong action moves the robot further from its training data, making the next action worse. This is not a capacity problem. It is structural, and it follows from the fact supervised learning ignores: <em>your actions determine your future inputs</em>.</p>
+
+<p>The first comfort &mdash; instructive feedback &mdash; dies with the second. When the cube ends up on the floor, nobody tells you which of the ninety decisions was wrong. You get a score &mdash; failed &mdash; and nothing else. Feedback of this kind is <strong>evaluative</strong> (a number saying how good the outcome was) rather than instructive (a label saying what to do), and it is <strong>delayed</strong>: it arrives long after the decision that caused it. That combination creates the <strong>credit assignment problem</strong>: deciding which past actions deserve credit or blame for an outcome that shows up much later. Nearly everything technical in this book is a strategy for credit assignment.</p>
+
+<h3>1.1.2 An analogy, and its limit</h3>
+
+<p>Supervised learning is a graded exam with an answer key: you write an answer, the key says what it should have been, you adjust. Reinforcement learning is a game of chess. You make forty moves, you are told &ldquo;you lost&rdquo;, and you must work out yourself whether the loss traces to the pawn structure on move nine or the blunder on move thirty-seven. One number for the whole game, evaluative rather than instructive.</p>
+
+<p>Now the limit, because an analogy without a stated limit misleads. Chess shows you the complete state of the world on the board, and its transitions are deterministic. A robot gets a camera image, a shadow of the state, and its transitions are noisy: the same joint command applied twice to the same apparent scene gives different results, because friction, backlash, and cable tension are not in the picture. The analogy captures delayed evaluative feedback exactly, and hidden state and stochastic dynamics not at all. Those two extras are most of what makes robot RL hard.</p>
+
+<p>The formal picture is a loop between an <strong>agent</strong> (the thing that chooses) and an <strong>environment</strong> (everything else, including the robot's own body), drawn in Figure 1.1. At each environment timestep \(t\) the agent gets an observation, emits an action \(a_t\), and the environment answers with a reward \(r_t\) and the next observation.</p>
+
+<figure>
+<svg viewBox="0 0 700 210" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch01f1arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 z" fill="#666"/>
+    </marker>
+  </defs>
+  <rect x="40" y="55" width="190" height="110" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+  <text x="135" y="80" text-anchor="middle" font-family="Noto Sans" font-size="13" font-weight="bold" fill="#333">Agent</text>
+  <g stroke="#4878a8" stroke-width="1">
+    <line x1="100" y1="98" x2="135" y2="92"/><line x1="100" y1="98" x2="135" y2="112"/><line x1="100" y1="98" x2="135" y2="130"/>
+    <line x1="100" y1="128" x2="135" y2="92"/><line x1="100" y1="128" x2="135" y2="112"/><line x1="100" y1="128" x2="135" y2="130"/>
+    <line x1="135" y1="92" x2="170" y2="98"/><line x1="135" y1="112" x2="170" y2="98"/><line x1="135" y1="130" x2="170" y2="98"/>
+    <line x1="135" y1="92" x2="170" y2="128"/><line x1="135" y1="112" x2="170" y2="128"/><line x1="135" y1="130" x2="170" y2="128"/>
+  </g>
+  <g fill="#4878a8">
+    <circle cx="100" cy="98" r="5"/><circle cx="100" cy="128" r="5"/>
+    <circle cx="135" cy="92" r="5"/><circle cx="135" cy="112" r="5"/><circle cx="135" cy="130" r="5"/>
+    <circle cx="170" cy="98" r="5"/><circle cx="170" cy="128" r="5"/>
+  </g>
+  <text x="135" y="155" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">policy &#960;<tspan font-size="9" dy="3">&#952;</tspan><tspan dy="-3">(a</tspan><tspan font-size="9" dy="3">t</tspan><tspan dy="-3"> | o</tspan><tspan font-size="9" dy="3">t</tspan><tspan dy="-3">)</tspan></text>
+  <rect x="450" y="45" width="210" height="155" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+  <text x="555" y="66" text-anchor="middle" font-family="Noto Sans" font-size="13" font-weight="bold" fill="#333">Environment</text>
+  <rect x="468" y="76" width="24" height="14" rx="3" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.2"/>
+  <circle cx="496" cy="83" r="4" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.2"/>
+  <line x1="500" y1="83" x2="558" y2="122" stroke="#999" stroke-dasharray="3,3"/>
+  <line x1="500" y1="83" x2="532" y2="150" stroke="#999" stroke-dasharray="3,3"/>
+  <line x1="465" y1="163" x2="650" y2="163" stroke="#ccc" stroke-width="1.5"/>
+  <rect x="585" y="153" width="42" height="10" rx="3" fill="#f8efe8" stroke="#b0703a" stroke-width="1.2"/>
+  <line x1="606" y1="153" x2="588" y2="117" stroke="#b0703a" stroke-width="4" stroke-linecap="round"/>
+  <line x1="588" y1="117" x2="552" y2="131" stroke="#b0703a" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="588" cy="117" r="4.5" fill="#b0703a"/>
+  <line x1="552" y1="131" x2="543" y2="124" stroke="#b0703a" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="552" y1="131" x2="545" y2="140" stroke="#b0703a" stroke-width="2.5" stroke-linecap="round"/>
+  <rect x="514" y="142" width="20" height="16" rx="2" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.2"/>
+  <path d="M 230 85 H 448" stroke="#666" stroke-width="1.5" fill="none" marker-end="url(#ch01f1arr)"/>
+  <text x="340" y="72" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">action a<tspan font-size="9" dy="3">t</tspan></text>
+  <text x="340" y="101" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">(joint targets, wheel speeds)</text>
+  <path d="M 450 150 H 232" stroke="#666" stroke-width="1.5" fill="none" marker-end="url(#ch01f1arr)"/>
+  <text x="340" y="140" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">observation o<tspan font-size="9" dy="3">t+1</tspan><tspan dy="-3">, reward r</tspan><tspan font-size="9" dy="3">t</tspan></text>
+  <text x="340" y="170" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">(camera pixels &mdash; not the full state)</text>
+  <text x="555" y="176" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">true state s stays hidden in here</text>
+  <text x="555" y="190" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">(contacts, friction, cloth pose)</text>
+</svg>
+<figcaption>Figure 1.1 &mdash; the agent&ndash;environment loop. Notice that only three things cross the boundary: an action going right, an observation and a reward coming back. Notice what does <em>not</em> cross: the true state, which stays inside the environment. Almost every difficulty in this book follows from those two facts.</figcaption>
+</figure>
+
+<h2>1.2 The MDP, built piece by piece</h2>
+
+<p>Textbooks introduce the formal model as a five-element tuple, all at once. That is efficient, and it is also why people bounce off it. We will take the pieces one at a time and write the tuple only at the end.</p>
+
+<h3>1.2.1 The five pieces</h3>
+
+<p><strong>The state space \(\mathcal{S}\)</strong> is the set of every situation the world can be in. For your rover a state is roughly the pose in the room, the wheel velocities, and the obstacle layout. For an SO-101 holding a cube it includes six joint angles, six joint velocities, the cube's pose, and the fingertip friction. Notice two things: the state is continuous rather than a list of cells, and it includes quantities you cannot measure.</p>
+
+<p><strong>The action space \(\mathcal{A}\)</strong> is the set of choices at each step. Your rover's was a pair of wheel commands. The SO-101's is six joint targets, or six deltas from the current position; LeHome uses two arms, so its action is twelve numbers (Larchenko, 2026). These are continuous, which rules out the tabular value iteration of a gridworld tutorial.</p>
+
+<p><strong>The transition distribution \(p(s_{t+1} \mid s_t, a_t)\)</strong> says what the world does in response. It is a distribution, not a function, because the same command in the same apparent situation gives different outcomes: the servo overshoots differently, the cloth catches on a wrinkle, a wheel slips. Simulators are no exception, and not for the reason people usually give: a contact solver is sensitive to ordering and thread timing, and domain randomization resamples friction, mass, and latency between episodes, so the same command in the same nominal state genuinely lands you in different next states. Seen from the policy's side it is worse still, because the policy conditions on an observation rather than the state, and many different states hide behind one image.</p>
+
+<p><strong>The reward function \(r(s,a)\)</strong> emits one scalar per step saying how good that step was. Here is the underrated point: unlike \(p\), the reward is not a fact about the world. You write it, and the agent optimizes what you wrote rather than what you meant. Chapter 11 is devoted to that.</p>
+
+<p><strong>The discount factor \(\gamma \in [0,1)\)</strong> says what a later reward is worth relative to one arriving now. It is a knob you choose, and the rest of this section is about it, because choosing it badly quietly ruins runs.</p>
+
+<p>Together those are a <strong>Markov decision process</strong> (MDP): the tuple \((\mathcal{S}, \mathcal{A}, p, r, \gamma)\). Every algorithm here assumes some version of it.</p>
+
+<h3>1.2.2 The Markov property, and a shirt that violates it</h3>
+
+<p>The word &ldquo;Markov&rdquo; carries the defining assumption: the next state depends only on the current state and action, not on anything deeper in the past. Formally \(p(s_{t+1} \mid s_t, a_t)\) is the whole story; also conditioning on \(s_{t-1}, a_{t-1}, \dots\) tells you nothing more.</p>
+
+<p>An analogy from your own trade: a Markov state is a complete save file. Serialize it, kill the process, restore it elsewhere, resume, and the future unfolds statistically the same way. Now the limit, and it is a big one: a camera image is not a save file, it is a screenshot. A screenshot shows the rendered scene, not the health counters, the seed, or what is behind the wall.</p>
+
+<p>Make that concrete. One overhead photograph of a crumpled long-sleeved shirt does not determine what happens when you pull the visible corner. If the left sleeve is folded underneath, the pull drags the whole garment; if it lies free, the pull peels the top layer away. The pixels look nearly identical either way, so the image is not a Markov state &mdash; and training cannot fix that, because the information is not in the input.</p>
+
+<p>A <strong>trajectory</strong> is one run through the loop: \(\tau = (s_0, a_0, r_0, s_1, a_1, r_1, \dots)\). An <strong>episode</strong> is a trajectory that ends &mdash; at a terminal state (shirt folded, rover crashed) or at a time limit. Episodes are where the pain lives on hardware: an episode boundary is a reset, and somebody has to perform it.</p>
+
+<h3>1.2.3 Returns: why we discount, and by how much</h3>
+
+<p>What the agent cares about is not one step's reward but everything that follows. The obvious definition is the plain sum \(r_t + r_{t+1} + r_{t+2} + \cdots\), and for a task that always ends in ten steps it is fine. It fails in two cases you will meet. If the task runs indefinitely &mdash; a rover patrolling a room &mdash; the sum can be infinite, and infinity minus infinity gives you nothing to optimize. And even for finite episodes, it calls a reward six hundred steps away as urgent as one right now.</p>
+
+<p>The fix is to weight later rewards less, geometrically, by a factor \(\gamma\) per step. That gives the <strong>return</strong>:</p>
+
+<div class="key-eq">
+\[ G_t \;=\; r_t + \gamma\, r_{t+1} + \gamma^2 r_{t+2} + \dots \;=\; \sum_{k=0}^{\infty} \gamma^k r_{t+k} \;=\; r_t + \gamma\, G_{t+1}. \]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+\(G_t\) &mdash; the return &mdash; is the one number summarizing everything good that happens from timestep \(t\) onward. \(r_t\) is the reward collected right now, at full value. \(r_{t+1}\) is next step's reward at \(\gamma\) of face value, \(r_{t+2}\) at \(\gamma^2\), and a reward \(k\) steps away at \(\gamma^k\). The middle form compresses that into a sum over the offset \(k\). The last form says it recursively: today's return is today's reward plus a discounted copy of tomorrow's return.
+</div>
+
+<p>Geometric weighting is not arbitrary: it is the only weighting that makes the recursion on the right true, and that recursion seeds nearly every algorithm here. Read forward it is a definition; read backward over a stored episode it is an algorithm &mdash; accumulate from the end, one multiply-add per step.</p>
+
+<pre class="code">def discounted_returns(rewards, gamma):
+    out = [0.0] * len(rewards)
+    G = 0.0
+    for t in reversed(range(len(rewards))):  # sweep backward from the last step
+        G = rewards[t] + gamma * G           # this line IS the recursion above
+        out[t] = G
+    return out                               # one return per input step, same length</pre>
+
+<p>How should you pick \(\gamma\)? Use the <strong>effective horizon</strong> \(N = 1/(1-\gamma)\), roughly how far ahead the agent looks. That number is worth deriving rather than memorizing, because it is the one heuristic in this section you will use every time you start a project.</p>
+
+<p>All the weights together, \(1 + \gamma + \gamma^2 + \cdots\), sum to \(1/(1-\gamma)\). The first \(N\) of them sum to \((1 - \gamma^N)/(1-\gamma)\). Divide the second by the first and the \(1/(1-\gamma)\) cancels, so the fraction of the total weight that lands inside the first \(N\) steps is simply \(1 - \gamma^N\). Now substitute \(N = 1/(1-\gamma)\). The quantity \(\gamma^{1/(1-\gamma)}\) approaches \(e^{-1} \approx 0.37\) as \(\gamma\) approaches 1 &mdash; at \(\gamma = 0.9\) it is \(0.9^{10} = 0.35\), at \(\gamma = 0.99\) it is \(0.99^{100} = 0.366\), at \(\gamma = 0.999\) it is \(0.999^{1000} = 0.368\). So the fraction inside the effective horizon is about \(1 - 0.37 = 0.63\), and it is about that for every \(\gamma\) you might pick.</p>
+
+<p>That is the content of the heuristic: roughly two-thirds of everything the agent is optimizing lies within \(1/(1-\gamma)\) steps of now, and rewards well past that barely move the objective at all. The horizon is not a hard cutoff &mdash; nothing is ignored exactly &mdash; but it tells you where the agent's attention is.</p>
+
+<table class="tbl">
+<thead><tr><th>\(\gamma\)</th><th>effective horizon \(1/(1-\gamma)\)</th><th>weight \(\gamma^{600}\) on a reward 600 steps away</th></tr></thead>
+<tbody>
+<tr><td>0.9</td><td>10 steps</td><td>\(4 \times 10^{-28}\) (effectively zero)</td></tr>
+<tr><td>0.95</td><td>20 steps</td><td>\(4 \times 10^{-14}\)</td></tr>
+<tr><td>0.99</td><td>100 steps</td><td>0.002</td></tr>
+<tr><td>0.999</td><td>1000 steps</td><td>0.55</td></tr>
+</tbody>
+</table>
+
+<p>The last column is the argument. A six-hundred-step folding episode paying out only at the end is invisible at \(\gamma = 0.99\): the terminal reward reaches the first state scaled by \(0.99^{600} \approx 0.002\), drowning in the noise of your value estimates. LeHome used \(\gamma = 0.999\), keeping 55&nbsp;percent alive at step zero (Larchenko, 2026). The discount is not a number to copy from a tutorial; it states how long your task is.</p>
+
+<h3>1.2.4 Worked example: returns by hand</h3>
+
+<p>Take a four-step gridworld episode like your rl-boarding project. The agent wanders two steps for nothing, clips an obstacle for \(-1\), then reaches the goal for \(+10\): \((r_0, r_1, r_2, r_3) = (0,\, 0,\, -1,\, +10)\). Sweep backward with \(\gamma = 0.9\):</p>
+
+<pre class="code">gamma = 0.9
+
+G_3 = r_3                     = 10
+G_2 = r_2 + 0.9 * G_3         = -1 + 0.9*10  = -1 + 9.0   = 8.0
+G_1 = r_1 + 0.9 * G_2         =  0 + 0.9*8.0 =  0 + 7.2   = 7.2
+G_0 = r_0 + 0.9 * G_1         =  0 + 0.9*7.2 =  0 + 6.48  = 6.48
+
+check, summing forward from t=0:
+  gamma^0 * 0  = 1.000 *   0  =  0
+  gamma^1 * 0  = 0.900 *   0  =  0
+  gamma^2 * -1 = 0.810 *  -1  = -0.81
+  gamma^3 * 10 = 0.729 *  10  = +7.29
+  total                        =  6.48   (matches)</pre>
+
+<p>Two things to notice. The returns climb as the agent nears the goal &mdash; 6.48, 7.2, 8.0, 10 &mdash; though three of the four rewards are zero or negative; that gradient in \(G_t\), not the sparse reward itself, is what value functions estimate and policies climb. And seen from the start, the collision costs only \(\gamma^2 \cdot 1 = 0.81\) while the goal contributes \(\gamma^3 \cdot 10 = 7.29\), a ratio of nine to one.</p>
+
+<p>Now run the identical episode at \(\gamma = 0.5\) to see what the discount controls:</p>
+
+<pre class="code">gamma = 0.5
+
+G_3 = r_3                     = 10
+G_2 = r_2 + 0.5 * G_3         = -1 + 0.5*10  = -1 + 5.0   = 4.0
+G_1 = r_1 + 0.5 * G_2         =  0 + 0.5*4.0 =  0 + 2.0   = 2.0
+G_0 = r_0 + 0.5 * G_1         =  0 + 0.5*2.0 =  0 + 1.0   = 1.0
+
+collision seen from t=0: gamma^2 * 1  = 0.25
+goal      seen from t=0: gamma^3 * 10 = 1.25   ratio 5 : 1  (was 9 : 1)</pre>
+
+<p>The ordering of the two events did not change, but their relative weight did: the goal now outweighs the collision five to one instead of nine to one. That ratio is \(10\gamma\), so a smaller \(\gamma\) makes the nearby penalty loom larger against the distant prize. An impatient agent takes fewer risks for a far-off payoff &mdash; a real behavior change caused by one scalar in a config file.</p>
+
+<div class="box jargon"><div class="box-title">Words you will hear</div>
+<strong>Rollout</strong> &mdash; one run of a policy in an environment, producing a trajectory; code calls it <span class="mono">traj</span> or <span class="mono">episode</span>, used interchangeably. <strong>Episode</strong> &mdash; a rollout that terminates; papers say &ldquo;episodic&rdquo; for tasks with resets. <strong>Return</strong> &mdash; the discounted sum \(G_t\), also called <em>reward-to-go</em>. <strong>Horizon</strong> &mdash; how far ahead you care, either episode length or \(1/(1-\gamma)\); in this book \(H\) instead means the length of an action chunk, the number of future actions a policy emits in one shot, defined in the next section. <strong>On-policy</strong> &mdash; training only on current-policy data; <em>off-policy</em> reuses older data from a <em>behavior policy</em> \(\pi_\beta\). <strong>POMDP</strong> &mdash; a partially observable MDP; a &ldquo;belief state&rdquo; is a distribution over hidden states.
+</div>
+
+<h2>1.3 Policies and value functions</h2>
+
+<p>A <strong>policy</strong> \(\pi_\theta(a \mid s)\) is a distribution over actions given the state, with parameters \(\theta\) &mdash; for us, network weights. One bookkeeping point before we go on: Figure 1.1 drew the policy as \(\pi_\theta(a_t \mid o_t)\), conditioned on the observation, and here it is conditioned on the state \(s\). That is deliberate, not a slip; Section 1.4 explains which letter the theory uses, which one your hardware actually hands you, and what it costs you that they differ.</p>
+
+<p>That the policy is a distribution rather than one action usually strikes engineers as a defect. Surely we want the <em>best</em> action, not a sample?</p>
+
+<p>Three reasons randomness is a feature. First, <strong>exploration</strong>: a deterministic policy never discovers a better action than the one it takes, because it never takes anything else. Second, the whole basis of Chapter 2: a stochastic policy makes expected return a smooth, differentiable function of \(\theta\) even when the action choice is discrete. Third, visible only in Part III: some tasks genuinely have several correct answers &mdash; grasp the shirt at the left collar or the right, both fine &mdash; and a policy forced to commit to one number averages them and reaches for the middle, where there is no cloth. That is Chapter 5, and why the second half of this book replaces Gaussians with <strong>generative models</strong> &mdash; networks that sample from a learned distribution of arbitrary shape rather than outputting one number, or one mean and spread, per joint.</p>
+
+<p>On your rover the policy was a Gaussian over wheel commands: the network output a mean and a spread, and you sampled. From Chapter 5 onward it becomes a generative model emitting a whole <strong>action chunk</strong> \(a_{t:t+H}\) &mdash; the next \(H\) actions in one shot &mdash; rather than one action per step.</p>
+
+<h3>1.3.1 Value, action-value, advantage</h3>
+
+<p>Value functions summarize what a policy can expect. The <strong>state value</strong> \(V^\pi(s) = \mathbb{E}[G_t \mid s_t = s]\) is the expected return from \(s\) when acting with \(\pi\) thereafter: on average, how well does this situation end? The <strong>action value</strong> \(Q^\pi(s,a)\) is the same, except the first action is forced to be \(a\): how well does it end if I do \(a\) right now?</p>
+
+<p>Now the question that matters for training: given a state and an action, was that action any good? The obvious answer is to judge it by what followed. Run the policy, record the return that came after each action, and rank actions by that return. It is direct, it needs no extra machinery, and it is what the plain policy gradient of Chapter 2 does in its rawest form.</p>
+
+<p>Take the four-step episode from Section 1.2 to see what that ranking really measures. With \((r_0, r_1, r_2, r_3) = (0, 0, -1, +10)\) and \(\gamma = 0.9\) the returns were \(G_0 = 6.48\), \(G_1 = 7.2\), \(G_2 = 8.0\), \(G_3 = 10\). The action taken at the last step scores 10. The action taken at the first step scores 6.48. Ranked by return, the last action wins by a wide margin &mdash; and yet nothing about that comparison involved comparing choices.</p>
+
+<p>Standing one step from the goal, every action that does not actively throw the episode away collects something near 10, the lazy ones included. Standing four steps out, even the best available action collects about 6.48, because that is all the situation is worth from there. So the ranking is mostly a readout of which situation the agent happened to be in, not which choice it made. A mediocre move in a winning position outscores an excellent move in a hard one, and if you train on that signal you reinforce having been lucky rather than having chosen well. On a real robot the spread across situations is far larger than in this gridworld &mdash; a folding policy that starts with the shirt half-flat is in a completely different position from one starting with it bunched &mdash; so this effect does not average out, it dominates.</p>
+
+<p>The fix is to give every state its own baseline and grade the action against that baseline rather than against zero. The baseline is already sitting on the page: \(V^\pi(s)\), what this situation is worth to this policy on average. Subtract it from \(Q^\pi(s,a)\) and what remains is the part attributable to the choice. That difference is the single most important derived quantity in this book, the <strong>advantage</strong>:</p>
+
+<div class="key-eq">
+\[ A^\pi(s,a) \;=\; Q^\pi(s,a) - V^\pi(s). \]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+\(A^\pi(s,a)\) asks: in state \(s\), is taking action \(a\) better or worse than what I would usually do here? \(Q^\pi(s,a)\) is the expected return if I take \(a\) now and behave normally afterward. \(V^\pi(s)\) is the expected return if I just behave normally from now &mdash; my own average in this state. Subtracting removes everything about how good the situation itself is, leaving only the part attributable to the choice. Positive means better than my average, negative worse, zero typical. That baseline-relative reading is why almost every method here consumes the advantage rather than the raw return.
+</div>
+
+<p>Put numbers on it, back in the gridworld, so you can watch the two rankings disagree. In the start state the policy averages \(V^\pi(s_0) = 6.48\), because its usual route clips the obstacle. Consider an action there that avoids the obstacle and lands in a state worth 8.0, collecting nothing on the way: \(Q^\pi(s_0, a) = 0 + 0.9 \times 8.0 = 7.2\), so \(A^\pi(s_0, a) = 7.2 - 6.48 = +0.72\). Now consider a state next to the goal, worth \(V^\pi(s_2) = 8.0\), and a dawdling action there that wastes a step and leaves the agent in a state worth 8.0 again: \(Q^\pi(s_2, a') = 0 + 0.9 \times 8.0 = 7.2\), so \(A^\pi(s_2, a') = 7.2 - 8.0 = -0.8\). Both actions score exactly 7.2 by raw return, so raw return cannot tell them apart at all. By advantage, one is clearly worth doing more often and the other clearly worth doing less, and the sign alone says which.</p>
+
+<p>Hold on to that last phrasing: <em>how much better than my own average</em>. It scales gradients in PPO (Chapter 3), becomes an exponential weight \(w_i = \exp(\hat{A}_i/\beta)\) in AWR (Chapter 4), a conditioning input in RECAP (Chapter 10), and the object of deliberate engineering in Chapter 11.</p>
+
+<p>Two pieces of decoration in that weight will recur throughout the book, so meet them now. The hat on \(\hat{A}_i\) marks an <em>estimate</em> computed from collected data, as opposed to the true \(A^\pi\), which you never have; from here on, a hat always means &ldquo;our best guess at this, built from samples&rdquo;. And \(\beta\) is a temperature: it sets how sharply the weighting favors good actions, with small \(\beta\) making the exponential pick out only the very best and large \(\beta\) flattening it toward treating all data equally (Chapter 4). Note that this \(\beta\) has nothing to do with the behavior policy \(\pi_\beta\) in the jargon box above. The letter is overloaded in the literature, and this book keeps both uses because you will meet both in papers.</p>
+
+<p>Values obey a one-step recursion of their own, the <strong>Bellman expectation equation</strong> &mdash; the return identity \(G_t = r_t + \gamma G_{t+1}\) with expectations applied to both sides:</p>
+
+<div class="key-eq">
+\[ V^\pi(s) \;=\; \mathbb{E}_{a \sim \pi(\cdot \mid s),\; s' \sim p(\cdot \mid s, a)}\!\left[\, r(s,a) + \gamma\, V^\pi(s') \,\right]. \]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The value of being in state \(s\) equals the reward you expect to collect on the next step, plus \(\gamma\) times the value of wherever you land. \(\mathbb{E}\) means average over two sources of randomness, named underneath it: \(a \sim \pi(\cdot \mid s)\) is the action your own policy samples here, and \(s' \sim p(\cdot \mid s,a)\) is the next state the environment produces in response. The centered dot means the whole distribution rather than its value at one point, so \(\pi(\cdot \mid s)\) reads &ldquo;the distribution over actions the policy would use in state \(s\)&rdquo; and \(\sim\) reads &ldquo;drawn from&rdquo;. \(r(s,a)\) is that immediate reward and \(V^\pi(s')\) is the value of the landing state. The consequence is large: you can learn \(V\) from single transitions, without waiting for the episode to end.
+</div>
+
+<p>That is what the TD residual \(\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)\) of Chapter 3 measures: how much one observed transition disagrees with the Bellman equation.</p>
+
+<p>Finally, the objective. All of reinforcement learning is the search for parameters that maximize expected return from the start of the episode:</p>
+
+<div class="key-eq">
+\[ J(\theta) \;=\; \mathbb{E}_{\tau \sim \pi_\theta}\!\left[ G_0 \right] \;=\; \mathbb{E}_{\tau \sim \pi_\theta}\!\Big[ \sum_{t} \gamma^t r_t \Big]. \]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+\(J(\theta)\) is one number: how good the policy with weights \(\theta\) is. \(\tau \sim \pi_\theta\) means &ldquo;run the current policy and get a trajectory&rdquo;, and \(\mathbb{E}\) averages over all trajectories it could produce. \(G_0\) is the return measured from the first step, which expands into the discounted sum on the right, \(\gamma^t\) shrinking rewards that arrive at later timesteps \(t\). Training means climbing \(J\) in \(\theta\). The catch that defines the field: you can never evaluate \(J(\theta)\) exactly, only estimate it by running the robot and averaging &mdash; and each estimate costs real seconds of hardware time.
+</div>
+
+<p>Chapters 2, 3, 4, 9, and 10 are five strategies for climbing \(J(\theta)\) when you can only sample it: differentiate through the sampling (2), do that safely in bounded steps (3), turn it into weighted imitation of data you already have (4), see which of those survive generative policies (9), and condition the policy on the advantage instead of weighting by it (10).</p>
+
+<h2>1.4 Why robot RL is hard</h2>
+
+<p>On paper the MDP is clean and the objective is a scalar to maximize. Five features of real robots make it hostile &mdash; five places where a method that works on a benchmark stops working on your bench.</p>
+
+<h3>1.4.1 Continuous, high-dimensional spaces</h3>
+
+<p>The tabular tools of gridworlds &mdash; enumerate states, store one value per cell, iterate &mdash; do not survive contact with hardware. One SO-101 has six continuous joints; a bimanual pair has twelve. And modern policies emit a chunk rather than an action: LeHome's predicts thirty timesteps at once, so one output is a \(30 \times 12 = 360\)-dimensional vector (Larchenko, 2026).</p>
+
+<p>So function approximation is mandatory, and it imports every instability neural networks have: the value function you train is wrong in ways that correlate with the states your policy visits, and the policy then optimizes against those errors. Much of Chapter 3 keeps that loop from exploding.</p>
+
+<h3>1.4.2 Partial observability</h3>
+
+<p>The robot never sees the state \(s\). It sees an <strong>observation</strong> \(o\) &mdash; camera pixels, encoder ticks, a sonar sweep. When observations do not determine the state, the problem is formally a <strong>POMDP</strong> (partially observable Markov decision process), and the guarantees MDP algorithms carry no longer apply.</p>
+
+<p>This is the crumpled shirt of Section 1.2 under its formal name. The practical responses all smuggle the missing information back in: stack recent frames so velocity becomes visible, give the policy memory, add sensors, or accept the ambiguity and learn a policy whose action distribution covers both possibilities &mdash; again Chapter 5.</p>
+
+<h3>1.4.3 Which letter, \(s\) or \(o\)? The book's convention</h3>
+
+<p>You may have noticed a tension. Section 1.3 wrote everything on states: the policy \(\pi_\theta(a \mid s)\), the value \(V^\pi(s)\), the action value \(Q^\pi(s,a)\), the Bellman equation. Figure 1.1 wrote the policy on observations, \(\pi_\theta(a_t \mid o_t)\). And this section has just told you the robot never sees \(s\) at all. So are the value functions of Section 1.3 computable on real hardware, and which letter will later chapters mean?</p>
+
+<p>Here is the convention, and it is worth fixing in your head now. The theory is stated on states, because the Markov property is a statement about states and the guarantees are proved there, so every formula in this book is written with \(s\). On hardware, every \(s\) you see in a formula is really an \(o\). Your network is fed pixels and encoder ticks; it computes something we write as \(V(s_t)\) but that is in fact \(V(o_t)\), and your policy is \(\pi_\theta(a_t \mid o_t)\) no matter how the equation above it is printed.</p>
+
+<p>The formulas do not stop working when you make that substitution &mdash; people train excellent policies this way every day &mdash; but they stop being exactly true, and the size of the error is precisely the POMDP tax described above. A value function on observations is trying to predict a return that depends on things the observation does not contain, so it is systematically wrong wherever two different states share one image. That is why the practical responses listed above are all attempts to make \(o_t\) more nearly a state. When a later chapter needs the distinction sharp &mdash; Chapter 5 on multimodality, Chapter 9 on what a generative policy can and cannot estimate &mdash; it will write \(o\) explicitly and say why.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+Your rover environment is a POMDP by design: the policy sees a sonar sweep and recent velocities, never its pose in the map. Now you can name the choice &mdash; \(o_t\) is a thin sensor slice of a hidden \(s_t\). When the RPLIDAR and ROS&nbsp;2 iteration lands, ask of every input: if two genuinely different situations produce the same reading, can any policy tell them apart? If one scan does not determine what happens next, stack scans or add memory before blaming the algorithm or the reward. Debugging a representation problem as a tuning problem costs weeks.
+</div>
+
+<h3>1.4.4 Sparse rewards over long horizons</h3>
+
+<p>&ldquo;One if the shirt is folded, else zero&rdquo; is an honest reward. It is also nearly information-free: hundreds of steps go by, the policy commits thousands of joint targets, and one bit comes back. Figure 1.2 draws that ratio to scale.</p>
+
+<figure>
+<svg viewBox="0 0 700 260" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch01f2arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 z" fill="#666"/>
+    </marker>
+  </defs>
+  <line x1="70" y1="160" x2="662" y2="160" stroke="#666" stroke-width="1.5" marker-end="url(#ch01f2arr)"/>
+  <line x1="70" y1="160" x2="70" y2="58" stroke="#666" stroke-width="1.5" marker-end="url(#ch01f2arr)"/>
+  <text x="44" y="112" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333" transform="rotate(-90 44 112)">reward r</text>
+  <text x="70" y="176" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">0</text>
+  <text x="212" y="176" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">150</text>
+  <text x="355" y="176" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">300</text>
+  <text x="497" y="176" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">450</text>
+  <text x="640" y="176" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">600</text>
+  <text x="208" y="146" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">r = 0 at every one of the 599 earlier steps</text>
+  <rect x="636" y="80" width="6" height="80" fill="#b04a4a"/>
+  <text x="630" y="72" text-anchor="end" font-family="Noto Sans" font-size="11" fill="#b04a4a">+1 if folded, 0 if not</text>
+  <rect x="352" y="120" width="6" height="40" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.2" stroke-dasharray="3,2"/>
+  <text x="345" y="118" text-anchor="end" font-family="Noto Sans" font-size="11" fill="#4a8a5c">+0.5 checkpoint</text>
+  <text x="345" y="104" text-anchor="end" font-family="Noto Sans" font-size="10" fill="#666">(manufactured in Chapter 11)</text>
+  <g fill="#eaf1f8" stroke="#9db8d2" stroke-width="0.8">
+    <rect x="70" y="192" width="8.5" height="14" rx="2"/><rect x="79.5" y="192" width="8.5" height="14" rx="2"/><rect x="89" y="192" width="8.5" height="14" rx="2"/><rect x="98.5" y="192" width="8.5" height="14" rx="2"/><rect x="108" y="192" width="8.5" height="14" rx="2"/>
+    <rect x="117.5" y="192" width="8.5" height="14" rx="2"/><rect x="127" y="192" width="8.5" height="14" rx="2"/><rect x="136.5" y="192" width="8.5" height="14" rx="2"/><rect x="146" y="192" width="8.5" height="14" rx="2"/><rect x="155.5" y="192" width="8.5" height="14" rx="2"/>
+    <rect x="165" y="192" width="8.5" height="14" rx="2"/><rect x="174.5" y="192" width="8.5" height="14" rx="2"/><rect x="184" y="192" width="8.5" height="14" rx="2"/><rect x="193.5" y="192" width="8.5" height="14" rx="2"/><rect x="203" y="192" width="8.5" height="14" rx="2"/>
+    <rect x="212.5" y="192" width="8.5" height="14" rx="2"/><rect x="222" y="192" width="8.5" height="14" rx="2"/><rect x="231.5" y="192" width="8.5" height="14" rx="2"/><rect x="241" y="192" width="8.5" height="14" rx="2"/><rect x="250.5" y="192" width="8.5" height="14" rx="2"/>
+    <rect x="260" y="192" width="8.5" height="14" rx="2"/><rect x="269.5" y="192" width="8.5" height="14" rx="2"/><rect x="279" y="192" width="8.5" height="14" rx="2"/><rect x="288.5" y="192" width="8.5" height="14" rx="2"/><rect x="298" y="192" width="8.5" height="14" rx="2"/>
+    <rect x="307.5" y="192" width="8.5" height="14" rx="2"/><rect x="317" y="192" width="8.5" height="14" rx="2"/><rect x="326.5" y="192" width="8.5" height="14" rx="2"/><rect x="336" y="192" width="8.5" height="14" rx="2"/><rect x="345.5" y="192" width="8.5" height="14" rx="2"/>
+    <rect x="355" y="192" width="8.5" height="14" rx="2"/><rect x="364.5" y="192" width="8.5" height="14" rx="2"/><rect x="374" y="192" width="8.5" height="14" rx="2"/><rect x="383.5" y="192" width="8.5" height="14" rx="2"/><rect x="393" y="192" width="8.5" height="14" rx="2"/>
+    <rect x="402.5" y="192" width="8.5" height="14" rx="2"/><rect x="412" y="192" width="8.5" height="14" rx="2"/><rect x="421.5" y="192" width="8.5" height="14" rx="2"/><rect x="431" y="192" width="8.5" height="14" rx="2"/><rect x="440.5" y="192" width="8.5" height="14" rx="2"/>
+    <rect x="450" y="192" width="8.5" height="14" rx="2"/><rect x="459.5" y="192" width="8.5" height="14" rx="2"/><rect x="469" y="192" width="8.5" height="14" rx="2"/><rect x="478.5" y="192" width="8.5" height="14" rx="2"/><rect x="488" y="192" width="8.5" height="14" rx="2"/>
+    <rect x="497.5" y="192" width="8.5" height="14" rx="2"/><rect x="507" y="192" width="8.5" height="14" rx="2"/><rect x="516.5" y="192" width="8.5" height="14" rx="2"/><rect x="526" y="192" width="8.5" height="14" rx="2"/><rect x="535.5" y="192" width="8.5" height="14" rx="2"/>
+    <rect x="545" y="192" width="8.5" height="14" rx="2"/><rect x="554.5" y="192" width="8.5" height="14" rx="2"/><rect x="564" y="192" width="8.5" height="14" rx="2"/><rect x="573.5" y="192" width="8.5" height="14" rx="2"/><rect x="583" y="192" width="8.5" height="14" rx="2"/>
+    <rect x="592.5" y="192" width="8.5" height="14" rx="2"/><rect x="602" y="192" width="8.5" height="14" rx="2"/><rect x="611.5" y="192" width="8.5" height="14" rx="2"/><rect x="621" y="192" width="8.5" height="14" rx="2"/>
+  </g>
+  <rect x="630.5" y="192" width="8.5" height="14" rx="2" fill="#f8e4e4" stroke="#b04a4a" stroke-width="1"/>
+  <text x="355" y="222" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">each block = 10 steps; at every step the policy commits 12 joint targets</text>
+  <text x="355" y="240" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">600 steps = 7,200 numbers chosen, against 1 bit of feedback</text>
+</svg>
+<figcaption>Figure 1.2 &mdash; one episode, one bit. The red spike at the far right is the entire learning signal for everything before it, and the blue strip shows the volume of decisions it must explain. Random exploration essentially never triggers that spike, so a from-scratch learner sees a flat line forever; the dashed green checkpoint is what Chapter 11 manufactures to break the silence.</figcaption>
+</figure>
+
+<p>Two different problems follow. First, exploration: random flailing essentially never folds a shirt, so a from-scratch learner sees reward zero forever and has nothing to climb. Second, credit assignment, which bites even once you succeed: the bit says the episode worked, not which of six hundred steps mattered. Chapter 11 manufactures denser signals without corrupting the task &mdash; and that second clause is the hard half, since an agent handed a proxy optimizes the proxy.</p>
+
+<h3>1.4.5 Sample cost and resets</h3>
+
+<p>PPO cheerfully consumes tens of millions of simulator steps, and in a simulator that is fine. A real arm at 30&nbsp;Hz yields roughly a hundred thousand transitions per hour if nothing goes wrong. Things go wrong: motors heat and lose torque, cables snag, printed parts fatigue.</p>
+
+<p>Worse, somebody must reset the scene &mdash; between folding episodes a human un-folds the shirt. You have felt this: your HIL-SERL run reached a 98&nbsp;percent intervention rate, another way of saying a human was in the loop for essentially every step. Sample efficiency is not a nicety here; it decides which algorithms can exist on hardware at all, and it is why Chapters 4 and 13 work so hard to extract signal from data you already paid for.</p>
+
+<h3>1.4.6 The sim-to-real gap</h3>
+
+<p>Simulation buys cheap samples and free resets, which is why LeHome's online round ran in Isaac Sim. But simulated contact, latency, friction, and rendering differ from reality, and an optimizer finds and exploits exactly those differences &mdash; a policy can come to rely on a rendering artifact that does not exist in your kitchen.</p>
+
+<p>The gap can be startlingly narrow and still fatal. In the LeHome real-world round, zero-shot transfer failed, and the policy proved sensitive even to the image-resize pipeline: 640 to 224 pixels directly, versus 640 to 320 to 224, was distinguishable to the model and dropped its success rate (Larchenko, 2026). Chapter 14 develops the two levers &mdash; make the domains more similar, or the training data more diverse.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+<em>Treating observations as states.</em> A memoryless policy reading \(o_t\) can only be as good as \(o_t\) is Markov, and no algorithm repairs a missing history; if two situations look identical to your network, tuning will not save you. <em>Setting \(\gamma\) by habit.</em> The discount fixes the effective horizon \(1/(1-\gamma)\). Copying \(\gamma = 0.99\) onto a 600-step sparse task scales the terminal reward by \(0.99^{600} \approx 0.002\) before it reaches the first state. Match \(\gamma\) to the task's horizon before tuning anything else, and re-check it whenever episode length changes.
+</div>
+
+<h2>1.5 A map of the field</h2>
+
+<p>The literature looks like a hundred unrelated acronyms. It is not. Four binary distinctions organize nearly all of it, and once you can place a method on them you can usually predict its strengths without reading the paper.</p>
+
+<p><strong>Model-free versus model-based.</strong> Does the algorithm learn the transition model \(p\) and plan through it, imagining futures before acting, or learn only a policy and some value estimates? Everything here is model-free. LeHome comes close to an exception: instead of a full world model it trains a cheap head predicting a few task-relevant keypoint distances &mdash; a world model shrunk to the numbers that matter (Chapter 8).</p>
+
+<p><strong>On-policy versus off-policy.</strong> Must training data come from the current policy \(\pi_\theta\), or may it come from older versions and other sources, written \(\pi_\beta\)? On-policy methods like PPO throw data away after a few gradient steps &mdash; affordable in simulation, painful on hardware. Off-policy methods reuse a replay buffer and pay in extra machinery.</p>
+
+<p><strong>Online versus offline.</strong> Can you collect new data during training, or is the dataset frozen? This axis is about access to the robot, not the math, and people constantly conflate it with the previous one. Your HIL-SERL setup keeps them apart: it is online (fresh episodes continuously) and off-policy (it trains from a buffer of older data and human interventions).</p>
+
+<p><strong>RL versus imitation.</strong> Is the objective to maximize return or to match a demonstrator? They fail differently: imitation is stable but capped by the demonstrator and fragile off-distribution; RL can exceed the demonstrator but needs a reward and far more data. Figure 1.3 arranges the book's methods on the two axes that matter most day to day.</p>
+
+<figure>
+<svg viewBox="0 0 700 300" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch01f3ax" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 z" fill="#666"/>
+    </marker>
+    <marker id="ch01f3rt" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 z" fill="#b0703a"/>
+    </marker>
+  </defs>
+  <line x1="100" y1="232" x2="665" y2="232" stroke="#666" stroke-width="1.5" marker-end="url(#ch01f3ax)"/>
+  <line x1="100" y1="232" x2="100" y2="28" stroke="#666" stroke-width="1.5" marker-end="url(#ch01f3ax)"/>
+  <text x="185" y="252" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">offline (fixed dataset)</text>
+  <text x="385" y="252" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">off-policy (replayed data)</text>
+  <text x="590" y="252" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">on-policy (fresh rollouts)</text>
+  <text x="380" y="271" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">where the training data comes from</text>
+  <text x="40" y="130" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333" transform="rotate(-90 40 130)">objective: imitation &#8594; return</text>
+  <path d="M 175 186 C 165 150, 172 120, 195 108" stroke="#b0703a" stroke-width="1.5" fill="none" stroke-dasharray="5,4" marker-end="url(#ch01f3rt)"/>
+  <path d="M 281 92 L 309 92" stroke="#b0703a" stroke-width="1.5" fill="none" stroke-dasharray="5,4" marker-end="url(#ch01f3rt)"/>
+  <text x="250" y="140" text-anchor="middle" font-family="Noto Sans" font-size="10.5" fill="#b0703a">LeHome route (Ch 4 &#8594; 10)</text>
+  <rect x="129" y="187" width="92" height="26" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+  <text x="175" y="204" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">BC &#183; Ch 4</text>
+  <rect x="396" y="187" width="118" height="26" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+  <text x="455" y="204" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">DAgger &#183; Ch 13</text>
+  <rect x="372" y="112" width="136" height="26" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+  <text x="440" y="129" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">HIL-SERL &#183; Ch 13</text>
+  <text x="440" y="158" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">(trains from replay; collects online)</text>
+  <rect x="519" y="45" width="112" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+  <text x="575" y="62" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">PPO &#183; Ch 2&ndash;3</text>
+  <rect x="131" y="79" width="148" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+  <text x="205" y="96" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">AWR / AWAC &#183; Ch 4</text>
+  <rect x="313" y="79" width="118" height="26" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+  <text x="372" y="96" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">RECAP &#183; Ch 10</text>
+  <circle cx="511" cy="58" r="3.5" fill="#b04a4a"/>
+  <circle cx="364" cy="125" r="3.5" fill="#b04a4a"/>
+  <circle cx="108" cy="287" r="3.5" fill="#b04a4a"/>
+  <text x="117" y="291" font-family="Noto Sans" font-size="10" fill="#666">= already running on your machines (PPO in rl-rover, HIL-SERL on the SO-101)</text>
+</svg>
+<figcaption>Figure 1.3 &mdash; the map of the field, and the book's route through it. Horizontal position says where training data comes from; vertical position says whether the objective is imitation or return. Orange chips are pure imitation, blue pure RL, green hybrids; all are model-free. The red dots mark where you already stand, and the dashed arrow is the path Chapters 4 and 10 take &mdash; note that it deliberately avoids the top-right corner.</figcaption>
+</figure>
+
+<p>Now walk the map, chip by chip. <strong>Behavior cloning</strong> sits bottom-left: supervised learning on fixed demonstrations, pure imitation, fully offline &mdash; and vulnerable to exactly the drift you saw with the tipped cube (Chapter 4). <strong>DAgger</strong> &mdash; dataset aggregation &mdash; keeps the imitation objective but moves right, going online: it rolls out the learner and asks an expert what to do in the states the learner actually reaches (Ross et al., 2011; Chapter 13). <strong>HIL-SERL</strong>, your pipeline, sits in the middle: online, off-policy RL with human interventions in the buffer, hence green (Luo et al., 2024; Chapter 13).</p>
+
+<p><strong>PPO</strong> occupies the top-right: online, on-policy return maximization, happiest in simulation where fresh rollouts are nearly free (Schulman et al., 2017; Chapters 2 and 3). That is the corner you know from rl-rover. <strong>AWR</strong> &mdash; advantage-weighted regression &mdash; sits high on the objective axis but far left on data: it maximizes return from off-policy or offline data by recasting RL as <em>weighted</em> behavior cloning, which is the hinge of this book and why Chapter 4 is its own chapter (Peng et al., 2019). <strong>AWAC</strong>, advantage-weighted actor-critic, is AWR's online sibling: the same weighted-imitation update, but fed by a replay buffer that keeps growing as the policy collects fresh episodes (Nair et al., 2020). <strong>RECAP</strong> &mdash; RL with experience and corrections via advantage-conditioned policies &mdash; also learns from replayed rollouts, but injects the advantage as a conditioning input rather than a sample weight (Physical Intelligence, 2025b; Chapter 10).</p>
+
+<p>Read the figure as the book's route. You have lived in the top-right corner with rl-rover and in the off-policy middle with hil-serl. Chapters 5 through 8 move you into the world of generative policies, and Chapter 9 delivers the bad news: for a flow-matching policy &mdash; one that produces an action by starting from noise and integrating a learned velocity field, rather than sampling from a Gaussian whose mean and spread the network printed out (Chapter 7) &mdash; the top-right corner is effectively unreachable. PPO-style updates need the probability the policy assigned to the action it took, and a policy built that way has no closed-form probability to hand you; getting one costs an expensive integration you cannot afford per gradient step. The dashed path &mdash; clone, reweight into RL with AWR, then condition on advantage with RECAP &mdash; is how LeHome extracted RL-grade improvement from BC-grade machinery, finishing first of sixty-two teams at 79.63&nbsp;percent in the challenge's online round (Larchenko, 2026). Chapters 11 and 12 engineer the advantage and the inference procedure; Chapters 13 to 15 add the human, the simulator, and the capstone on your own hardware.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+Garment folding is this chapter's MDP made concrete. Observations \(o_t\) are three RGB images, overhead plus one per wrist &mdash; the cloth's true configuration is never observed. Actions are chunks \(a_{t:t+H}\) of twelve-dimensional bimanual joint deltas, emitted by a policy derived from \(\pi_{0.5}\), a vision-language-action model &mdash; a network mapping images and a text instruction to actions (Physical Intelligence, 2025a; Chapter 8). The raw reward is one bit, folded or not, after hundreds of steps, with \(\gamma = 0.999\) to keep it alive. Everything else in Larchenko's system &mdash; checkpoint rewards (Chapter 11), AWR (Chapter 4), RECAP (Chapter 10), human-in-the-loop DAgger (Chapter 13) &mdash; is machinery for making this sparse, partially observed, long-horizon MDP tractable.
+</div>
+
+<div class="box checkpoint"><div class="box-title">Checkpoint</div>
+<ul>
+<li>Explain, with the tipped-cube example, why supervised learning on demonstrations is not enough, and name the two comforts control removes.</li>
+<li>Write down the five parts of an MDP with an instance of each from your rover or SO-101, and say which part you author rather than discover.</li>
+<li>Compute discounted returns by hand with the backward sweep \(G_t = r_t + \gamma G_{t+1}\), and predict how they change when \(\gamma\) shrinks.</li>
+<li>Choose \(\gamma\) from episode length via the effective horizon \(1/(1-\gamma)\), and say why \(0.99\) is the wrong default for a 600-step sparse task.</li>
+<li>Define \(V^\pi\), \(Q^\pi\), and \(A^\pi\), and state the advantage in the &ldquo;better than my own average&rdquo; form without the formula.</li>
+<li>Place BC, DAgger, HIL-SERL, PPO, AWR, and RECAP on the online/offline and imitation/return axes, naming the chapter for each.</li>
+</ul>
+</div>
+
+<p><strong>Where to go deeper.</strong> Sutton and Barto (2018), chapters 3 and 4, remain the canonical treatment of MDPs, returns, and Bellman equations; read them alongside this chapter if the value definitions still feel slippery. Kaelbling, Littman, and Cassandra (1998) formalize POMDPs, and Ibarz et al. (2021) catalog why deep RL on physical robots fails in practice. Both are optional context beyond this book's core list. Appendix A sequences Sutton and Barto against the papers of the coming chapters, and Appendix B gives you the first experiment to run on your own rig.</p>
+
+</section>

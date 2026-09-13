@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>§2.6 in plain words — companion to Ch. 2 of “Reinforcement Learning for Real Robots”</title>
+<script>
+window.MathJax = {
+  tex: { inlineMath: [['\\(','\\)']], displayMath: [['\\[','\\]']] },
+  svg: { fontCache: 'none' }
+};
+</script>
+<script src="../textbook/assets/mathjax-tex-svg.js"></script>
+<style>
+:root{
+  --blue:#4878a8; --blue-bg:#eaf1f8;
+  --orange:#b0703a; --orange-bg:#f8efe8;
+  --green:#4a8a5c; --green-bg:#ecf5ee;
+  --red:#b04a4a; --red-bg:#fbeeee;
+  --ink:#333; --gray:#666; --line:#e3e8ef;
+}
+*{box-sizing:border-box}
+body{
+  margin:0 auto; max-width:920px; padding:40px 26px 90px;
+  font-family:"Noto Sans","Segoe UI",system-ui,sans-serif;
+  font-size:16px; line-height:1.55; color:var(--ink);
+}
+h1{font-size:29px; line-height:1.25; margin:0 0 6px}
+h2{font-size:21px; margin:52px 0 12px; padding-bottom:7px; border-bottom:2px solid var(--line)}
+h3{font-size:16.5px; margin:26px 0 8px}
+p{margin:10px 0}
+.sub{color:var(--gray); font-size:15px; margin-top:0}
+nav.chips{margin:18px 0 6px; display:flex; flex-wrap:wrap; gap:8px}
+nav.chips a{
+  background:var(--blue-bg); color:var(--blue); text-decoration:none;
+  border-radius:999px; padding:5px 13px; font-size:13.5px; font-weight:600;
+}
+nav.chips a:hover{background:var(--blue); color:#fff}
+.box{border-radius:6px; padding:14px 18px; margin:18px 0}
+.box .bt{font-weight:700; margin-bottom:6px; font-size:12.5px; letter-spacing:.05em; text-transform:uppercase}
+.box-plain{background:var(--blue-bg); border-left:4px solid var(--blue)}
+.box-jargon{background:var(--orange-bg); border-left:4px solid var(--orange)}
+.box-lehome{background:var(--green-bg); border-left:4px solid var(--green)}
+.box-pitfall{background:var(--red-bg); border-left:4px solid var(--red)}
+.box-key{background:#f4f4f1; border:1.5px solid var(--ink)}
+.box ul{margin:6px 0 2px; padding-left:20px}
+.box li{margin:4px 0}
+table.est{width:100%; border-collapse:collapse; font-size:14.5px; margin:16px 0}
+table.est th{
+  text-align:left; padding:9px 12px; background:var(--blue-bg);
+  font-size:12.5px; letter-spacing:.04em; text-transform:uppercase; color:var(--blue);
+}
+table.est td{padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top}
+.hl{background:#fdf0dd; border-radius:4px; padding:1px 6px; font-weight:600}
+pre.code{
+  background:#f7f8fa; border:1px solid var(--line); border-radius:6px;
+  padding:14px 16px; font:12.5px/1.55 "SFMono-Regular",Consolas,"Liberation Mono",monospace;
+  overflow-x:auto; margin:14px 0;
+}
+.duo{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:16px 0}
+@media (max-width:760px){.duo{grid-template-columns:1fr}}
+.panel{border:1px solid var(--line); border-radius:6px; overflow:hidden}
+.panel .ph{padding:8px 14px; font-weight:700; font-size:13.5px}
+.panel.good .ph{background:var(--green-bg); color:var(--green)}
+.panel.bad .ph{background:var(--red-bg); color:var(--red)}
+.panel pre.code{margin:0; border:0; border-radius:0; background:#fff}
+.badge{display:inline-block; font-size:12px; font-weight:700; border-radius:999px; padding:2px 10px; margin-left:8px; vertical-align:middle}
+.badge-ok{background:var(--green-bg); color:var(--green); border:1px solid var(--green)}
+.badge-no{background:var(--red-bg); color:var(--red); border:1px solid var(--red)}
+.setup{
+  background:var(--blue-bg); border:1px solid #d3e0ee; border-radius:6px;
+  padding:12px 16px; margin:14px 0; font-size:15px;
+}
+.step-card{
+  border:1.5px solid var(--blue); border-radius:6px; background:#fff;
+  padding:18px 22px; min-height:170px; margin:14px 0 10px;
+}
+.step-title{color:var(--blue); font-weight:700; font-size:12.5px; text-transform:uppercase; letter-spacing:.06em}
+.step-math{font-size:18.5px; margin:12px 0; line-height:1.7}
+.step-note{color:var(--gray); font-style:italic; font-size:14.5px}
+.stepbar{height:6px; background:var(--line); border-radius:3px; overflow:hidden; margin:6px 0 2px}
+.stepbar i{display:block; height:100%; background:var(--blue); width:12.5%}
+.stepcount{font-size:12.5px; color:var(--gray); margin-bottom:8px}
+button{
+  font:inherit; font-size:14.5px; padding:8px 20px; border-radius:6px;
+  border:1.5px solid var(--blue); background:var(--blue); color:#fff; cursor:pointer;
+}
+button.ghost{background:#fff; color:var(--blue)}
+button:disabled{opacity:.35; cursor:default}
+.btnrow{display:flex; gap:10px; margin:6px 0 8px}
+.cards{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:16px 0}
+@media (max-width:760px){.cards{grid-template-columns:1fr}}
+.card{border:1px solid var(--line); border-radius:6px; padding:14px 16px; background:#fbfcfe}
+.card .ct{font-weight:700; font-size:15px; margin-bottom:4px}
+.card .ch{color:var(--blue); font-size:12.5px; font-weight:700; letter-spacing:.04em; text-transform:uppercase}
+.bigquote{
+  font-size:21px; font-weight:700; text-align:center; padding:24px 12px;
+  border-top:2px solid var(--ink); border-bottom:2px solid var(--ink); margin:26px 0;
+}
+.fig{margin:24px 0}
+.fig svg{width:100%; height:auto; display:block; background:#fff; border:1px solid #eef1f5; border-radius:6px}
+.cap{font-size:13.5px; color:var(--gray); margin-top:8px}
+details{border:1px solid var(--line); border-radius:6px; padding:10px 16px; margin:10px 0; background:#fbfcfe}
+summary{cursor:pointer; font-weight:600}
+details p{margin:10px 0 4px}
+.map{background:var(--blue-bg); border-radius:6px; padding:16px 20px 16px 34px; margin:18px 0}
+.map li{margin:7px 0}
+.map b{color:var(--blue)}
+footer{margin-top:60px; padding-top:14px; border-top:1px solid var(--line); color:var(--gray); font-size:13px}
+</style>
+</head>
+<body>
+
+<h1>§2.6, in plain words</h1>
+<p class="sub">
+  A step-by-step companion to <em>Section 2.6 — “The hidden requirement, and the bridge to Part III”</em>
+  of <em>Reinforcement Learning for Real Robots</em>, Ch.&nbsp;2 (policy gradients).
+  The textbook itself is <strong>not modified</strong>; this page just walks the same section with numbers and pictures.
+  (If the equations don’t render, keep this file in <code>explanations/</code> — it loads MathJax from <code>../textbook/assets/</code>.)
+</p>
+
+<nav class="chips">
+  <a href="#s1">1 · The thread</a>
+  <a href="#s2">2 · The free lunch</a>
+  <a href="#s3">3 · When it stops being free</a>
+  <a href="#s4">4 · Pushing away</a>
+  <a href="#s5">5 · What survives</a>
+  <a href="#s6">6 · Recap + self-check</a>
+</nav>
+
+<div class="map">
+  <b>What §2.6 does in five beats</b>
+  <ol>
+    <li>Every estimator in Chapter 2 (REINFORCE, baseline, policy gradient theorem, actor loss) contains the <em>same factor</em>: \(\nabla_\theta \log \pi_\theta(a\mid s)\).</li>
+    <li>For ordinary policies (softmax, Gaussian) that factor is <em>free</em> — a five-line closed-form computation.</li>
+    <li>For modern generative robot policies (diffusion / flow matching) it is not cheaply available at all. That’s the “hidden requirement” of the title.</li>
+    <li>There’s a second, arguably bigger wall: these updates push probability mass <em>away from</em> bad actions, which can break a policy that learned a narrow family of good motions.</li>
+    <li>What survives: the <strong>advantage</strong>. The rest of the book is built on it. That’s the bridge to Part III.</li>
+  </ol>
+</div>
+
+<!-- ============ 1 ============ -->
+<h2 id="s1">1 · The thread running through every equation</h2>
+
+<p>Before §2.6 says anything new, point at something you already have: every method in this chapter is built from one shared ingredient. Look:</p>
+
+<table class="est">
+  <tr><th>Method (section)</th><th>What it computes</th></tr>
+  <tr>
+    <td>Policy gradient theorem (2.2)</td>
+    <td>\(\nabla_\theta J(\theta) = \mathbb{E}\!\Big[\sum_t A_t\; \nabla_\theta \log \pi_\theta(a_t\mid s_t)\Big]\)</td>
+  </tr>
+  <tr>
+    <td>REINFORCE (2.3)</td>
+    <td>\(\nabla_\theta J \approx \tfrac{1}{N}\sum_{i=1}^{N} R(\tau_i)\; \nabla_\theta \log \pi_\theta(\tau_i)\)</td>
+  </tr>
+  <tr>
+    <td>REINFORCE with baseline (2.4)</td>
+    <td>\(\nabla_\theta J \approx \tfrac{1}{N}\sum_{i=1}^{N} \big(R(\tau_i)-b\big)\; \nabla_\theta \log \pi_\theta(\tau_i)\)</td>
+  </tr>
+  <tr>
+    <td>Actor loss (2.5)</td>
+    <td>\(L = -\,\hat A\; \nabla_\theta \log \pi_\theta(a\mid s)\)</td>
+  </tr>
+</table>
+
+<p>Four methods, one bolded factor in all of them: <span class="hl">\(\nabla_\theta \log \pi_\theta(a\mid s)\)</span>. Here is what that thing actually is.</p>
+
+<div class="box box-plain">
+  <div class="bt">In plain words — the shared factor</div>
+  <ul>
+    <li>\(\pi_\theta(a\mid s)\): the probability (or density) your policy assigns to action \(a\) in state \(s\). \(\theta\) = the policy’s knobs (its network weights).</li>
+    <li>\(\log \pi_\theta(a\mid s)\): <em>how surprised the policy was</em> by this action. (Same information as the probability, on a log scale.)</li>
+    <li>\(\nabla_\theta \log \pi_\theta(a\mid s)\): for <em>each knob</em>, how fast that surprise would go down if you turned the knob. I.e., “the direction to turn the network so that <em>this exact action</em> becomes less surprising.”</li>
+    <li>The whole method, in English: <em>for every action you actually took, if it turned out well, turn the knobs so that action becomes less surprising; if it turned out badly, turn them the other way.</em></li>
+  </ul>
+</div>
+
+<div class="box box-pitfall">
+  <div class="bt">The hidden requirement (the title of the section)</div>
+  Using <em>any</em> of these methods means your policy can hand you an <strong>exact number</strong> for “how surprised I was by the action I just sampled” — and you can backpropagate through it. For classical policies this is so cheap that nobody thinks of it as a requirement. That invisibility is the trap: §2.6 is about the day it stops being met.
+</div>
+
+<!-- ============ 2 ============ -->
+<h2 id="s2">2 · When the policy is a Gaussian: the free lunch</h2>
+
+<p>Two common policy types. Both make the hidden requirement trivially easy.</p>
+
+<div class="duo">
+  <div class="panel good">
+    <div class="ph">Discrete actions: softmax <span class="badge badge-ok">log π: one lookup</span></div>
+    <pre class="code">The policy's output literally IS a
+probability vector:  [0.7, 0.3]
+
+sampled action a = 0  (the first one)
+log pi(a|s) = log 0.7 = -0.357   # done</pre>
+  </div>
+  <div class="panel good">
+    <div class="ph">Continuous actions: Gaussian <span class="badge badge-ok">log π: five lines</span></div>
+    <pre class="code">mu, log_std = policy_net(obs)
+var  = (2 * log_std).exp()
+logp = -0.5 * (((a - mu) ** 2) / var
+             + 2 * log_std
+             + math.log(2 * math.pi)).sum(-1)
+logp.backward()   # grad_theta log pi</pre>
+  </div>
+</div>
+
+<p>That’s the Gaussian from the book’s code block: a bell curve over actions, with mean \(\mu\) (where the policy “aims”) and spread \(\sigma\) (how confident it is). Its log-density is plain arithmetic — no sampling, no simulation. Let’s actually <em>do</em> the arithmetic, one step at a time, with real numbers.</p>
+
+<div class="setup">
+  <strong>Setup — no hand-waving, all numbers.</strong> The policy is a diagonal Gaussian on a 2-D action: the rover’s left/right wheel commands. The network has output
+  \(\mu = [0.2,\;-0.1]\) and \(\sigma = [0.5,\;0.5]\) (so \(\sigma^2 = 0.25\)).
+  It sampled the action \(a = [0.4,\;0.1]\).
+  <br><strong>Question:</strong> what is \(\log \pi(a\mid s)\), and what is \(\nabla_\theta \log \pi\) — the thing every update actually uses?
+</div>
+
+<div class="stepcount" id="stepcount">Step 1 of 8</div>
+<div class="stepbar"><i id="stepbar"></i></div>
+<div class="step-card">
+  <div class="step-title" id="step-title"></div>
+  <div class="step-math" id="step-math"></div>
+  <div class="step-note" id="step-note"></div>
+</div>
+<div class="btnrow">
+  <button class="ghost" id="btn-back">← Back</button>
+  <button id="btn-next">Next →</button>
+  <button class="ghost" id="btn-restart">Restart</button>
+</div>
+
+<div class="box box-plain">
+  <div class="bt">Read the finale like a story</div>
+  <ul>
+    <li>The <em>direction</em> \([0.8, 0.8]\) is <strong>identical</strong> whether the action was good or bad. What flips is only the sign of the reward.</li>
+    <li>Good action → step \(+100 \times [0.8, 0.8]\): the mean slides <em>toward</em> it. “Make good actions more likely.”</li>
+    <li>Bad action → step \(-100 \times [0.8, 0.8]\): the mean slides <em>away</em> from it. “Make bad actions <em>less</em> likely.”</li>
+    <li>That second sentence — <em>pushing away</em> — is the seed of the next wall. The book plants it on purpose.</li>
+  </ul>
+</div>
+
+<!-- ============ 3 ============ -->
+<h2 id="s3">3 · The moment it stops being free</h2>
+
+<p>Now change the policy. This is what happens from Chapter 5 onward (Ch.&nbsp;5: why Gaussians fail, Ch.&nbsp;6: diffusion, Ch.&nbsp;7: flow matching).</p>
+
+<p>A modern robot policy doesn’t emit one action. It emits an <strong>action chunk</strong> \(a_{t:t+H}\): a whole block of \(H\) future actions produced in one shot. And it doesn’t compute a probability — it <em>generates</em>. Start from pure noise, then run the network over and over, each pass nudging the blob a little closer to “looks like real motion”:</p>
+
+<div class="fig">
+  <svg viewBox="0 0 700 195" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans, sans-serif">
+    <defs>
+      <marker id="s26f1arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#4878a8"/>
+      </marker>
+    </defs>
+    <!-- z -->
+    <rect x="15" y="60" width="100" height="52" rx="6" fill="#f3f3f3" stroke="#666"/>
+    <text x="65" y="82" text-anchor="middle" font-size="15" font-weight="700" fill="#333">z</text>
+    <text x="65" y="99" text-anchor="middle" font-size="10" fill="#666">random noise</text>
+    <!-- arrow 1 -->
+    <line x1="115" y1="86" x2="150" y2="86" stroke="#4878a8" stroke-width="2" marker-end="url(#s26f1arr)"/>
+    <text x="133" y="76" text-anchor="middle" font-size="10.5" fill="#4878a8">vθ</text>
+    <!-- x1 -->
+    <rect x="155" y="60" width="80" height="52" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+    <text x="195" y="91" text-anchor="middle" font-size="13" fill="#333">x₁</text>
+    <!-- arrow 2 -->
+    <line x1="235" y1="86" x2="270" y2="86" stroke="#4878a8" stroke-width="2" marker-end="url(#s26f1arr)"/>
+    <text x="253" y="76" text-anchor="middle" font-size="10.5" fill="#4878a8">vθ</text>
+    <!-- x2 -->
+    <rect x="275" y="60" width="80" height="52" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+    <text x="315" y="91" text-anchor="middle" font-size="13" fill="#333">x₂</text>
+    <!-- arrow 3 -->
+    <line x1="355" y1="86" x2="390" y2="86" stroke="#4878a8" stroke-width="2" marker-end="url(#s26f1arr)"/>
+    <text x="373" y="76" text-anchor="middle" font-size="10.5" fill="#4878a8">vθ</text>
+    <!-- dots -->
+    <rect x="395" y="60" width="60" height="52" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+    <text x="425" y="94" text-anchor="middle" font-size="16" fill="#4878a8">⋯</text>
+    <!-- arrow 4 -->
+    <line x1="455" y1="86" x2="490" y2="86" stroke="#4878a8" stroke-width="2" marker-end="url(#s26f1arr)"/>
+    <text x="473" y="76" text-anchor="middle" font-size="10.5" fill="#4878a8">vθ</text>
+    <!-- chunk -->
+    <rect x="495" y="56" width="190" height="60" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+    <text x="590" y="80" text-anchor="middle" font-size="12" font-weight="700" fill="#333">action chunk</text>
+    <text x="590" y="98" text-anchor="middle" font-size="10" fill="#666">H future actions, one shot</text>
+    <!-- question -->
+    <text x="15" y="152" font-size="12.5" font-weight="700" fill="#b04a4a">Where does log πθ(a | o) live in this code?</text>
+    <text x="15" y="173" font-size="11.5" fill="#b04a4a">Nowhere. No line of it computes a probability — it just denoises, pass after pass.</text>
+  </svg>
+  <div class="cap">The generation pipeline of a flow-matching (or diffusion) policy. The network \(v_\theta\) learns a <em>velocity field</em> or a <em>denoiser</em> — “nudge this toward real motion” — not a probability. There is no line in the code that outputs \(\log \pi_\theta(a_{t:t+H}\mid o)\).</div>
+</div>
+
+<p>So where did the probability go? The book’s sentence, written as a formula. For a continuous-time flow, the probability of the output is the probability of the input <em>plus</em> a running total of how much the flow stretched or squeezed space along the way (the change-of-variables formula):</p>
+
+\[
+\log p(a) \;=\; \log p(z) \;+\; \int_0^{1} \operatorname{div} v_\theta(x_u, u)\, du
+\]
+
+<div class="box box-plain">
+  <div class="bt">In plain words</div>
+  <ul>
+    <li>\(\log p(z)\): you know this — \(z\) is Gaussian noise, easy.</li>
+    <li>\(\operatorname{div} v_\theta\): “how much is the flow spreading things out right here?” Positive = stretching, negative = squeezing.</li>
+    <li>The integral: <em>walk the whole generation path</em>, from noise to finished chunk, and keep a running total of that stretch at every point. That running total is the missing part of the log-probability.</li>
+  </ul>
+</div>
+
+<p>Do you see why this is not a free lunch? To get one number — the “surprise score” for one generated chunk — you must run and backpropagate through the <em>entire chain of denoising steps</em>, evaluating the divergence along the way. Compare with the Gaussian: five lines of arithmetic.</p>
+
+<p>Is it <em>impossible</em>? The book is careful here, because the strong claim — “the gradient cannot be computed at all” — is simply <strong>false</strong>, and real papers depend on that:</p>
+
+<table class="est">
+  <tr><th>Approach</th><th>What it does</th><th>Cost</th></tr>
+  <tr>
+    <td>Path integral (above)</td>
+    <td>Recover \(\log p(a)\) by integrating the divergence of the velocity field along the generation path</td>
+    <td>Unroll + backprop the full chain; numerical error; high variance</td>
+  </tr>
+  <tr>
+    <td>Denoising chain as its own MDP <span style="color:var(--gray);font-size:12.5px">(DPPO, Flow-GRPO)</span></td>
+    <td>Treat each denoising step as a state, each step taken as an “action”; run PPO on <em>those</em> steps instead</td>
+    <td>A complete second RL problem nested inside the first</td>
+  </tr>
+</table>
+
+<div class="box box-key">
+  <div class="bt" style="color:var(--ink)">Verdict</div>
+  <p style="margin:6px 0 0"><strong>In principle:</strong> computable. <strong>In practice:</strong> expensive, high-variance, nothing like the free lunch a Gaussian gives you. So in practice \(\log \pi_\theta\) is off the table — and REINFORCE, actor-critic, and PPO all stall at the same wall, for the same reason.</p>
+</div>
+
+<!-- ============ 4 ============ -->
+<h2 id="s4">4 · The wall nobody warns you about: pushing away</h2>
+
+<p>The tractability problem above is the famous one. The book says something bolder: it is <em>arguably not the most important</em> obstacle. Here’s the other one.</p>
+
+<p>Remember the finale of the worked example: a bad action produces a step that moves the mean <em>away</em> from it. A policy-gradient update does not just pull probability mass toward good actions — it also pushes mass <em>away from</em> bad ones. For the Gaussian in our example that’s harmless: it’s a fat, spread-out blob, and pushing mass around it just reshapes a blob. No tragedy.</p>
+
+<p>A generative policy is different in exactly the way that matters. Its whole value is that it has learned a <strong>narrow family</strong> of action chunks that are physically coherent — a thin “manifold” inside the enormous space of all possible action chunks. Almost all the probability mass sits on that thin surface. And now look what “push away from bad” does to a thin surface:</p>
+
+<div class="fig">
+  <svg viewBox="0 0 700 310" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans, sans-serif">
+    <defs>
+      <marker id="s26f2green" markerWidth="9" markerHeight="9" refX="7.5" refY="3" orient="auto">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#4a8a5c"/>
+      </marker>
+      <marker id="s26f2red" markerWidth="9" markerHeight="9" refX="7.5" refY="3" orient="auto">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#b04a4a"/>
+      </marker>
+    </defs>
+    <!-- incoherent territory dots -->
+    <circle cx="340" cy="40" r="4" fill="#666" opacity="0.55"/>
+    <circle cx="410" cy="26" r="4" fill="#666" opacity="0.55"/>
+    <circle cx="300" cy="58" r="4" fill="#666" opacity="0.55"/>
+    <circle cx="452" cy="44" r="4" fill="#666" opacity="0.55"/>
+    <text x="478" y="38" font-size="10.5" fill="#666">incoherent territory</text>
+    <!-- the manifold band -->
+    <path d="M 60 230 C 220 190, 300 120, 640 80" fill="none" stroke="#ecf5ee" stroke-width="64" stroke-linecap="round"/>
+    <path d="M 60 230 C 220 190, 300 120, 640 80" fill="none" stroke="#4a8a5c" stroke-width="1.5" stroke-dasharray="6 5" opacity="0.4"/>
+    <!-- band label -->
+    <line x1="240" y1="288" x2="200" y2="222" stroke="#999" stroke-width="1"/>
+    <text x="248" y="300" font-size="11" fill="#4a8a5c" font-weight="700">the manifold: the thin family of chunks that look physically coherent</text>
+    <!-- good chunk -->
+    <circle cx="192" cy="188" r="9" fill="#4a8a5c"/>
+    <text x="192" y="243" text-anchor="middle" font-size="10.5" fill="#4a8a5c" font-weight="700">good chunk</text>
+    <!-- bad chunk -->
+    <circle cx="395" cy="122" r="9" fill="#b04a4a"/>
+    <text x="415" y="168" font-size="10.5" fill="#b04a4a" font-weight="700">bad chunk</text>
+    <!-- pull arrow: bad -> good, along the band -->
+    <line x1="372" y1="133" x2="215" y2="181" stroke="#4a8a5c" stroke-width="2.5" marker-end="url(#s26f2green)"/>
+    <text x="205" y="118" font-size="10.5" fill="#4a8a5c" font-weight="700">“pull toward good” — stays on the manifold</text>
+    <!-- push arrow: off the band -->
+    <line x1="393" y1="113" x2="378" y2="56" stroke="#b04a4a" stroke-width="2.5" marker-end="url(#s26f2red)"/>
+    <text x="398" y="66" font-size="10.5" fill="#b04a4a" font-weight="700">“push away from bad” — points straight off it</text>
+  </svg>
+  <div class="cap">Notice the asymmetry. “Pull toward good” can travel <em>along</em> the manifold — it just moves you to a better coherent chunk. “Push away from bad” points <em>off</em> the manifold, because a thin surface has no “away from bad” direction that stays on the surface. The same update formula that was harmless for the fat Gaussian is now the mechanism that produces incoherent motion.</div>
+</div>
+
+<div class="box box-jargon">
+  <div class="bt">Analogies (with their limits, as always)</div>
+  <p style="margin:4px 0">Think of the policy as a painter who has learned that <em>arm motions look like this</em>. RL says two things: “make the good painting more likely” and “make the bad painting less likely.” The second instruction is like telling a painter <em>never paint the sky blue</em> — they stop producing anything that looks like a painting at all. <strong>Limit of the analogy:</strong> the real mechanism is geometric. You are literally shaving probability mass off a narrow surface, and a fat-tailed Gaussian has room to absorb that, while a narrow generative distribution does not.</p>
+</div>
+
+<!-- ============ 5 ============ -->
+<h2 id="s5">5 · What survives: the advantage</h2>
+
+<p>So the gradient-of-the-log-probability is, in practice, off the table. Does that mean no policy improvement at all? No — and this is the turn that organizes the whole rest of the book.</p>
+
+<p>Chapter 2’s central <em>quantity</em> is not the estimator. It is the <strong>advantage</strong> \(\hat A\): <em>how much better than average this action (chunk) did</em> — reward minus baseline, refined with GAE. And you can use \(\hat A\) to improve a policy <strong>without ever differentiating a log-probability</strong>:</p>
+
+<div class="cards">
+  <div class="card">
+    <div class="ch">Chapter 4</div>
+    <div class="ct">Weight the data by it — AWR</div>
+    <p style="margin:6px 0 0; font-size:14.5px">Train with weighted regression: chunks with high advantage count more, \(e^{\hat A/\beta}\). No gradient of \(\log \pi\) anywhere — it’s supervised learning with smart weights.</p>
+  </div>
+  <div class="card">
+    <div class="ch">Chapter 10</div>
+    <div class="ct">Condition on it — RECAP</div>
+    <p style="margin:6px 0 0; font-size:14.5px">Feed \(\hat A\) to the policy <em>as an input</em>: “given a high score, produce a good action.” The generative model is never differentiated through a likelihood.</p>
+  </div>
+  <div class="card">
+    <div class="ch">Chapter 11</div>
+    <div class="ct">Engineer better estimates of it</div>
+    <p style="margin:6px 0 0; font-size:14.5px">Value heads, GAE, damped baselines — everything from §2.4–2.5 about making \(\hat A\) lower-variance still applies, untouched.</p>
+  </div>
+  <div class="card">
+    <div class="ch">Chapter 12</div>
+    <div class="ct">Rank candidates with it at inference time</div>
+    <p style="margin:6px 0 0; font-size:14.5px">Generate many candidate chunks, score each with \(\hat A\), pick the best. Policy improvement that happens at <em>test time</em>, not training time.</p>
+  </div>
+</div>
+
+<div class="bigquote">“The estimator is disposable. The advantage is not.”<br>
+<span style="font-size:15px; font-weight:400; color:var(--gray)">That sentence is the thesis of the rest of this book.</span></div>
+
+<div class="box box-lehome">
+  <div class="bt">In the LeHome solution</div>
+  <p style="margin:6px 0 0">None of this chapter’s estimators run on Larchenko’s policy. \(\pi_{0.5}\) generates action chunks by flow matching, so \(\log \pi_\theta(a_{t:t+H}\mid o)\) — the term every equation in this chapter differentiates — is not something you can cheaply evaluate, and PPO was off the table from the first day (Larchenko, 2026). The chapter’s central quantity survives intact: his solution estimates advantages with a success-probability value head \(\hat p_{succ}\), GAE, and a damped \(\alpha V\) baseline (Ch.&nbsp;11), then consumes those advantages through AWR weighting (Ch.&nbsp;4) and RECAP conditioning (Ch.&nbsp;10).</p>
+</div>
+
+<!-- ============ 6 ============ -->
+<h2 id="s6">6 · Recap, and three questions to check on yourself</h2>
+
+<p><strong>Three sentences.</strong> (1)&nbsp;Every policy-gradient method needs \(\nabla_\theta \log \pi_\theta(a\mid s)\) — an exact, differentiable “surprise score” for the action you sampled. (2)&nbsp;Gaussian policies hand you that for free; generative (diffusion/flow) policies don’t — in practice it’s off the table — and besides, these methods push mass <em>away</em> from bad actions, which can shred the narrow family of good motions a generative policy learned. (3)&nbsp;So the book changes course: keep the advantage, drop the gradient. That is the bridge to Part III.</p>
+
+<details>
+  <summary>Q1 — A colleague says: “If we can’t compute the gradient of the log-prob, we can’t learn the policy at all.” What’s true, and what’s false?</summary>
+  <p><strong>True:</strong> standard REINFORCE / actor-critic / PPO updates <em>need</em> that factor, so they stall. <strong>False:</strong> “can’t learn at all” — you can still improve with the advantage alone (weight data: AWR; condition on it: RECAP; rank at inference time). And “impossible” is too strong: for flows, \(\log p(a)\) is computable in principle via the path integral, and DPPO / Flow-GRPO run PPO on the denoising steps — it’s just expensive and high-variance, not unavailable.</p>
+</details>
+
+<details>
+  <summary>Q2 — In the worked example, why does ∂log π/∂μ = (a − μ)/σ² point from μ toward a?</summary>
+  <p>The log-density is \(-\tfrac12 (a-\mu)^2/\sigma^2 +\) const. Differentiate with respect to \(\mu\): the squared term shrinks when \(\mu\) moves <em>toward</em> \(a\), and the derivative works out to \(+(a-\mu)/\sigma^2\). With \(a=0.4\), \(\mu=0.2\): positive, so “increase \(\mu\)” — i.e., aim closer to the action you took. The spread \(\sigma\) is in the denominator, so a confident (narrow) policy reacts more strongly per unit of surprise.</p>
+</details>
+
+<details>
+  <summary>Q3 — Why does “push away from bad” hurt a generative policy but not the Gaussian?</summary>
+  <p>The Gaussian’s mass is a fat blob — pushing mass away from a bad point just reshapes the blob, and the tails absorb it. A generative policy’s mass lives on a thin manifold of physically coherent chunks (that narrowness is exactly its value). “Push away” has no direction that stays on the surface, so it shoves predictions <em>off</em> the manifold — into incoherent motion. Same update formula; totally different geometry.</p>
+</details>
+
+<details>
+  <summary>Words you will hear (for reading papers)</summary>
+  <ul>
+    <li><strong>log-likelihood / log-probability:</strong> the “surprise” number \(\log \pi(a\mid o)\); the thing every policy-gradient update differentiates.</li>
+    <li><strong>likelihood:</strong> \(p(a\mid o)\) of a <em>generated</em> action — “how likely was that output?” For flows it’s buried in the path integral.</li>
+    <li><strong>change of variables:</strong> the rule that probability of the output = probability of the input × how much the map stretched space; the continuous version accumulates that stretch (“divergence”) as an integral.</li>
+    <li><strong>manifold:</strong> a thin surface in a high-dimensional space — here, the set of action chunks that look physically coherent.</li>
+    <li><strong>AWR / AWAC:</strong> Advantage-Weighted Regression (Ch.&nbsp;4) — policy improvement by reweighting, no \(\log\pi\) gradient.</li>
+    <li><strong>RECAP:</strong> advantage-conditioned policy (Ch.&nbsp;10).</li>
+    <li><strong>DPPO / Flow-GRPO:</strong> methods that treat the denoising steps as their own MDP and run PPO on them.</li>
+  </ul>
+</details>
+
+<footer>
+  Companion notes for §2.6 only — the textbook was not modified. Source: <code>textbook/chapters/ch02-policy-gradients.html</code>, section 2.6 (incl. its LeHome box and checkpoint). Palette and box conventions follow <code>textbook/STYLE.md</code>.
+</footer>
+
+<script>
+const steps = [
+  {
+    t: "Step 1 · Distance from the mean",
+    m: "\\[ a - \\mu = [0.4-0.2,\\; 0.1-(-0.1)] = [0.2,\\; 0.2] \\]",
+    n: "The action landed 0.2 to the right of the mean on both wheels. That’s the raw “surprise” before any bookkeeping."
+  },
+  {
+    t: "Step 2 · Square it",
+    m: "\\[ [0.2,\\;0.2]^{\\,2} = [0.04,\\;0.04] \\]",
+    n: "The Gaussian punishes distance, and squaring drops the sign: 0.2 above or below the mean is equally surprising."
+  },
+  {
+    t: "Step 3 · Scale by the spread",
+    m: "\\[ \\frac{[0.04,\\;0.04]}{\\sigma^2} = \\frac{[0.04,\\;0.04]}{0.25} = [0.16,\\;0.16] \\]",
+    n: "σ = 0.5 means a deviation of 0.2 is small — a mild surprise. A tighter policy (smaller σ) would score the same action as much more surprising."
+  },
+  {
+    t: "Step 4 · The normalizer (per dimension)",
+    m: "\\[ 2\\log\\sigma = 2\\log 0.5 = -1.39 \\qquad\\qquad \\log(2\\pi) = +1.84 \\]",
+    n: "Bookkeeping that makes the bell curve’s probabilities add up to 1. These numbers are identical whether you sampled 0.4 or −3 — only step 1–3 depends on the action."
+  },
+  {
+    t: "Step 5 · Add everything, per dimension",
+    m: "\\[ \\text{per dim: } 0.16 - 1.39 + 1.84 = 0.61 \\qquad\\Rightarrow\\qquad \\text{both dims: } 0.61 + 0.61 = 1.22 \\]",
+    n: "That’s the whole inside of the formula from the code block: the squared-error term plus the two normalizer terms, summed over the 2 action dimensions."
+  },
+  {
+    t: "Step 6 · The log-probability",
+    m: "\\[ \\log \\pi(a\\mid s) = -\\tfrac{1}{2} \\times 1.22 = -0.61 \\qquad\\Rightarrow\\qquad \\pi(a\\mid s) = e^{-0.61} \\approx 0.54 \\]",
+    n: "The policy “expected” this action about half the time. Mild surprise — exactly the intuition from step 3. One number, five lines of arithmetic, no sampling involved."
+  },
+  {
+    t: "Step 7 · The gradient — the part every update actually uses",
+    m: "\\[ \\frac{\\partial\\,\\log \\pi}{\\partial \\mu} = \\frac{a-\\mu}{\\sigma^2} = \\frac{[0.2,\\;0.2]}{0.25} = [0.8,\\;0.8] \\]",
+    n: "The knob-turning direction: to make this action less surprising, move the mean 0.8 units toward it on each wheel. This is ∇θ log π — the bolded factor in every equation of Chapter 2 — computed by autograd for free."
+  },
+  {
+    t: "Step 8 · And that’s the whole game",
+    m: "\\[ R = +100:\\; \\Delta \\theta \\propto +100 \\times [0.8,0.8] = [+80,+80] \\quad\\text{(mean slides toward }a\\text{)} \\[2ex] R = -100:\\; \\Delta \\theta \\propto -100 \\times [0.8,0.8] = [-80,-80] \\quad\\text{(mean slides away from }a\\text{)} \\]",
+    n: "Good action → “make it more likely”. Bad action → “make it less likely”. Note the direction [0.8, 0.8] is identical in both rows — the sign of the reward decides pull vs. push. That push is the seed of wall #2 in section 4 below."
+  }
+];
+let i = 0;
+const elTitle = document.getElementById("step-title");
+const elMath = document.getElementById("step-math");
+const elNote = document.getElementById("step-note");
+const elBar = document.getElementById("stepbar");
+const elCount = document.getElementById("stepcount");
+const btnBack = document.getElementById("btn-back");
+const btnNext = document.getElementById("btn-next");
+
+function render() {
+  const s = steps[i];
+  elTitle.textContent = s.t;
+  elMath.innerHTML = s.m;
+  elNote.textContent = s.n;
+  elBar.style.width = ((i + 1) / steps.length * 100) + "%";
+  elCount.textContent = "Step " + (i + 1) + " of " + steps.length;
+  btnBack.disabled = (i === 0);
+  btnNext.disabled = (i === steps.length - 1);
+  if (window.MathJax && MathJax.typesetPromise) MathJax.typesetPromise([elMath]);
+}
+btnNext.addEventListener("click", () => { if (i < steps.length - 1) { i++; render(); } });
+btnBack.addEventListener("click", () => { if (i > 0) { i--; render(); } });
+document.getElementById("btn-restart").addEventListener("click", () => { i = 0; render(); });
+window.addEventListener("load", render);
+render();
+</script>
+
+</body>
+</html>

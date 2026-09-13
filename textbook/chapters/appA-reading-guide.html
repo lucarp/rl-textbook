@@ -1,0 +1,168 @@
+<section class="chapter" id="appA">
+<h1>Appendix A &mdash; Paper-by-paper reading guide</h1>
+
+<p>This appendix turns the book's load-bearing citations into a study plan &mdash; the papers worth hours of your time, not every work the chapters cite in passing. Every entry tells you three things: what the paper contributes, which sections to read, and which sections you may skip without guilt. The skipping instructions matter as much as the reading ones.</p>
+
+<p>Each entry carries a <strong>tier</strong>, a reading-depth label that says how much of your week the paper deserves. <strong>Tier 1</strong> means read deeply, with a pen: work the derivations the book only sketched, and reproduce one figure or equation yourself. Budget three to five hours. <strong>Tier 2</strong> means read once, for the single idea the book borrows; do not fight the proofs. Budget about an hour. <strong>Tier 3</strong> means skim, or file it as a reference for when a detail matters. Budget twenty minutes, and zero if the week is full.</p>
+
+<p>If you have been dropped into an unfamiliar codebase, the tiers will feel familiar. Tier 1 is stepping through a function in a debugger until you could rewrite it. Tier 2 is reading the docstring and one call site. Tier 3 is knowing the file exists so you can grep it in six weeks. The analogy has one limit: code tells you when you have misunderstood it, because the test goes red. A paper never does; you can misread one for a year and feel fine. Hence the pitfall box below.</p>
+
+<p>Read in <em>book order</em>, not chronological order: the list is a dependency graph, and book order is one topological sort of it, each paper placed where you first have the vocabulary for it. Chronological order is closer to <code>git log</code>, abandoned branches and all &mdash; but paper dependencies, unlike imports, are partial, so you can often read half a paper long before you can read all of it.</p>
+
+<div class="box jargon"><div class="box-title">Words you will hear</div>
+<strong>Ablation.</strong> An experiment that removes one component to show it mattered; often the most informative table in a paper. <strong>Preprint vs camera-ready.</strong> The arXiv and conference versions may differ; when numbers disagree, the later one wins. <strong>ELBO.</strong> Evidence lower bound &mdash; the variational objective diffusion papers derive, then simplify away; you can skip it. <strong>Reduction.</strong> A proof technique turning one problem into another with known guarantees, as DAgger reduces imitation to online learning. <strong>Supplementary.</strong> The appendix-after-the-appendix, where hyperparameters hide.</div>
+
+<h2>A.1 Foundations and policy gradients (Chapters 1&ndash;2)</h2>
+
+<p><strong>REINFORCE</strong> (Williams, 1992) &mdash; Machine Learning 8(3&ndash;4). Tier 2. The original score-function gradient estimator and the first proof that subtracting a baseline leaves the gradient unbiased. Read Sections 1&ndash;2 and the algorithm statement; skip the episodic variants and the 1992-era network machinery. Chapter 2 rederives what you need.</p>
+
+<p><strong>Policy gradient theorem</strong> (Sutton, McAllester, Singh, and Mansour, 1999) &mdash; NeurIPS 1999. Tier 2. Shows that the gradient of \(J(\theta)\) needs no derivative of the state distribution, which is why policy gradients are computable at all. Read the theorem and the function-approximation section; skim the convergence result.</p>
+
+<h2>A.2 Trust regions, PPO, and GAE (Chapter 3)</h2>
+
+<p><strong>TRPO</strong> (Schulman et al., 2015) &mdash; arXiv 1502.05477. Tier 3. Read Sections 1&ndash;4 for the monotonic-improvement bound and the KL-constraint idea; skip the conjugate-gradient implementation. PPO replaced it in practice, and the bound is what survives.</p>
+
+<p><strong>PPO</strong> (Schulman et al., 2017) &mdash; arXiv 1707.06347. Tier 1. The clipped surrogate objective you have already trained with. The paper is short; read all of it, and hand-trace the clip logic for one ratio \(\rho_t\) above \(1+\epsilon\) and one below \(1-\epsilon\). Read it with your rl-rover TensorBoard curves open; that closes the loop.</p>
+
+<p><strong>GAE</strong> (Schulman et al., 2016) &mdash; arXiv 1506.02438. Tier 1. The \(\lambda\)-weighted sum of TD residuals \(\delta_t\) as a bias&ndash;variance dial for \(\hat{A}_t\) &mdash; used verbatim in LeHome. Read Sections 1&ndash;3 with a pen; skim the trust-region value-fitting section.</p>
+
+<h2>A.3 RL as weighted behavior cloning (Chapter 4)</h2>
+
+<p><strong>AWR</strong> (Peng et al., 2019) &mdash; arXiv 1910.00177. Tier 1. The hinge of this book: RL as supervised regression with weights \(w_i = \exp(\hat{A}_i/\beta)\). Work through the constrained-policy-search derivation in Section 3 and the appendix &mdash; it is the one derivation everything after Chapter 4 stands on.</p>
+
+<p><strong>AWAC</strong> (Nair et al., 2020) &mdash; arXiv 2006.09359. Tier 2. AWR with an off-policy Q-function critic, built for offline pretraining followed by online fine-tuning &mdash; the shape of every modern robot pipeline, including yours. Read the introduction and Algorithm 1; skip the benchmark tables.</p>
+
+<h2>A.4 Generative policies I: the diffusion lineage (Chapter 6, with background for Chapter 5)</h2>
+
+<p>Chapter 5 gets no reading slot of its own, and that is deliberate: it surveys the generative families rather than following one paper. Two entries below still bear on it &mdash; ACT for the conditional-VAE alternative, DDPM for the iterative-refinement argument. Its other distinctive citations, the GAN paper (Goodfellow et al., 2014) and RT-2 (Brohan et al., 2023), are worth knowing by name but not worth hours on this timeline.</p>
+
+<p><strong>DDPM</strong> (Ho et al., 2020) &mdash; arXiv 2006.11239. Tier 2. The paper that made diffusion practical: a fixed forward noising process, a network trained to predict the noise added, and the sampler that walks back down the noise levels \(k\). Read Sections 2 and 3, especially where the variational objective collapses into a plain mean-squared-error loss on predicted noise; skip the ELBO derivation.</p>
+
+<p><strong>Diffusion Policy</strong> (Chi et al., 2023) &mdash; arXiv 2303.04137. Tier 1. The primary source for Chapter 6: a visuomotor policy &mdash; camera pixels in, motor commands out &mdash; expressed as a conditional denoising process over a whole action chunk \(a_{t:t+H}\), executed receding-horizon: predict a long chunk, execute only its first few actions, then re-plan. Read the method and ablations closely, especially prediction horizon versus execution horizon &mdash; that one table explains more about chunked control than any prose can; skim the benchmark task descriptions unless you mean to reproduce one.</p>
+
+<p><strong>DDIM</strong> (Song et al., 2020) &mdash; arXiv 2010.02502. Tier 3. A deterministic, non-Markovian sampler that reaches comparable samples in far fewer steps \(K\). Read the sampling section only. When a diffusion policy is too slow at inference, this is the first knob, and Chapter 12 assumes it exists.</p>
+
+<p><strong>ACT / action chunking</strong> (Zhao et al., 2023) &mdash; arXiv 2304.13705. Tier 2. The ALOHA paper, which introduced Action Chunking with Transformers: predict a block of \(H\) actions at once, then blend overlapping predictions by temporal ensembling. Its generative model is a conditional VAE &mdash; an encoder-decoder that samples from a learned latent distribution &mdash; not a diffusion model, which cleanly separates what chunking buys you from what the generative family buys you. Read Section 3 for the CVAE formulation and the temporal-ensembling description; skip the ALOHA hardware sections and the bimanual teleoperation setup, which do not transfer to a single SO-101 pair.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+Diffusion Policy and ACT are the two entries you can run the week you read them. LeRobot ships both, and your frozen 24-episode cube dataset is enough for either &mdash; no new teleoperation session needed. Train ACT and a diffusion policy on that <em>same</em> dataset, then vary only the execution horizon. You will feel the difference between committing to eight actions and committing to two, and every later discussion of chunking will have a memory attached. Appendix B's E5 and E6 are this experiment written out, with hour budgets and a gate.</div>
+
+<h2>A.5 Generative policies II: flow matching (Chapter 7)</h2>
+
+<p><strong>Flow matching</strong> (Lipman et al., 2023) &mdash; arXiv 2210.02747. Tier 2. Trains a velocity field \(v_\theta(a^u, u, o)\) by regression along straight-line interpolants &mdash; no likelihoods, no ODE solves during training. Read Sections 1&ndash;3 for the conditional flow-matching trick, where an intractable target becomes tractable because the conditional and marginal objectives share a gradient, and the optimal-transport part of Section 4 for the straight-line interpolant; skip the appendix proofs.</p>
+
+<p><strong>Classifier-free guidance</strong> (Ho and Salimans, 2022) &mdash; arXiv 2207.12598. Tier 2. Train conditional and unconditional models jointly by dropping the condition at random, then extrapolate between the two predictions with scale \(g\) at sampling time. A short workshop paper; read it all. Chapter 10 reuses the trick on advantage conditioning, and Chapter 12 turns \(g\) into an inference-time knob.</p>
+
+<h2>A.6 Vision-language-action models (Chapter 8)</h2>
+
+<p><strong>Pi0</strong> (Black et al., 2024) &mdash; arXiv 2410.24164. Tier 2. The first of the family: a pretrained vision-language backbone with a flow-matching action expert grafted on, trained on a large cross-embodiment dataset &mdash; many robot types pooled into one training set. Read the architecture section and how the action expert exchanges information with the backbone; skip the evaluation tables and the dataset-composition breakdown. Reading it first makes \(\pi_{0.5}\) half as long, because \(\pi_{0.5}\) assumes it.</p>
+
+<p><strong>\(\pi_{0.5}\)</strong> (Physical Intelligence, 2025a) &mdash; arXiv 2504.16054. Tier 1. The vision-language-action model underneath the LeHome solution: a VLM backbone with a flow-matching action expert emitting chunks \(a_{t:t+H}\). Read the architecture and co-training sections closely, including hierarchical inference, where the model first emits a language subtask and then acts on it; skim the evaluation.</p>
+
+<h2>A.7 The comparison chapter (Chapter 9)</h2>
+
+<p>Chapter 9 has no primary source: nobody has written the paper that sits PPO and VLA-RL side by side. Build it yourself: read PPO (Section A.2) and \(\pi_{0.5}\) (Section A.6) back to back, and write down every place where the second has no equivalent of something the first needs. That list &mdash; no per-action log-probability, no on-policy data, no ratio \(\rho_t\) to clip &mdash; is the chapter in raw form.</p>
+
+<h2>A.8 Learning by conditioning (Chapter 10)</h2>
+
+<p><strong>\(\pi^*_{0.6}\) / RECAP</strong> (Physical Intelligence, 2025b) &mdash; arXiv 2511.14759. Tier 1. Advantage-conditioned policies: instead of reweighting data, label each chunk with an advantage condition \(c\) &mdash; in the paper a binary indicator thresholded at \(\epsilon_A\) and written into the input as a text token reading &ldquo;Advantage: positive&rdquo; or &ldquo;Advantage: negative&rdquo; &mdash; then ask for the positive label at inference. Read the RECAP method section twice &mdash; it is Chapter 10 in primary-source form &mdash; plus the value-learning details and how the per-task threshold is set, by percentile rather than by sign; skim the fleet results.</p>
+
+<h2>A.9 Reward and advantage engineering (Chapter 11)</h2>
+
+<p><strong>Potential-based shaping</strong> (Ng, Harada, and Russell, 1999) &mdash; ICML 1999. Tier 2. Shaping rewards of the form \(\gamma \Phi(s_{t+1}) - \Phi(s_t)\) are the only ones guaranteed to preserve the optimal policy. Read the theorem and the bicycle example, the clearest published account of reward hacking; skip the proofs.</p>
+
+<p><strong>CUPED</strong> (Deng et al., 2013) &mdash; WSDM 2013. Tier 3. Control variates &mdash; subtracting a correlated quantity you can predict, to shrink variance &mdash; applied to A/B testing; LeHome's damped baseline \(\alpha V\) is this estimator transplanted into advantage estimation. Read Section 3 for the variance-optimal coefficient; the rest is web experimentation.</p>
+
+<p><strong>GRPO</strong> (Shao et al., 2024) &mdash; arXiv 2402.03300. Tier 3. The DeepSeekMath paper. Only the group-relative advantage matters here &mdash; scoring each rollout against the mean of its siblings &mdash; the anchor Chapter 11 uses against stale value heads. Read Section 4; skip the benchmarks.</p>
+
+<h2>A.10 Inference-time optimization (Chapter 12)</h2>
+
+<p><strong>Thompson sampling</strong> (Thompson, 1933) &mdash; Biometrika 25. Tier 3, a historical pleasure worth one evening. Pair it with the <strong>tutorial</strong> (Russo et al., 2018) &mdash; arXiv 1707.02038, Tier 2: read Chapters 1&ndash;4 on Bernoulli bandits with Beta posteriors, exactly the machinery that tunes LeHome's seven inference knobs online; skip the approximate-inference chapters.</p>
+
+<p><strong>Real-Time Chunking</strong> (Black et al., 2025) &mdash; arXiv 2506.07339. Tier 2. Frames chunk switching as inpainting: freeze the overlap with the chunk currently executing, then generate the rest consistently with it. Read the method; skim the latency analysis. This is the origin of Chapter 12's inpainting knob.</p>
+
+<h2>A.11 Imitation and the human in the loop (Chapter 13)</h2>
+
+<p><strong>DAgger</strong> (Ross, Gordon, and Bagnell, 2011) &mdash; arXiv 1011.0686. Tier 1. Why behavior cloning compounds errors quadratically in horizon, and how on-policy relabeling makes the growth linear. Read the full paper, including the reduction argument; the no-regret machinery can be skimmed on a first pass.</p>
+
+<p><strong>HG-DAgger</strong> (Kelly et al., 2019) &mdash; arXiv 1810.02890. Tier 2. Human-gated DAgger: the expert decides when to seize control, so every intervention marks a state the policy handled badly. This is your RB-to-intervene gesture, written up. Read the gating section and the risk metric; skip the driving-simulator specifics.</p>
+
+<p><strong>HIL-SERL</strong> (Luo et al., 2024) &mdash; arXiv 2410.21845. Tier 1. The pipeline you run on the SO-101. Read the full system section against your own actor/learner logs &mdash; intervention handling, reward interface, replay design &mdash; and the ablations on human corrections. Nothing to skip; it is all operational, and your 98% intervention rate is a number it helps you interpret.</p>
+
+<h2>A.12 Simulation and rollout collection (Chapter 14)</h2>
+
+<p><strong>Difficulty-targeted selection</strong> (Sun et al., 2025) &mdash; arXiv 2506.05316. Tier 3. Training signal peaks on examples the policy succeeds at roughly half the time; LeHome's hard mining applies this to rollout selection. Read the introduction and the selection rule; the LLM details do not transfer.</p>
+
+<h2>A.13 The capstone sources (Chapter 15)</h2>
+
+<p><strong>LeHome tech report</strong> (Larchenko, 2026) &mdash; arXiv 2606.27163. Tier 1. The case study this book is built around: \(\pi_{0.5}\) plus AWR plus RECAP, auxiliary heads, the full advantage formula, inference-time bandits, and the sim-to-real playbook. Read it twice: once after Chapter 10, when the training story will parse, and again line by line before starting the capstone.</p>
+
+<p><strong>BEHAVIOR-1K report</strong> (Larchenko et al., 2025) &mdash; arXiv 2512.06951. Tier 2. The earlier win that seeded LeHome's architecture choices and chunk post-processing logic. Read for lineage after the LeHome report; skim the benchmark engineering.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+The minimum viable reading list behind LeHome is six entries: GAE for \(\hat{A}_t\), AWR for the weights \(w_i\), \(\pi_{0.5}\) for the architecture, RECAP for advantage conditioning, CUPED for the damped baseline \(\alpha V\), and the Russo tutorial for the inference-time bandit. Everything else explains why those six are reasonable rather than arbitrary. That is no argument for skipping the rest &mdash; a system you can only copy is a system you cannot debug &mdash; but it says where to start if a deadline compresses the plan.</div>
+
+<h2>A.14 Beyond papers</h2>
+
+<p><strong>Sutton and Barto</strong>, <em>Reinforcement Learning: An Introduction</em>, 2nd edition (2018). Reference. When a foundation wobbles, its own Chapters 3&ndash;6 (MDPs, dynamic programming, TD learning) and its own Chapter 13 (policy gradients) are the canonical patch &mdash; those are Sutton and Barto's chapter numbers, not this book's. Do not read it cover to cover on this timeline.</p>
+
+<p><strong>CS224R</strong> (Chelsea Finn, Stanford). Lecture-format coverage of deep RL for robotics: offline RL, imitation, and real-robot case studies. Use the offline-RL lecture as a second angle on Chapters 4 and 10 whenever the papers feel too compressed.</p>
+
+<p><strong>LeRobot</strong> (Hugging Face). The codebase your hil-serl project already runs. Treat it as a primary source: when a paper's description of intervention handling or chunk execution is ambiguous, the resolution is in this repository, not in another paper.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Reading papers without running code. A week of passive reading produces the feeling of understanding; twenty minutes of predicting what a change does to your own runs &mdash; then checking &mdash; produces the real thing. Pair every Tier 1 paper with an experiment on rl-rover or the SO-101 &mdash; Appendix B names twelve rungs across the fifteen chapters, each with an hour budget and a gate &mdash; or improvise: change \(\lambda\), change \(\beta\), break the baseline on purpose. If you cannot name the experiment a paper suggests, you have not finished reading it. Second pitfall: tier drift. Everything feels Tier 1 while you are reading it. Set a timer.</div>
+
+<h2>A.15 A twelve-week cadence</h2>
+
+<p>Does this list fit the time you have? The raw count of twenty-eight entries misleads, because a Tier 3 skim and a Tier 1 study are not the same unit of work. So weight them: count a Tier 1 paper as one full <em>paper-equivalent</em>, a Tier 2 as one half, a Tier 3 as one quarter.</p>
+
+<div class="key-eq">\[ N_{\text{eq}} = 1.0 \, n_1 + 0.5 \, n_2 + 0.25 \, n_3 \]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The left side, \(N_{\text{eq}}\), is the size of the reading list in &ldquo;one deep paper&rdquo; units &mdash; the currency you budget in. On the right, \(n_1\) counts the Tier 1 entries, \(n_2\) the Tier 2, \(n_3\) the Tier 3. The coefficients \(1.0\), \(0.5\), \(0.25\) say a Tier 2 read costs about half a Tier 1 and a Tier 3 skim about a quarter &mdash; a deliberately conservative rounding, not a reading of the hour budgets above, which at face value would make Tier 2 a third to a fifth of Tier 1 and Tier 3 under a tenth. The rounding gives the lighter tiers room, because skims expand. Change them if your pace differs, and redo the arithmetic.</div>
+
+<p>Counting the entries above gives 9 Tier 1, 13 Tier 2, and 6 Tier 3. Substituting, one term at a time:</p>
+
+<div class="key-eq">\[ N_{\text{eq}} = 1.0 \times 9 + 0.5 \times 13 + 0.25 \times 6 = 9 + 6.5 + 1.5 = 17.0 \]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+Seventeen paper-equivalents of work. The nine Tier 1 papers contribute nine units, since each counts fully. The thirteen Tier 2 papers contribute six and a half, half of thirteen. The six Tier 3 papers contribute one and a half, a quarter of six. Adding the subtotals gives seventeen. Notice that the Tier 2 entries dominate by count yet cost less than the Tier 1 ones: your week is decided by the Tier 1 column.</div>
+
+<p>Spread over twelve weeks, \(17.0 / 12 \approx 1.42\) paper-equivalents per week. In practice that is three deep papers every four weeks &mdash; the nine Tier 1 entries over twelve weeks &mdash; plus roughly one Tier 2 read a week and a Tier 3 skim every other week. Priced at the Tier 1 rate of three to five hours per equivalent, that is about four to seven hours of reading a week; summing the raw hour budgets instead gives three and a half to five, the gap being the conservatism in the weights. Either way most of your 15 to 20 hours a week is left for building and debugging. The hiring signal comes from the rigs, not the reading list.</p>
+
+<p>The same count, section by section, each line multiplying entries by their tier weights.</p>
+
+<pre class="code">section  entries (tier)                          weighted        subtotal
+A.1      REINFORCE(2) PGtheorem(2)               .5+.5             1.00
+A.2      TRPO(3) PPO(1) GAE(1)                   .25+1+1           2.25
+A.3      AWR(1) AWAC(2)                          1+.5              1.50
+A.4      DDPM(2) DiffPolicy(1) DDIM(3) ACT(2)    .5+1+.25+.5       2.25
+A.5      FlowMatching(2) CFG(2)                  .5+.5             1.00
+A.6      Pi0(2) \(\pi_{0.5}\)(1)                         .5+1              1.50
+A.7      (no primary source)                     none              0.00
+A.8      RECAP(1)                                1                 1.00
+A.9      Ng(2) CUPED(3) GRPO(3)                  .5+.25+.25        1.00
+A.10     Thompson(3) Russo(2) RTC(2)             .25+.5+.5         1.25
+A.11     DAgger(1) HGDAgger(2) HILSERL(1)        1+.5+1            2.50
+A.12     Sun(3)                                  .25               0.25
+A.13     LeHome(1) BEHAVIOR(2)                   1+.5              1.50
+                                                 TOTAL            17.00</pre>
+
+<p>Now group those subtotals into three blocks of four weeks. <strong>Weeks 1&ndash;4</strong> take Sections A.1&ndash;A.3: \(1.00 + 2.25 + 1.50 = 4.75\) equivalents, about 1.19 per week, while you rebuild advantage estimation on rl-rover. <strong>Weeks 5&ndash;8</strong> take Sections A.4&ndash;A.8: \(2.25 + 1.00 + 1.50 + 0.00 + 1.00 = 5.75\), about 1.44 per week &mdash; the generative block, read while the capstone's simulation stage trains in the background. <strong>Weeks 9&ndash;12</strong> take Sections A.9&ndash;A.13: \(1.00 + 1.25 + 2.50 + 0.25 + 1.50 = 6.50\), about 1.63 per week, while you fine-tune on the real SO-101. Check the sum: \(4.75 + 5.75 + 6.50 = 17.00\), matching the total above. Each block carries exactly three Tier 1 papers, which is the three-every-four-weeks rate made concrete.</p>
+
+<p>Be honest about that curve: each block is heavier than the one before it, and the last is the heaviest &mdash; the block where real-robot debugging will eat your evenings. If weeks 9 through 12 slip, move the Sun et al. skim and CUPED forward; both are Tier 3, worth 0.25, readable in one sitting. Do not move DAgger or HIL-SERL: Section A.11 is 2.50 equivalents on its own, and it lands exactly where your hands will be.</p>
+
+<div class="box checkpoint"><div class="box-title">Checkpoint</div>
+<ul>
+<li>Explain what each tier asks of you, and estimate the hours it implies.</li>
+<li>Say why the list is ordered by chapter rather than by publication date.</li>
+<li>Name the primary source for each of Chapters 6, 7, 8, 10, and 13 without looking back.</li>
+<li>State the six-entry minimal reading list behind LeHome, and what each contributes.</li>
+<li>Compute the paper-equivalent total for any subset, and rebalance the plan when a week is lost.</li>
+<li>For any Tier 1 paper here, name the experiment you would run on rl-rover or the SO-101.</li>
+</ul></div>
+
+<p><strong>Where to go deeper.</strong> The highest-return habit is a reading log: one paragraph per paper, written from memory a day later, naming the one idea and the one experiment. Keep it in the repository with the code it explains. When a paper resists two honest attempts, find the matching CS224R lecture or the LeRobot implementation and return with the mechanism already in your head.</p>
+
+</section>

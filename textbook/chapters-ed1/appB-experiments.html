@@ -1,0 +1,63 @@
+<section class="chapter" id="appB">
+<h1>Appendix B &mdash; The experiment ladder</h1>
+
+<p>Reading this book produces vocabulary; only experiments produce skill. This appendix turns each chapter into one concrete experiment on hardware and code you already own &mdash; the <span class="mono">rl-boarding</span> gridworld, the <span class="mono">rl-rover</span> PPO stack, the LeRobot checkout and SO-101 in <span class="mono">hil-serl</span>, and finally the LeHome stack itself. The rungs are ordered; each assumes the chapters and rungs before it. Times assume your 15&ndash;20 h/week and map onto the roadmap phases (table at the end).</p>
+
+<p>Three rules bind every rung. <strong>One question per experiment</strong>: write it down before touching the keyboard, and design the smallest run that answers it. <strong>Measure, don't watch</strong>: every rung ends in a number or a plot, never an impression &mdash; and where runs are cheap (E2, E3) use 3&ndash;5 seeds, because single-seed RL results are noise. <strong>Log like you already do</strong>: a dated <span class="mono">NEXT.md</span>-style note per rung &mdash; question, setup, result, surprise. Those notes become the tech notes of roadmap Phase 5 almost verbatim.</p>
+
+<h2>B.1 Foundations rungs (Chapters 1&ndash;3)</h2>
+
+<p><strong>E1 &middot; Values by hand</strong> (Chapter 1; <span class="mono">rl-boarding</span>; ~3 h). <em>Question:</em> do empirical returns really converge to a value function obeying the Bellman recursion? Run the gridworld with a fixed random policy for a few thousand episodes; for two chosen cells, average the discounted returns observed from them to estimate \(V(s)\), then verify \(V(s) \approx \mathbb{E}[r + \gamma V(s')]\) using the empirical successor frequencies. Repeat at \(\gamma = 0.9\) and \(0.99\). <em>You understood it if</em> you can predict, before rerunning, which cells' values move most when \(\gamma\) changes &mdash; and why the far-from-goal cells feel the discount hardest.</p>
+
+<p><strong>E2 &middot; REINFORCE from scratch, and the variance cure</strong> (Chapter 2; CartPole, already installed in the rover venv via <span class="mono">gymnasium[classic-control]</span>; ~5 h). Write REINFORCE in ~60 lines (softmax policy, the estimator of Section 2.1 &mdash; no library). Train 5 seeds without a baseline, then 5 with a learned value baseline. Plot the ten learning curves together and, per batch, the standard deviation of the gradient estimate. <em>You understood it if</em> the baseline curves are visibly tighter and you can point at the exact line where \(G_t\) became \(G_t - b(s_t)\) &mdash; and explain why that cannot change the expectation.</p>
+
+<p><strong>E3 &middot; PPO forensics on the rover</strong> (Chapter 3; <span class="mono">rl-rover</span>; ~5 h). Your <span class="mono">train_rover.py</span> runs are the corpus. First, read a healthy run's TensorBoard against Section 3.5: <span class="mono">approx_kl</span>, <span class="mono">clip_fraction</span>, <span class="mono">entropy_loss</span>, <span class="mono">value_loss</span>. Then break it twice on short (300k-step) runs: set <span class="mono">clip_range=10</span> and watch for the collapse Section 3.1 predicts; set <span class="mono">gae_lambda=0.0</span> and watch early learning starve while the critic is still bad. Finally, dump one episode's rewards and <span class="mono">policy.predict_values()</span> outputs and recompute \(\hat{A}_t\) by hand at \(\lambda \in \{0, 0.95\}\), reproducing the Section 3.5 arithmetic on your own data. <em>You understood it if</em> you can diagnose, from curves alone, which knob a stranger's broken PPO run needs.</p>
+
+<h2>B.2 The pivot rungs (Chapters 4&ndash;6)</h2>
+
+<p><strong>E4 &middot; AWR on your own logged data</strong> (Chapter 4; <span class="mono">rl-rover</span>; ~7 h). Build an offline dataset: roll out a <em>mediocre</em> checkpoint (an early <span class="mono">ppo_rover_v0*.zip</span>) for ~500 episodes, storing observations, actions, and returns. Train two fresh policies by supervised regression on the actions: one unweighted (BC), one weighted by \(w_i = \exp(\hat{A}_i/\beta)\) with \(\hat{A}_i = G_i - V(s_i)\) from the checkpoint's own critic, advantages normalized, weights clipped at 20. Evaluate both on 100 episodes. <em>You understood it if</em> weighted beats unweighted, and you can show the histogram of weights and say what \(\beta\) is doing to it &mdash; then push \(\beta\) toward 0 and watch the dead-data failure of the pitfall box appear.</p>
+
+<p><strong>E5 &middot; Train a generative policy and see multimodality</strong> (Chapter 5; LeRobot in <span class="mono">hil-serl</span>, GPU; ~8 h). Train LeRobot's diffusion policy (or the flow-matching <span class="mono">pi0</span>/<span class="mono">pi05</span> ports your checkout already ships) on an existing SO-101 dataset &mdash; your 24-episode cube set works. Then interrogate it: freeze one observation, sample 50 action chunks, and plot the first action dimension's spread &mdash; the mode structure of Figure 5.1 made visible on your own data. Find which config fields play \(H\), \(K\), and the execution length: \(H\) is <span class="mono">chunk_size</span> in the pi0-family and <span class="mono">horizon</span> in diffusion; the execution length is <span class="mono">n_action_steps</span> in both. <em>You understood it if</em> you can explain why this policy has no usable <span class="mono">log_prob</span> method while E2's sixty-liner did.</p>
+
+<p><strong>E6 &middot; Minimal RECAP: one conditioning bit</strong> (Chapter 6; <span class="mono">hil-serl</span> data, GPU; ~8 h). Conditioning needs failures, and your cube dataset is 24/24 successes &mdash; so mix in failure episodes from your HIL-SERL run buffers, or record ~10 deliberate near-misses. Label every episode's chunks \(c \in \{+,-\}\) by outcome, append the bit as one extra policy input, train with ~30% condition dropout, and evaluate the policy queried at \(c{=}+\) against an unconditioned twin trained on the same mixed data. <em>You understood it if</em> \(c{=}+\) recovers (or beats) the clean-data policy while the unconditioned twin is dragged down by the failures &mdash; conditioning turned bad data into signal instead of poison.</p>
+
+<h2>B.3 Engineering rungs (Chapters 7&ndash;8)</h2>
+
+<p><strong>E7 &middot; Shaping honestly, and CUPED on your logs</strong> (Chapter 7; <span class="mono">rl-rover</span>; ~6 h). Two parts. (a) Add a deliberately broken progress bonus to the rover &mdash; raw &ldquo;+k when distance shrinks&rdquo;, not potential-based &mdash; and short-train until you catch the policy farming it (oscillating toward/away from the goal); then write the same idea as \(\gamma\Phi(s')-\Phi(s)\) and confirm the exploit dies. (b) From E3's logged episodes, compute \(\rho_{GV}\) between returns and the critic's predictions, then \(\alpha^* = \rho_{GV}\,\sigma_G/\sigma_V\), and verify numerically that \(\mathrm{Var}(G-\alpha^* V) < \mathrm{Var}(G - V)\) whenever the critic is noisy. <em>You understood it if</em> you can state which of your two baselines (E3's critic early vs. late in training) deserves \(\alpha\) closer to 1, before computing it.</p>
+
+<p><strong>E8 &middot; Inference knobs and a bandit to tune them</strong> (Chapter 8; E5's policy in sim or on the arm; ~5 h). The checkpoint is frozen; only execution changes. Sweep <span class="mono">n_action_steps</span> over {1, 8, half of \(H\), \(H\)} at ~30 scored episodes each, and keep the curve. Then hand the same choice to the Beta&ndash;Thompson bandit of Section 8.5 (the ~15-line implementation) and let it allocate the same episode budget online. Skip best-of-N for now &mdash; you have no Q-like head until the capstone. <em>You understood it if</em> the bandit's final posteriors rank the arms the way your sweep did, while having spent most of its episodes on the contenders instead of the losers.</p>
+
+<h2>B.4 Human-and-real-world rungs (Chapters 9&ndash;10)</h2>
+
+<p><strong>E9 &middot; Close the HIL-SERL loop, and watch the human retire</strong> (Chapter 9; <span class="mono">hil-serl</span>, the run <span class="mono">NEXT.md</span> says is one USB cable away; 2&ndash;3 robot sessions). Finish the cube run to a clean success rate over &ge;50 scored episodes. Instrument what Chapter 9 predicts: log the intervention flag per frame and plot intervention rate per 10-episode window across the sessions &mdash; it should decay as the policy absorbs the corrections. Keep the neutral-action histogram from your RB-release bug as a permanent dashboard check. Then implement Section 9.4's weighting in one DAgger-style refit: corrections up-weighted, pre-takeover ramp to zero. <em>You understood it if</em> you can show the decay curve and say what a <em>flat</em> one would have told you.</p>
+
+<p><strong>E10 &middot; Async at N=2</strong> (Chapter 10; <span class="mono">rover-mujoco</span>; ~9 h). Split rover training into Figure 10.1's roles on one machine: a learner process consuming episode files, plus rollout workers that load the newest checkpoint from a shared directory (a filesystem stands in for the Hub), each running the MuJoCo rover. Measure episodes/hour at 1 vs. 2 workers, then kill a worker mid-run and confirm nothing but throughput suffers. Use AWR-style weighted updates on the learner &mdash; then note, per Section 10.4, why the same architecture with PPO would be quietly wrong as the checkpoints lag. Your existing <span class="mono">audit_baseline.py</span> solvability check is the companion piece: rerun it whenever you widen randomization. <em>You understood it if</em> the worker crash cost you throughput and nothing else, and you can say which single property of the update rule made that true.</p>
+
+<h2>B.5 The capstone gate (Chapter 11)</h2>
+
+<p><strong>E11 &middot; Stage A, exactly as written</strong> (Chapter 11; LeHome repos, GPU; 1&ndash;2 weeks). Clone the challenge environment and the solution repo, get Isaac Lab rendering, run <em>his</em> sim checkpoint through the official evaluator on the public garments, and land within a few points of the published per-type numbers (74.5 / 70.0 / 80.5 / 93.5). Write the one-page codebase map Section 11.2 demands. This rung is deliberately unoriginal: it converts the whole book from prose into a running system you have verified, and every later capstone stage stands on it. <em>You understood it if</em> your reproduced score has a confidence interval attached (Section 11.1) and you can point, in his code, at where each auxiliary head attaches and where the sampler applies the AWR priorities.</p>
+
+<h2>B.6 The ladder at a glance</h2>
+
+<table class="tbl">
+<thead><tr><th>Rung</th><th>Chapter</th><th>Where</th><th>Time</th><th>Roadmap phase</th></tr></thead>
+<tbody>
+<tr><td>E1 values by hand</td><td>1</td><td>rl-boarding</td><td>~3 h</td><td>Phase 0</td></tr>
+<tr><td>E2 REINFORCE + baseline</td><td>2</td><td>CartPole</td><td>~5 h</td><td>Phase 0</td></tr>
+<tr><td>E3 PPO forensics</td><td>3</td><td>rl-rover</td><td>~5 h</td><td>Phase 0</td></tr>
+<tr><td>E4 AWR on logged data</td><td>4</td><td>rl-rover</td><td>~7 h</td><td>Phase 1</td></tr>
+<tr><td>E5 generative policy</td><td>5</td><td>LeRobot + GPU</td><td>~8 h</td><td>Phase 1</td></tr>
+<tr><td>E6 minimal RECAP</td><td>6</td><td>hil-serl data</td><td>~8 h</td><td>Phase 1</td></tr>
+<tr><td>E7 shaping + CUPED</td><td>7</td><td>rl-rover</td><td>~6 h</td><td>Phase 2&ndash;3</td></tr>
+<tr><td>E8 knobs + bandit</td><td>8</td><td>E5's policy</td><td>~5 h</td><td>Phase 3</td></tr>
+<tr><td>E9 HIL-SERL close-out</td><td>9</td><td>SO-101</td><td>2&ndash;3 sessions</td><td>Phases 1, 4</td></tr>
+<tr><td>E10 async at N=2</td><td>10</td><td>rover-mujoco</td><td>~9 h</td><td>Phase 2&ndash;3</td></tr>
+<tr><td>E11 capstone Stage A</td><td>11</td><td>LeHome stack</td><td>1&ndash;2 wk</td><td>Phase 2</td></tr>
+</tbody>
+</table>
+
+<p>That is roughly 60&ndash;70 hours of bench time before the capstone's Stage B &mdash; about seven weeks of your build hours, which is exactly what the roadmap's Phases 0&ndash;2 allocate. E1&ndash;E3 can compress into Phase 0's two weeks because the tooling already exists; E9 straddles the plan deliberately (start it early &mdash; the robot teaches faster than the book).</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Climbing rungs without the gates. The temptation is to &ldquo;run&rdquo; E4 or E6, see a plausible curve, and move on. The gate is the stated measurement plus the <em>you understood it if</em> test, spoken aloud or written &mdash; an experiment that produced a number you cannot explain has not been finished, it has been visited.</div>
+</section>

@@ -1,0 +1,206 @@
+<section class="chapter" id="ch05">
+<h1>Chapter 5 &mdash; Generative action policies and VLAs</h1>
+
+<p>This chapter changes what a policy is. Until now \(\pi_\theta\) was a Gaussian whose mean a network computes. From here on it is a <strong>generative action policy</strong>: a model that transforms random noise into a one-second sequence of actions. The switch buys the expressiveness that demonstration data demands and, in vision-language-action models, web-scale semantics &mdash; and it quietly destroys the quantity that every algorithm in Chapters 2 and 3 relied on: the log-probability of an action. Seeing exactly what breaks, and what survives, is the hinge of this book.</p>
+
+<h2>5.1 Why Gaussians are not enough</h2>
+
+<p>Every policy so far had the same shape: the network maps an observation to the parameters of a simple distribution, almost always a Gaussian \(\pi_\theta(a|o) = \mathcal{N}(\mu_\theta(o), \sigma^2)\), and the action is a sample. For the rover this was exactly right: at any state there is essentially one sensible steering command, and PPO only needs the policy to sharpen around it. The assumption baked in is <strong>unimodality</strong> &mdash; one best action, plus noise.</p>
+
+<p>Demonstration data violates that assumption almost everywhere. Watch a human teleoperate a mug grasp with the handle facing away: sometimes the arm swings around the left of the mug, sometimes around the right. Both work, and the demonstrator is indifferent. The conditional distribution of demonstrated actions at this observation, \(\pi_\beta(a|o)\), has two modes. Fit a Gaussian by maximum likelihood and the mean lands between them: the arm drives straight into the mug (Figure 5.1). Bimanual tasks make this the default condition rather than a corner case: when two arms fold a shirt, sometimes the left arm leads and the right stabilizes, sometimes the reverse. The average &mdash; both arms half-leading &mdash; meets in the middle and collides. <strong>Mode averaging</strong> does not produce a mediocre action from the data; it produces an action that appears in no demonstration at all.</p>
+
+<figure><svg viewBox="0 0 700 230" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch05f1arrG" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4a8a5c"/></marker>
+<marker id="ch05f1arrR" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#b04a4a"/></marker>
+</defs>
+<text x="170" y="22" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">Two valid demo modes</text>
+<circle cx="170" cy="50" r="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="182" y="54" font-family="Noto Sans" font-size="11" fill="#666">start</text>
+<rect x="130" y="150" width="80" height="48" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="170" y="178" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">mug</text>
+<path d="M 170 58 C 90 70, 70 128, 122 160" fill="none" stroke="#4a8a5c" stroke-width="2" marker-end="url(#ch05f1arrG)"/>
+<text x="66" y="110" font-family="Noto Sans" font-size="11" fill="#4a8a5c">mode A</text>
+<path d="M 170 58 C 250 70, 270 128, 218 160" fill="none" stroke="#4a8a5c" stroke-width="2" marker-end="url(#ch05f1arrG)"/>
+<text x="252" y="110" font-family="Noto Sans" font-size="11" fill="#4a8a5c">mode B</text>
+<line x1="170" y1="58" x2="170" y2="142" stroke="#b04a4a" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ch05f1arrR)"/>
+<text x="176" y="100" font-family="Noto Sans" font-size="11" fill="#b04a4a">mean</text>
+<text x="170" y="218" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b04a4a">invalid: hits the mug</text>
+<text x="535" y="22" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">Action density at this observation</text>
+<line x1="390" y1="180" x2="685" y2="180" stroke="#666" stroke-width="1"/>
+<path d="M 395 179 C 425 179 430 85 455 85 C 480 85 495 176 535 176 C 575 176 590 85 615 85 C 640 85 645 179 675 179" fill="#eaf1f8" stroke="#4878a8" stroke-width="2"/>
+<path d="M 400 179 C 470 175 480 120 535 120 C 590 120 600 175 670 179" fill="none" stroke="#b0703a" stroke-width="2"/>
+<circle cx="535" cy="178" r="4" fill="#b04a4a"/>
+<text x="448" y="72" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4878a8">demos (two modes)</text>
+<text x="535" y="110" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b0703a">Gaussian fit</text>
+<text x="535" y="200" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b04a4a">mean falls in the valley</text>
+<text x="535" y="222" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">action a (e.g. approach angle)</text>
+</svg><figcaption>Figure 5.1 &mdash; Mode averaging. Left: two valid grasp trajectories; the Gaussian mean drives into the object. Right: the same failure as densities &mdash; a unimodal fit to bimodal demonstrations puts its mean where the data has none.</figcaption></figure>
+
+<p>Modern imitation policies also do not emit one action at a time. They emit an <strong>action chunk</strong> \(a_{t:t+H}\) (Zhao et al., 2023): the next \(H\) actions as one output, executed open-loop or partially before the policy is queried again. A typical choice &mdash; used by the \(\pi\)-family &mdash; is \(H = 50\) at 50 Hz control, one second of motion per query. Chunking gives <strong>temporal consistency</strong>: a policy re-sampled 50 times per second can dither between mode A and mode B mid-reach, while a chunked policy commits to one coherent motion. It also means fewer decisions per second, which amortizes inference latency (a 3B-parameter model cannot run at 50 Hz anyway) and reduces the number of points where compounding errors can inject themselves.</p>
+
+<p>But chunking raises the stakes on multimodality. A chunk for a bimanual SO-101 at the LeHome setting of \(H = 30\) is a point in a \(H \times d = 30 \times 12 = 360\)-dimensional space, and the modes are now entire trajectories: which grasp, which path, which speed, which arm leads &mdash; the count of distinct valid chunks multiplies. Per-step log-probabilities become close to meaningless: there is no per-timestep density inside a chunk to evaluate, and a factorized Gaussian over 360 dimensions either underfits catastrophically or assigns likelihoods dominated by irrelevant dimensions. What we need is a model class judged by the quality of its <em>samples</em>, not the tractability of its densities. Diffusion policies proved that transport-based generative models fit multimodal robot data beautifully (Chi et al., 2023); <strong>flow matching</strong> is the simpler, faster route to the same power, and it is what the \(\pi\)-family of VLAs uses.</p>
+
+<h2>5.2 Flow matching from zero</h2>
+
+<p>We want to sample a chunk \(a \sim \pi_\theta(\cdot|o)\). The flow-matching recipe: start from something trivial to sample &mdash; Gaussian noise \(z \sim \mathcal{N}(0, I)\) with the same shape as the chunk &mdash; and learn to <em>transport</em> noise to data. Introduce a <strong>flow time</strong> \(u \in [0,1]\). This is a new, private axis of the generation process; it has nothing to do with the environment timestep \(t\). At \(u=0\) we sit at pure noise, at \(u=1\) at a data point. Connect each training pair \((z, a)\) by the straightest possible path, the <strong>interpolant</strong> \(a^u = (1-u)\,z + u\,a\). Moving along this line at constant speed, the velocity is \(\frac{d a^u}{du} = a - z\). Now train a network \(v_\theta(a^u, u, o)\) &mdash; the <strong>velocity field</strong> &mdash; to predict that velocity from the current point, the flow time, and the observation:</p>
+
+<div class="key-eq">\[
+\mathcal{L}(\theta) \;=\; \mathbb{E}_{(o,a)\sim \mathcal{D},\; z \sim \mathcal{N}(0,I),\; u \sim \mathcal{U}[0,1]} \Big\lVert\, v_\theta\big(a^u, u, o\big) - (a - z) \,\Big\rVert^2 ,
+\qquad a^u = (1-u)\,z + u\,a .
+\]</div>
+
+<p>Why does regressing on per-pair straight lines yield a correct sampler? Many pairs \((z,a)\) pass through the same point \((a^u, u)\), each demanding a different velocity; the mean-squared-error minimizer is their conditional average, \(v_\theta^\ast = \mathbb{E}[\,a - z \mid a^u, u, o\,]\), and a short calculation shows this averaged field transports the noise distribution exactly onto the data distribution (Lipman et al., 2023; Liu et al., 2023). The proof is three lines of calculus in the papers; the practical content is that training is plain supervised regression &mdash; no adversary, no likelihood, no partition function.</p>
+
+<p>Sampling means solving the ordinary differential equation \(\frac{da}{du} = v_\theta(a, u, o)\) from \(u=0\) to \(u=1\), in practice with \(K\) Euler steps. The \(\pi\)-family uses \(K = 10\).</p>
+
+<pre class="code"># training step (one sample)
+o, a = batch                    # a: action chunk, shape (H, d)
+z = normal(0, 1, a.shape)       # noise
+u = uniform(0, 1)               # flow time -- NOT env time t
+a_u = (1 - u) * z + u * a       # straight-line interpolant
+loss = mse(v_theta(a_u, u, o), a - z)
+loss.backward(); opt.step()
+
+# sampling: K Euler steps of the ODE
+a = normal(0, 1, (H, d))        # start at u = 0
+for k in range(K):              # K = 10 in pi0.5
+    a = a + (1 / K) * v_theta(a, k / K, o)
+return a                        # the chunk a_{t:t+H}</pre>
+
+<p>Run one training step by hand on a scalar action. Say the demo action is \(a = 0.8\), the sampled noise is \(z = -0.5\), and we draw \(u = 0.3\). The interpolant is \(a^u = 0.7 \times (-0.5) + 0.3 \times 0.8 = -0.11\); the regression target is \(a - z = 1.3\). If the network currently outputs \(v_\theta(-0.11, 0.3, o) = 0.9\), the loss is \((0.9 - 1.3)^2 = 0.16\) and the gradient nudges the output toward 1.3. At sampling time each of the \(K=10\) Euler steps moves the sample by one tenth of the predicted velocity.</p>
+
+<p>Multimodality is handled for free (Figure 5.2). The learned field partitions noise space: some draws of \(z\) flow to mode A, others to mode B, and in the ideal limit no sample lands between the modes, because between the modes the field points <em>away</em>, not inward (a finite-capacity network and \(K\)-step Euler integration add small errors in practice, but essentially no probability mass ends up in the valley). All the stochasticity of the policy lives in the single initial draw of \(z\); given \(z\), generation is deterministic.</p>
+
+<figure><svg viewBox="0 0 700 250" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch05f2arrB" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4878a8"/></marker>
+<marker id="ch05f2arrO" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#b0703a"/></marker>
+<marker id="ch05f2arrN" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#666"/></marker>
+</defs>
+<line x1="105" y1="85" x2="590" y2="65" stroke="#999" stroke-width="1"/>
+<line x1="120" y1="100" x2="585" y2="78" stroke="#999" stroke-width="1"/>
+<line x1="112" y1="118" x2="614" y2="186" stroke="#999" stroke-width="1"/>
+<line x1="100" y1="150" x2="590" y2="165" stroke="#999" stroke-width="1"/>
+<line x1="82" y1="112" x2="612" y2="170" stroke="#999" stroke-width="1"/>
+<line x1="88" y1="130" x2="592" y2="86" stroke="#4878a8" stroke-width="2.5" marker-end="url(#ch05f2arrB)"/>
+<circle cx="95" cy="118" r="48" fill="none" stroke="#4878a8" stroke-width="1" stroke-dasharray="4 4"/>
+<circle cx="75" cy="95" r="4" fill="#eaf1f8" stroke="#4878a8"/><circle cx="105" cy="85" r="4" fill="#eaf1f8" stroke="#4878a8"/>
+<circle cx="88" cy="130" r="4" fill="#eaf1f8" stroke="#4878a8"/><circle cx="112" cy="118" r="4" fill="#eaf1f8" stroke="#4878a8"/>
+<circle cx="70" cy="140" r="4" fill="#eaf1f8" stroke="#4878a8"/><circle cx="100" cy="150" r="4" fill="#eaf1f8" stroke="#4878a8"/>
+<circle cx="120" cy="100" r="4" fill="#eaf1f8" stroke="#4878a8"/><circle cx="82" cy="112" r="4" fill="#eaf1f8" stroke="#4878a8"/>
+<text x="95" y="48" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4878a8">noise z ~ N(0, I)</text>
+<ellipse cx="600" cy="73" rx="42" ry="26" fill="none" stroke="#4a8a5c" stroke-width="1" stroke-dasharray="4 4"/>
+<circle cx="590" cy="65" r="4" fill="#ecf5ee" stroke="#4a8a5c"/><circle cx="610" cy="72" r="4" fill="#ecf5ee" stroke="#4a8a5c"/>
+<circle cx="598" cy="85" r="4" fill="#ecf5ee" stroke="#4a8a5c"/><circle cx="615" cy="60" r="4" fill="#ecf5ee" stroke="#4a8a5c"/>
+<circle cx="585" cy="78" r="4" fill="#ecf5ee" stroke="#4a8a5c"/>
+<text x="600" y="32" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4a8a5c">chunk mode A</text>
+<ellipse cx="600" cy="175" rx="42" ry="26" fill="none" stroke="#4a8a5c" stroke-width="1" stroke-dasharray="4 4"/>
+<circle cx="590" cy="165" r="4" fill="#ecf5ee" stroke="#4a8a5c"/><circle cx="612" cy="170" r="4" fill="#ecf5ee" stroke="#4a8a5c"/>
+<circle cx="600" cy="185" r="4" fill="#ecf5ee" stroke="#4a8a5c"/><circle cx="585" cy="180" r="4" fill="#ecf5ee" stroke="#4a8a5c"/>
+<circle cx="614" cy="186" r="4" fill="#ecf5ee" stroke="#4a8a5c"/>
+<text x="600" y="218" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4a8a5c">chunk mode B</text>
+<circle cx="241" cy="117" r="4" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="241" y="100" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b0703a">a&#7512; at u = 0.3</text>
+<circle cx="441" cy="99" r="4" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="441" y="83" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b0703a">u = 0.7</text>
+<line x1="255" y1="122" x2="330" y2="122" stroke="#b0703a" stroke-width="2" marker-end="url(#ch05f2arrO)"/>
+<text x="300" y="145" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b0703a">target v = a &minus; z</text>
+<line x1="150" y1="232" x2="540" y2="232" stroke="#666" stroke-width="1" marker-end="url(#ch05f2arrN)"/>
+<text x="95" y="236" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">u = 0</text>
+<text x="600" y="236" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">u = 1</text>
+<text x="345" y="224" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">flow time u (not the env timestep t)</text>
+</svg><figcaption>Figure 5.2 &mdash; Flow matching as transport. Noise samples (left, u=0) travel along straight interpolants to action chunks (right, u=1). Each z commits to one mode; nothing is averaged. The highlighted path shows the interpolant a&#7512; at u=0.3 and 0.7 and the constant regression target a&nbsp;&minus;&nbsp;z.</figcaption></figure>
+
+<p>One paragraph on diffusion, since you will meet both. Diffusion models (Ho et al., 2020) define a forward process that gradually noises data and learn to reverse it, predicting the noise (equivalently the score) at each level; the diffusion policy of Chi et al. (2023) brought this to manipulation. Flow matching keeps the same spirit &mdash; learn a vector field that carries noise to data, integrate it at sampling time &mdash; but chooses straight deterministic paths instead of curved stochastic ones. The straight-line choice makes the training target a constant and lets a handful of Euler steps suffice where diffusion often needs dozens. If you understand one, you understand the other; they differ in the path, not the idea.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+You have already touched this stack: LeRobot ships trainable generative policies &mdash; <code>diffusion</code>, and the flow-matching <code>pi0</code> ports &mdash; alongside the ACT you may have seen in tutorials. A worthwhile evening: train the diffusion policy on a handful of SO-101 teleop episodes and watch the config &mdash; chunk size, number of denoising steps, how many actions execute before re-querying. Those are exactly \(H\), \(K\), and the execution-length knob of Chapter 8.</div>
+
+<h2>5.3 Why log-prob RL breaks here</h2>
+
+<p>Now the pivot the book has been building toward. PPO needs the importance ratio \(\rho_t(\theta) = \pi_\theta(a_t|s_t)/\pi_{\theta_{old}}(a_t|s_t)\) for every sampled action, differentiably, so it can clip at \(1 \pm \epsilon\). Even plain REINFORCE needs \(\nabla_\theta \log \pi_\theta(a_t|s_t)\). So: what is \(\log \pi_\theta(a|o)\) for a flow policy?</p>
+
+<p>It exists. The Euler integration is (in the limit) an invertible map from \(z\) to \(a\), and the instantaneous change-of-variables formula for continuous flows (Chen et al., 2018) gives</p>
+
+\[
+\log \pi_\theta(a \mid o) \;=\; \log \mathcal{N}(z; 0, I) \;-\; \int_0^1 \nabla \cdot v_\theta\big(a(u), u, o\big)\, du ,
+\]
+
+<p>where \(a(u)\) is the trajectory of the learned ODE passing through \(a(1) = a\), and \(z = a(0)\) is recovered by integrating that ODE backward from \(a\). Note the divergence integral runs along the ODE path &mdash; the curve the learned field's trajectories actually follow &mdash; not along the straight training interpolant \(a^u\). Look at what evaluating this costs. The divergence \(\nabla \cdot v_\theta\) is the trace of the Jacobian of a large network with respect to a 360-dimensional input, needed at every integration step: exact evaluation means hundreds of backward passes per step, and the Hutchinson trace estimator makes it affordable only by making it noisy. PPO would need this quantity for <em>two</em> networks (\(\pi_\theta\) and \(\pi_{\theta_{old}}\)), differentiably through \(\theta\), for every sample in every minibatch epoch &mdash; and it needs the resulting log-<em>ratio</em> accurate on the scale of \(\epsilon \approx 0.2\), or clipping is deciding based on estimator noise. Coarse \(K=10\) Euler integration adds bias on top of the variance. And even granting all of that, the chunk is executed over \(H\) environment steps: there is no per-timestep \(\pi_\theta(a_t|s_t)\) at all, so the per-step ratios \(\rho_t\) that PPO's surrogate is written in are not merely expensive &mdash; they are undefined. In practice, log-prob-based RL on flow policies is a dead end (this is precisely why the LeHome solution contains no PPO).</p>
+
+<p>Here is the asymmetry that saves us. The flow-matching loss is a <em>per-sample regression</em>, and regressions can be weighted and conditioned. Multiply sample \(i\)'s loss by the AWR weight \(w_i = \exp(\hat{A}_i/\beta)\) from Chapter 4 and everything goes through unchanged: \(\mathcal{L} = \mathbb{E}\big[\, w_i \,\lVert v_\theta(a_i^{u_i}, u_i, o_i) - (a_i - z_i)\rVert^2 \big]\) is weighted behavior cloning where "cloning" happens to mean denoising, and good chunks simply pull the velocity field harder than bad ones. Alternatively, append extra conditioning to the input &mdash; a token saying "this was a good action" &mdash; and sample conditioned on good; that is Chapter 6. Density evaluation: intractable. Weighted or conditioned regression: trivial. Every technique in the rest of this book &mdash; advantage engineering in Chapter 7, guidance and best-of-\(N\) in Chapter 8 &mdash; touches only the regression loss or the sampler, never the density.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Two classics. First, conflating flow time \(u\) with the env timestep \(t\): the ODE integration is an inner loop that runs to completion <em>inside one</em> control decision; \(u\) never appears in the MDP. Second, hoping to get log-probs "approximately" (Hutchinson estimates, ELBO surrogates) and feed them to PPO: the estimator noise is far larger than the \(\epsilon\)-sized signal the clip needs, so the update direction is garbage even when each estimate looks plausible.</div>
+
+<h2>5.4 VLAs: a VLM that outputs actions</h2>
+
+<p>A <strong>vision-language-action model (VLA)</strong> is a vision-language model &mdash; a transformer pre-trained on web images and text &mdash; extended to output robot actions. The motivation is generalization: a policy trained from scratch on your demos knows nothing outside them, while a VLM already knows what socks are, what "put them in the laundry basket" means, and roughly where to look. \(\pi_0\) (Black et al., 2024) set the template: a PaliGemma backbone of about 3B parameters, plus a small (~300M) <strong>action expert</strong> &mdash; a separate set of transformer weights that attends to the backbone's key-value cache and is trained by flow matching to turn noise into 50-step action chunks. The backbone supplies perception and semantics; the expert supplies the motor distribution.</p>
+
+<p>\(\pi_{0.5}\) (Physical Intelligence, 2025a) is the version built for <strong>open-world generalization</strong>, and its recipe matters more than its architecture. Pre-training (280k steps) treats everything as discrete tokens, including actions, which are compressed into text-like tokens by the FAST tokenizer &mdash; so a single autoregressive objective covers web data (captioning, VQA, object localization), roughly 400 hours of mobile-manipulator data from about 100 homes, static-arm data from more homes, cross-embodiment lab data, and subtask-annotation data. The striking statistic: 97.6% of pre-training examples are <em>not</em> mobile-manipulation home data. Post-training (80k steps) then adds the flow-matching action expert, initialized from scratch, and optimizes a hybrid loss &mdash; next-token prediction plus 10 times the flow-matching loss &mdash; on curated successful episodes plus verbal-instruction data, with web data retained so the semantics do not wash out.</p>
+
+<p>Inference is hierarchical, inside one model (Figure 5.3). At low frequency the backbone autoregressively writes a high-level subtask <em>in text</em> &mdash; "pick up the plate" &mdash; from all cameras and the overall command; the action expert, conditioned on that subtask and on forward and wrist views, integrates \(K=10\) Euler steps to emit a one-second chunk, whose 50 actions execute at 50 Hz. The model literally talks itself through the task, and the language interface is also where you can intervene or evaluate.</p>
+
+<p>What did the recipe buy? \(\pi_{0.5}\) cleans kitchens and bedrooms in homes never seen in training, in runs of 10&ndash;15 minutes. Success scales smoothly with the number of training environments (3 to 104 locations), and at the top of that curve it matches a control model trained directly on the test homes &mdash; co-training closed the in-domain gap. Language-following on out-of-distribution objects rose from about 20% to about 60% over the same sweep. Note what the VLM does and does not transfer: semantics and robustness &mdash; novel objects, layouts, phrasings &mdash; not motor skill, which still comes from robot data. The practical consequence, which Chapter 11 leans on: fine-tune a pre-trained VLA; do not train one from scratch.</p>
+
+<figure><svg viewBox="0 0 700 348" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch05f3arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#666"/></marker>
+<marker id="ch05f3arrG" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4a8a5c"/></marker>
+<marker id="ch05f3arrO" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#b0703a"/></marker>
+</defs>
+<rect x="15" y="45" width="120" height="28" rx="6" fill="#eaf1f8" stroke="#4878a8"/><text x="75" y="63" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">scene camera</text>
+<rect x="15" y="83" width="120" height="28" rx="6" fill="#eaf1f8" stroke="#4878a8"/><text x="75" y="101" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">wrist camera(s)</text>
+<rect x="15" y="121" width="120" height="28" rx="6" fill="#eaf1f8" stroke="#4878a8"/><text x="75" y="139" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">task prompt</text>
+<line x1="135" y1="59" x2="173" y2="59" stroke="#666" stroke-width="1.2" marker-end="url(#ch05f3arr)"/>
+<line x1="135" y1="97" x2="173" y2="97" stroke="#666" stroke-width="1.2" marker-end="url(#ch05f3arr)"/>
+<line x1="135" y1="135" x2="173" y2="135" stroke="#666" stroke-width="1.2" marker-end="url(#ch05f3arr)"/>
+<rect x="175" y="40" width="185" height="125" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="267" y="90" text-anchor="middle" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333">VLM backbone</text>
+<text x="267" y="110" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">web + robot co-training</text>
+<text x="267" y="128" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">~3B params</text>
+<path d="M 360 62 C 392 62, 388 30, 416 30" fill="none" stroke="#666" stroke-width="1.2" marker-end="url(#ch05f3arr)"/>
+<text x="387" y="52" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">low rate</text>
+<rect x="420" y="15" width="225" height="30" rx="6" fill="none" stroke="#4878a8" stroke-dasharray="4 3"/>
+<text x="532" y="34" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">subtask text: "pick up the shirt"</text>
+<line x1="532" y1="45" x2="532" y2="66" stroke="#666" stroke-width="1.2" marker-end="url(#ch05f3arr)"/>
+<line x1="360" y1="105" x2="416" y2="105" stroke="#666" stroke-width="1.2" marker-end="url(#ch05f3arr)"/>
+<text x="388" y="98" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">KV cache</text>
+<rect x="420" y="70" width="225" height="70" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="532" y="93" text-anchor="middle" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333">action expert</text>
+<text x="532" y="111" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">flow matching, ~300M</text>
+<text x="532" y="129" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">K = 10 Euler steps</text>
+<text x="668" y="72" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">z ~ N(0, I)</text>
+<line x1="664" y1="78" x2="640" y2="88" stroke="#666" stroke-width="1.2" marker-end="url(#ch05f3arr)"/>
+<line x1="557" y1="140" x2="557" y2="158" stroke="#666" stroke-width="1.2" marker-end="url(#ch05f3arr)"/>
+<rect x="460" y="160" width="185" height="40" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+<text x="552" y="176" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">action chunk</text>
+<text x="552" y="192" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">H steps, ~1 s per query</text>
+<line x1="267" y1="165" x2="90" y2="238" stroke="#4a8a5c" stroke-width="1.2" marker-end="url(#ch05f3arrG)"/>
+<line x1="267" y1="165" x2="260" y2="238" stroke="#4a8a5c" stroke-width="1.2" marker-end="url(#ch05f3arrG)"/>
+<line x1="267" y1="165" x2="430" y2="238" stroke="#4a8a5c" stroke-width="1.2" marker-end="url(#ch05f3arrG)"/>
+<line x1="267" y1="165" x2="600" y2="238" stroke="#4a8a5c" stroke-width="1.2" marker-end="url(#ch05f3arrG)"/>
+<rect x="15" y="240" width="150" height="32" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/><text x="90" y="260" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">success prob.</text>
+<rect x="185" y="240" width="150" height="32" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/><text x="260" y="260" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">completion fraction</text>
+<rect x="355" y="240" width="150" height="32" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/><text x="430" y="260" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">garment type</text>
+<rect x="525" y="240" width="150" height="32" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/><text x="600" y="260" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">keypoint distances</text>
+<text x="245" y="292" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">current-frame heads: linear probes off a learned query token (Section 5.5)</text>
+<path d="M 648 185 C 694 195, 694 252, 670 294" fill="none" stroke="#b0703a" stroke-width="1.2" marker-end="url(#ch05f3arrO)"/>
+<rect x="525" y="298" width="165" height="42" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="607" y="315" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">Q-like head</text>
+<text x="607" y="331" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">action-conditional (FM query)</text>
+</svg><figcaption>Figure 5.3 &mdash; A &pi;0.5-style VLA with auxiliary heads. The backbone writes a subtask in text at low rate; the action expert attends to its KV cache and integrates the flow ODE to emit a chunk of \(H\) actions (&pi;0.5's default is \(H=50\) at 50 Hz; the LeHome fine-tune emits \(H=30\) at 30 Hz). Green heads reuse the trunk's representation for value-like predictions; the orange Q-like head reads the denoising action chunk at the expert's tail (Section 5.5).</figcaption></figure>
+
+<h2>5.5 Auxiliary heads: the policy is its own value function</h2>
+
+<p>A VLA trunk that can fold a shirt has already computed almost everything a value function would want to know: where the garment is, how the grasp is going, how far along the task is. So instead of training a separate critic, bolt small heads &mdash; linear probes off one learned query token &mdash; onto the trunk's features and supervise them with labels you get nearly for free: a <strong>success-probability head</strong> \(\hat{p}_{succ}\) trained on hindsight episode outcomes, a <strong>completion-fraction</strong> head on progress labels, a <strong>garment-type</strong> classifier, and a <strong>keypoint-distance</strong> head regressing distances between task-relevant points (gripper to nearest corner, corner to its fold target), which the simulator state provides exactly. A fifth head is <strong>action-conditional</strong>: a query at the tail of the flow-matching action expert reads the denoising action chunk and predicts <em>future</em> (\(t+H\)) keypoint distances plus a success residual \(\Delta_{succ} = y - \mathrm{sg}(\hat{p}_{succ})\), where the stop-gradient keeps its learning from corrupting the V-like success head. Because it sees a candidate chunk, it is a <strong>Q-like head</strong>.</p>
+
+<p>The payoff comes in layers. First, the value function sees everything the policy sees: a separate critic &mdash; \(\pi^*_{0.6}\) uses a distinct 670M-parameter VLM for this &mdash; must build its own, possibly poorer, representation from its own forward pass, while a head on the trunk shares the policy's eyes, updates when the policy updates, and ships in the same checkpoint at near-zero extra parameters and FLOPs. Chapter 7 builds the actual value estimate from these heads (\(V(s) = \hat{p}_{succ} - R_{acc}\), used with a damped baseline \(\alpha V\)). Second, the auxiliary losses shape the trunk itself: forcing it to predict keypoint distances forces geometric task state into the features the action expert reads. Third, the keypoint head is a cheap stand-in for a world model: rather than predicting future pixels, it predicts the low-dimensional, task-relevant geometry &mdash; the only part of the future the reward cares about &mdash; at a vanishing fraction of the cost. Fourth, at inference the Q-like head can score candidate chunks &mdash; the current-frame heads see only the observation and cannot tell candidates apart &mdash; which is what makes best-of-\(N\) selection in Chapter 8 possible with no extra models.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+Larchenko's policy is the architecture of Figure 5.3: \(\pi_{0.5}\) fine-tuned for bimanual SO-101 folding, emitting \(H=30\) chunks at 30 Hz in sim (20 Hz in the real round), with all five heads ("the policy is its own value function"). PPO was ruled out for the reasons in Section 5.3; improvement runs through AWR-style weighting (Chapter 4) and RECAP-style conditioning (Chapter 6). The keypoint head doubles as the cheap world model; the heads feed Chapter 7's advantages and Chapter 8's chunk scoring.</div>
+
+<p><strong>Where to go deeper.</strong> Flow matching is best learned from Lipman et al. (2023) and the rectified-flow view of Liu et al. (2023); Chi et al. (2023) is the diffusion-policy paper that made transport models standard in manipulation, and Zhao et al. (2023) is the case for action chunking. For VLAs, read Black et al. (2024) for \(\pi_0\) and Physical Intelligence (2025a) for the \(\pi_{0.5}\) co-training recipe. Appendix A sequences the flow-matching, guidance, and \(\pi_{0.5}\) papers; the rectified-flow view, Diffusion Policy, the action-chunking paper, and \(\pi_0\) are optional context beyond the guide.</p>
+
+</section>

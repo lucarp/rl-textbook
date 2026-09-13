@@ -1,0 +1,473 @@
+<section class="chapter" id="ch14">
+<h1>Chapter 14 &mdash; Simulation, sim-to-real, and the asynchronous RL loop</h1>
+
+<p>Chapters 11 and 13 both assumed the same thing without saying it out loud: that transitions arrive. Advantages get computed on them, weights get attached, the policy improves. Chapter 12 made a quieter version of the same assumption &mdash; that a trained policy already exists to run at inference time. Nobody asked where the transitions come from, how fast, or what happens when the machine producing them dies at three in the morning.</p>
+
+<p>This chapter is about the factory that produces them. It has three rooms: the simulator, where most robot RL data is actually made; the bridge between simulation and reality, which decides whether any of that data was worth making; and the asynchronous training loop that keeps the whole thing running without a human standing over it.</p>
+
+<p>You have built a small version of all three &mdash; the rover's MuJoCo port with domain randomization, and hil-serl's actor and learner processes. What this chapter adds is scale, the failure modes that only appear at scale, and one architectural idea, the storage bus, that turns two processes into any number of machines. Figure 14.1 is what we are building toward; we will earn each box.</p>
+
+<div class="box jargon"><div class="box-title">Words you will hear</div>
+<p><strong>Domain gap</strong>, also called the <strong>reality gap</strong> &mdash; the mismatch between the observation and dynamics distribution a policy trained on and the one it is deployed into; papers use the two names interchangeably. <strong>System identification</strong> (sysID) &mdash; measuring a real system's physical parameters (masses, friction, motor gains, latency) so a model can match them. <strong>Domain randomization</strong> (DR) &mdash; sampling those parameters and visual properties from wide distributions in training so the policy cannot depend on any one; <strong>ADR</strong> (automatic domain randomization) is the variant that widens each range on its own whenever the policy keeps succeeding inside it (OpenAI et al., 2019). <strong>Privileged information</strong> and <strong>teacher&ndash;student distillation</strong> &mdash; the main alternative to randomization: train a teacher that reads simulator-only state (exact poses, contact forces), then distill it into a student that reads only the cameras the real robot has. <strong>Curriculum</strong> &mdash; a sampling rule that biases collection toward task instances of a chosen difficulty instead of sampling them uniformly. <strong>Staleness</strong> &mdash; how many gradient steps old the policy that generated a piece of data is.</p>
+</div>
+
+<figure>
+<svg viewBox="0 0 700 290" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch14f1ab" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#4878a8"/></marker>
+    <marker id="ch14f1ao" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#b0703a"/></marker>
+    <marker id="ch14f1ag" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#666"/></marker>
+  </defs>
+  <rect x="25" y="85" width="135" height="78" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+  <text x="92" y="112" font-family="Noto Sans" font-size="13" font-weight="bold" fill="#333" text-anchor="middle">Learner</text>
+  <text x="92" y="130" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">one GPU, samples</text>
+  <text x="92" y="144" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">the training mix</text>
+  <rect x="285" y="80" width="130" height="88" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+  <text x="350" y="112" font-family="Noto Sans" font-size="13" font-weight="bold" fill="#333" text-anchor="middle">Storage bus</text>
+  <text x="350" y="130" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">immutable artifacts</text>
+  <text x="350" y="146" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">no queues, no locks</text>
+  <rect x="534" y="74" width="150" height="76" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <rect x="527" y="81" width="150" height="76" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <rect x="520" y="88" width="150" height="76" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+  <text x="595" y="113" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333" text-anchor="middle">Rollout workers</text>
+  <text x="595" y="130" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">any number, preemptible</text>
+  <text x="595" y="144" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">3&ndash;5 sim instances each</text>
+  <rect x="286" y="207" width="128" height="52" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+  <text x="350" y="229" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333" text-anchor="middle">Evaluator</text>
+  <text x="350" y="246" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">unbiased success rate</text>
+  <line x1="162" y1="103" x2="282" y2="103" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch14f1ab)"/>
+  <text x="222" y="96" font-family="Noto Sans" font-size="10" fill="#4878a8" text-anchor="middle">checkpoints</text>
+  <line x1="282" y1="142" x2="162" y2="142" stroke="#b0703a" stroke-width="1.5" marker-end="url(#ch14f1ao)"/>
+  <text x="222" y="158" font-family="Noto Sans" font-size="10" fill="#b0703a" text-anchor="middle">rollout datasets</text>
+  <line x1="418" y1="103" x2="517" y2="103" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch14f1ab)"/>
+  <text x="467" y="96" font-family="Noto Sans" font-size="10" fill="#4878a8" text-anchor="middle">checkpoints</text>
+  <line x1="517" y1="142" x2="418" y2="142" stroke="#b0703a" stroke-width="1.5" marker-end="url(#ch14f1ao)"/>
+  <text x="467" y="158" font-family="Noto Sans" font-size="10" fill="#b0703a" text-anchor="middle">episodes</text>
+  <line x1="330" y1="171" x2="330" y2="204" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch14f1ab)"/>
+  <text x="322" y="191" font-family="Noto Sans" font-size="10" fill="#4878a8" text-anchor="end">checkpoints</text>
+  <line x1="372" y1="204" x2="372" y2="171" stroke="#666" stroke-width="1.5" marker-end="url(#ch14f1ag)"/>
+  <text x="380" y="191" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="start">metrics</text>
+  <text x="350" y="281" font-family="Noto Sans" font-size="10.5" fill="#666" text-anchor="middle">no shared clock: each component pulls the newest artifact whenever it happens to be ready</text>
+</svg>
+<figcaption>Figure 14.1 &mdash; The asynchronous RL loop. Notice what is <em>not</em> in this picture: there is no arrow between the learner and the workers. Every component talks only to the storage bus, so any of them can be restarted, duplicated, or killed without the others noticing anything worse than a pause in the flow of new artifacts.</figcaption>
+</figure>
+
+<h2>14.1 Why simulate at all</h2>
+
+<h3>14.1.1 What we want, and the obvious thing to try</h3>
+
+<p>What we want is millions of transitions covering the states the policy will actually visit, labeled with enough reward signal to tell good behavior from bad. The obvious way to get them is to collect them on the robot. You have a robot. Point it at the task and let it run.</p>
+
+<p>Here is the tally, and you know most of it from hil-serl. Every episode ends with a human resetting the scene &mdash; on your rig, you. Wall-clock speed is fixed at 1&times;; physics has no fast-forward button. One robot means one data stream. The reward signal needs a learned success classifier or a human finger on a button (Chapter 13). And an exploring policy &mdash; one deliberately trying actions it is unsure about &mdash; can strip a gear, knock a mug off the table, or close a gripper on a finger.</p>
+
+<h3>14.1.2 Exactly how badly that fails, with numbers</h3>
+
+<p>The arithmetic is more brutal than the intuition. Take LeHome's garment folding: a 600-step control horizon at 30 Hz, which is twenty seconds of robot motion, plus the human work between episodes. That work is two jobs, not one. Twenty seconds to flatten the garment back out across the table, and about ten more to reseat it in the same starting position and press start. So thirty seconds of reset against twenty seconds of episode &mdash; fifty seconds per attempt &mdash; and assume a person can keep that up for eight solid hours, which they cannot.</p>
+
+<pre class="code"># Real-robot collection, one rig, one human
+episode  (600 steps at 30 Hz)                     = 20 s
+reset    (flatten 20 s + reseat and start 10 s)   = 30 s
+episode + reset            = 20 + 30              = 50 s
+episodes per hour          = 3600 / 50            = 72
+episodes per 8-hour day    = 72 * 8               = 576
+LeHome's final data pool   = 12,500 kept episodes
+days of nonstop human work = 12500 / 576          = 21.7 days
+
+# Simulated collection, one rollout machine, 4 Isaac Sim instances
+episode (incl. reset)      = ~30 s
+episodes per instance-hour = 3600 / 30            = 120
+episodes per machine-hour  = 120 * 4              = 480
+three machines             = 1440 episodes / hour
+12,500 episodes            = 12500 / 1440         = 8.7 hours of fleet time</pre>
+
+<p>Twenty-two person-days against nine hours of unattended machine time, for one data pool of one run. Two honest caveats. Nine hours is throughput, not calendar time: the actual LeHome campaign ran roughly three months across ~140 sessions, because most of a project is debugging, not streaming. And Isaac Sim takes about thirty seconds to produce a twenty-second episode, so it runs <em>slower</em> than real time. Simulation does not win by being fast. It wins by being parallel, and by not needing you.</p>
+
+<h3>14.1.3 The fix, item by item</h3>
+
+<p><strong>Resets become a function call.</strong> More than that: you can save a full physics snapshot &mdash; every position, velocity, and contact state &mdash; at any timestep and restore it later. Section 14.5 turns that one capability into an entire curriculum toolkit. There is no real-world equivalent; you cannot rewind a garment.</p>
+
+<p><strong>Speed and parallelism.</strong> One instance may be slower than real time, but \(M\) instances give \(M\) independent streams, and \(M\) is limited by your GPU budget rather than by how many robots you own. (\(M\) here, not \(K\): this book keeps \(K\) for the sampler's integration steps.)</p>
+
+<p><strong>Ground-truth state.</strong> The simulator knows the true state \(s\), not merely the observation \(o\). Chapter 11 built dense rewards out of keypoint distances &mdash; how far the left sleeve's tip is from the right shoulder. On hardware those must be estimated by a perception model that is itself sometimes wrong, or abandoned for a binary classifier; in simulation they are a scene-graph query, exact on every frame, free. The LeHome success checker is literally a conjunction of pairwise keypoint-distance thresholds, five conditions for tops and four for pants (the official checker; Larchenko expanded long pants to seven for his own reward &mdash; Chapter 8). So "the simulator gives you keypoints" means Chapter 11's whole reward toolkit &mdash; checkpoints, potential shaping on completion, the tightness bonus &mdash; becomes cheap, because every input it needs is exact.</p>
+
+<p><strong>Safety.</strong> The policy can flail through millions of catastrophic actions and the only cost is electricity.</p>
+
+<p>An analogy from your day job: the simulator is your test suite. Resets are <code>tearDown</code>, physics snapshots are fixtures restored before each case, \(M\) instances are \(M\) parallel test runners, and ground-truth keypoints are the internal assertions you can only write because you hold the object under test rather than its HTTP response. Where the analogy breaks: a unit test is written against a specification <em>you control</em>, so passing means correct. A simulator approximates physics nobody controls, so passing in sim means only "passing in sim."</p>
+
+<h3>14.1.4 The stack landscape, and a rule for choosing</h3>
+
+<p><strong>MuJoCo</strong> (Todorov et al., 2012) is the fast, CPU-friendly rigid-body workhorse &mdash; what you ported the rover to, still the default for contact-rich rigid manipulation and for anything that must run on a laptop. <strong>NVIDIA Isaac Sim</strong>, with the <strong>Isaac Lab</strong> RL layer on top, trades setup simplicity for GPU-parallel physics, photorealistic rendering, and deformable bodies &mdash; cloth in particular, which is why LeHome's garments live there. <strong>Genesis</strong> is a newer GPU-native simulator aiming at speed across several solvers. <strong>SAPIEN</strong>, with <strong>ManiSkill</strong> as its task suite, targets articulated-object manipulation. <strong>PyBullet</strong> is the old, dependency-light option, still fine for prototyping.</p>
+
+<p>The rule for choosing has two clauses. Pick by the physics your task cannot fake: cloth, rope, fluid, or granular material eliminates most of the list immediately. Then pick by the rendering fidelity your observations require: a policy reading joint angles does not care what the render looks like; a policy reading three RGB cameras cares enormously. Everything else is a tiebreaker.</p>
+
+<h2>14.2 The two levers for any domain gap</h2>
+
+<h3>14.2.1 The obvious plan, and why it cannot work</h3>
+
+<p>What we want is a policy trained in simulation that works in reality. The obvious plan is to build a simulator that matches reality, so that "works in sim" and "works in reality" become the same statement.</p>
+
+<p>This fails for a reason worth stating precisely. Every sim-to-real problem is a <strong>domain gap</strong>: the joint distribution over observations and dynamics seen in training is not the one seen at deployment. Some of that mismatch you can measure and fix. Much of it you cannot even enumerate &mdash; nobody knows the bending stiffness of a particular worn t-shirt, the spectral response of a $30 webcam under fluorescent light, or the true latency from photon to torque on your USB chain. You cannot fix what you cannot measure.</p>
+
+<p>Worse, the mismatches you would never think to look for are the ones the network finds. Larchenko's auxiliary heads could tell apart two image-resize pipelines &mdash; 640 pixels straight down to 224, versus 640 to 320 to 224 &mdash; and success dropped when the wrong one was used (Larchenko, 2026). If a resampling kernel is a detectable domain difference, "match reality exactly" is not a plan.</p>
+
+<h3>14.2.2 The fix: two levers, and only two</h3>
+
+<p>Everything you can do about a domain gap is one of two levers, drawn in Figure 14.2.</p>
+
+<p><strong>Lever one: make the domains more similar.</strong> This is <strong>system identification</strong> &mdash; measuring real masses, friction coefficients, motor response curves, and control latency, then setting the simulator's parameters to match &mdash; plus camera alignment (pose, intrinsics, exposure) and asset matching (scan or rebuild the actual objects you will manipulate).</p>
+
+<p><strong>Lever two: make the training data more diverse.</strong> This is <strong>domain randomization</strong> (Tobin et al., 2017; Peng et al., 2018): randomize colors, patterns, textures, lighting, camera pose and intrinsics, and physics parameters, then stack heavy image augmentation on top of the rendered result.</p>
+
+<p>That list is a category list, and category lists are easy to nod along to without knowing what you would actually write. So here is the real randomizer from the LeHome simulation, item by item. Each garment's mesh gets its texture swapped for another drawn from a library, so the same shirt appears in dozens of fabrics. The swapped texture is then remapped in LAB color space, which moves lightness and hue independently of the pattern &mdash; a plaid stays plaid but arrives in a color no photograph in the library contained. Every camera's pose is jittered around its nominal mount, and its focal length with it, so no fixed pixel ever means a fixed place on the table. The dome light is redrawn between episodes: direction, color temperature, intensity. And a small color tint is applied <em>per step</em>, so the white balance drifts even within a single episode and the policy cannot latch onto one.</p>
+
+<p>Notice the two timescales, because you will have to choose them yourself. Texture, camera pose, and lighting are drawn once per episode and then held, which is what makes each episode look like a different room. The tint is redrawn every step, which is what makes the room flicker. The two teach different invariances, and you want both.</p>
+
+<p>Formally, randomization replaces one MDP with a distribution over MDPs indexed by randomization parameters \(\xi\):</p>
+
+<div class="key-eq">
+\[
+J(\theta) \;=\; \mathbb{E}_{\xi \sim p(\xi)}\;\mathbb{E}_{\tau \sim p_{\xi}(\tau \mid \pi_\theta)}\big[\,G_0\,\big],
+\qquad G_0 = \textstyle\sum_{t} \gamma^{t} r_t .
+\]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+<p>The left side, \(J(\theta)\), is what we maximize: how good the policy with parameters \(\theta\) is. Normally that is one expectation over trajectories; here there are two, nested. The outer one, \(\mathbb{E}_{\xi \sim p(\xi)}\), says: first roll dice to build a world. \(\xi\) is one draw of every randomized quantity at once &mdash; this texture, this lighting, this camera pose, this friction &mdash; and \(p(\xi)\) is the distribution you chose to draw from. The inner expectation says: <em>inside that world</em>, run \(\pi_\theta\) to get a trajectory \(\tau\), where \(p_\xi(\tau \mid \pi_\theta)\) is the trajectory distribution that world's physics produces. \(G_0\) is that trajectory's return from step 0: rewards \(r_t\) each shrunk by \(\gamma^t\), summed. So \(J(\theta)\) is an <em>average across a population of worlds</em>, and one \(\theta\) must serve all of them.</p>
+</div>
+
+<p>That is why the lever works. One set of weights must succeed for every \(\xi\) it will meet, so it cannot key on any feature that varies with \(\xi\). If the shirt is sometimes red and sometimes plaid, "look for red" stops being viable and the network is pushed toward invariant structure &mdash; shape, edges, how the fabric deforms. Make the ranges wide enough and reality becomes just another sample of \(\xi\), handled because all the others are.</p>
+
+<figure>
+<svg viewBox="0 0 700 235" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch14f2ab" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#4878a8"/></marker>
+    <marker id="ch14f2ao" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#b0703a"/></marker>
+  </defs>
+  <line x1="350" y1="15" x2="350" y2="220" stroke="#ccc" stroke-dasharray="4 4"/>
+  <text x="170" y="26" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333" text-anchor="middle">Lever 1 &#8212; align: move the domains together</text>
+  <ellipse cx="105" cy="125" rx="62" ry="42" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+  <text x="105" y="129" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#4878a8" text-anchor="middle">sim</text>
+  <ellipse cx="238" cy="138" rx="62" ry="42" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+  <text x="238" y="142" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#b0703a" text-anchor="middle">real</text>
+  <line x1="148" y1="112" x2="184" y2="118" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch14f2ab)"/>
+  <line x1="196" y1="150" x2="160" y2="144" stroke="#b0703a" stroke-width="1.5" marker-end="url(#ch14f2ao)"/>
+  <text x="170" y="207" font-family="Noto Sans" font-size="10.5" fill="#666" text-anchor="middle">system ID &#183; camera alignment &#183; asset matching</text>
+  <text x="525" y="26" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333" text-anchor="middle">Lever 2 &#8212; diversify: widen sim over real</text>
+  <ellipse cx="525" cy="132" rx="140" ry="70" fill="#eaf1f8" fill-opacity="0.35" stroke="#4878a8" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="525" y="80" font-family="Noto Sans" font-size="10.5" fill="#4878a8" text-anchor="middle">randomized sim, &#958; ~ p(&#958;)</text>
+  <ellipse cx="468" cy="140" rx="46" ry="30" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+  <text x="468" y="144" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#4878a8" text-anchor="middle">sim</text>
+  <ellipse cx="586" cy="146" rx="46" ry="30" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+  <text x="586" y="150" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#b0703a" text-anchor="middle">real</text>
+  <line x1="452" y1="112" x2="435" y2="92" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch14f2ab)"/>
+  <line x1="428" y1="130" x2="402" y2="120" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch14f2ab)"/>
+  <line x1="438" y1="162" x2="415" y2="180" stroke="#4878a8" stroke-width="1.5" marker-end="url(#ch14f2ab)"/>
+  <text x="525" y="222" font-family="Noto Sans" font-size="10.5" fill="#666" text-anchor="middle">randomization widens training until real falls inside it</text>
+</svg>
+<figcaption>Figure 14.2 &mdash; The two levers, and the fact that they solve the same problem in opposite directions. On the left the training distribution moves toward the deployment one and stays narrow; on the right it stays put and grows until the deployment distribution is inside it. The right panel costs capacity, because one policy must now solve every world in the dashed ellipse.</figcaption>
+</figure>
+
+<h3>14.2.3 Which lever, when &mdash; and what diversification costs</h3>
+
+<p>Align when the mismatch is measurable and cheap to fix: a camera mounted three centimeters off, an action scale wrong by a constant factor, forty milliseconds of unmodeled latency. Fixing those removes the gap exactly and costs no policy capacity. Diversify when the mismatch is unmeasurable or high-dimensional: fabric dynamics, room lighting, texture, wear. The working rule is one sentence: <strong>align what you can measure, randomize what you cannot.</strong></p>
+
+<p>Diversification is not free, and this is the part people skip. The policy now solves a strictly harder problem: \(J(\theta)\) is an average over worlds, and the \(\theta\) maximizing an average is generally not the \(\theta\) maximizing any single term. Illustratively, a policy trained under one fixed lighting setup might reach 85% there and 5% elsewhere, while the randomized version reaches 78% nearly everywhere. You trade peak performance in one domain for a floor across all of them &mdash; deliberately, rather than discovering it on a leaderboard.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+<p>You have pulled both levers already: the rover's MuJoCo port randomized dynamics before the printed chassis ran the policy. What is worth adding is the audit. Write an <code>audit_baseline.py</code> that samples 200 draws of \(\xi\) from your current ranges and in each runs a scripted expert (or replays a known-good trajectory), recording success. If the expert falls from 95% to 40%, your ranges are not teaching robustness, they are teaching that the world is noise. Run it whenever you widen a range: minutes spent, days saved.</p>
+</div>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+<p><strong>Randomizing past solvability.</strong> This is what the audit above catches. On the rover, overly wide dynamics ranges produced sampled worlds that were effectively undrivable &mdash; no policy could have succeeded, so every gradient from those episodes was noise. The symptom is deceptive: training loss looks fine, because the network dutifully predicts the mean of an unpredictable target, and success rate simply stops improving. Widen ranges only as fast as <em>some</em> policy can still win in them, and one factor at a time so you know which one broke it.</p>
+</div>
+
+<h2>14.3 Real-to-real: the gap everyone forgets</h2>
+
+<p>Sim-to-real is only half the story, because "real" is not one domain either. Two SO-101 arms off the same production run differ in servo zero offsets, gear backlash, and cable tension; two cameras of the same model differ in color response; two 3D-printed mounts differ by a millimeter, which at the end of a 30 cm arm is several millimeters of tool position. In any competition or deployment, <strong>the evaluation rig is not your rig</strong>.</p>
+
+<p>Larchenko faced the whole chain at once: policies trained in Isaac Sim, fine-tuned on his own bimanual rig, evaluated on the organizers' rig, which he never touched. He also discovered, only on physically assembling his setup, that the garments were kids'-sized (Larchenko, 2026). Zero-shot transfer failed outright. The real problem was not sim-to-real; it was sim &rarr; his robot &rarr; their robot, with the last hop blind.</p>
+
+<p>This is "works on my machine," with physics &mdash; and the analogy has a hard limit. In software you end that argument by shipping a container image that pins everything; there is no container for a servo's backlash, a room's lighting, or a garment's age. The only substitute is Section 14.2's two levers applied a second time: align what you can reach, randomize what you cannot.</p>
+
+<h3>14.3.1 Three tools that close the real-to-real gap</h3>
+
+<p><strong>Tool one: alignment overlay tooling.</strong> Build a utility that drives the robot to the joint state recorded in a dataset frame, then draws the live camera image on top of that stored frame. Now you nudge a camera mount until the two images coincide instead of guessing, and the same trick overlays a simulator render on a real view. This is the align lever applied real-to-real, and it worked well enough that the LeHome organizers adopted the tool to calibrate the official evaluation arenas &mdash; evidence that per-rig misalignment was widespread, not personal.</p>
+
+<p><strong>Tool two: per-source speed factors.</strong> Datasets recorded on different rigs by different operators move at different tempos. Organizer demonstrations are brisk; your own teleoperation is slower because you are being careful; DAgger corrections &mdash; the human-takeover segments of Chapter 13, where an operator grabs the controls mid-episode and drives the robot out of trouble &mdash; are slower still, because a human is reacting to a failure already in progress. Train on the raw mixture and the policy inherits an incoherent sense of pace, with nothing in the observation to say which applies. The fix is to resample each source's time axis to a common motion intensity: in the LeHome real mix, organizer demonstrations at 1.0&times; (the reference), home teleoperation played back 1.5&times; faster, DAgger corrections 2.0&times; faster, and simulator data <em>slowed</em> to 0.65&times; because sim motion was the fastest of the four. Above one means too slow relative to the reference; below one, too fast.</p>
+
+<p><strong>Tool three: sim-to-real format conversion.</strong> Simulator success replays were rendered into the real data format &mdash; same camera layout, resolution, and normalization &mdash; so sim experience could sit inside the same training mix as real episodes, sampled by the same code path. The mix used three buckets with fixed batch shares: organizer demonstrations at 60% (500 episodes, ~187k frames), the author's own teleoperation plus DAgger at 30% (321 plus 471 episodes), and converted sim replays at 10% (1,723 episodes, ~625k frames).</p>
+
+<p>On top of all three buckets sits the augmentation stack, applied independently per camera so the three views never agree about what was distorted. It is worth naming in full, since "heavy augmentation" is another phrase that is easy to agree with and hard to implement: color jitter with separate gain and gamma shifts, blur, simulated sensor noise, random crop, rotation and zoom, cutout patches that blank part of the frame, and whole-camera dropout that blanks one view entirely for a stretch of steps. Proprioceptive state gets noise too. Camera dropout is the one people leave out and the one that saves the run: on the evaluation rig a USB camera will eventually stall for half a second, and a policy that has never seen a dead view will do something interesting with it.</p>
+
+<p>The lesson is in the mismatch. The sim bucket holds more than three times the frames of the organizer bucket and receives one sixth of the batch share &mdash; per frame, organizer data was sampled at roughly 1.00, home data at 0.21, sim data at 0.05. Batch share states how much you trust a source; it has almost nothing to do with how much of it you have.</p>
+
+<h3>14.3.2 The strip-the-model recipe</h3>
+
+<p>Fine-tuning for the real world is not just a data change; it is a model change. Four moves, each with a reason.</p>
+
+<p>Start from a <strong>late-but-not-latest checkpoint</strong>. The latest is by construction the most sim-overfit &mdash; it has had the most gradient steps to exploit simulator-specific cues. Back up a little and you keep most of the skill with less of the overfitting.</p>
+
+<p><strong>Keep</strong> the action objective (Chapter 7's flow-matching loss, which is the actual skill), plus the garment-type and completion heads: their targets exist on real hardware, since a human can label garment type and completion is just elapsed fraction of a successful run. <strong>Freeze</strong> the success-style heads &mdash; success, checkpoint, time-to-completion. On hardware there is no per-frame ground-truth success signal, so training them means training on labels you do not have; freezing keeps their features intact without corrupting them.</p>
+
+<p><strong>Drop</strong> the keypoint head, both of the report's future-prediction queries, advantage conditioning, guidance, and best-of-N. The keypoint head was Chapter 8's cheap world-model stand-in, and its targets are sim-privileged: no keypoints on hardware, no head. The two future queries go for exactly the same reason &mdash; the training-only FAST-token query and the flow-matching \(Q\)-like query at the expert's tail (Chapter 8 lists both) are trained against simulator state the real robot has no way to observe. Advantage conditioning (Chapter 10) needs an advantage, and there are no advantages without rewards. Guidance and best-of-N (Chapter 12) depend on those heads being trustworthy, and you have just established that they are not.</p>
+
+<p>Real-world inference is then three things. Chunked actions: predict \(a_{t:t+H}\), execute part of it, predict again. Soft inpainting between chunks &mdash; Chapter 12's trick for making a newly generated chunk agree with the actions already committed, by pinning the overlapping prefix during generation instead of letting the new chunk start wherever it likes. And the garment-type bootstrap: a warm-up inference at the start of the episode whose first few chunks each vote on which of the four garment types is on the table, with the majority answer latched and fed back as a conditioning input for the rest of the episode, so the policy cannot change its mind about what it is folding halfway through.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+<p><strong>Sim-format visual leakage.</strong> Converting sim data into the real format leaks sim-only cues &mdash; a render artifact, a noise floor, a resampling signature. The policy learns "this looks like sim, act like the sim policy," and splits into two modes, one of which never runs at evaluation. Not hypothetical: the auxiliary heads could distinguish two image-resize pipelines. Three defenses. Keep the sim-format share small (10% in LeHome). Augment that bucket hardest &mdash; the whole stack listed above, camera dropout and cutout included. And test that behavior does not change when you restyle an input the task does not depend on.</p>
+</div>
+
+<h2>14.4 The asynchronous loop</h2>
+
+<h3>14.4.1 Why the PPO shape cannot do this</h3>
+
+<p>Chapter 3's PPO is a lockstep algorithm, and it is worth being precise about why. Its objective is built on the importance ratio</p>
+
+\[
+\rho_t(\theta) \;=\; \frac{\pi_\theta(a_t \mid s_t)}{\pi_{\theta_{old}}(a_t \mid s_t)} .
+\]
+
+<p>Name the parts, because the whole argument lives in them. The numerator is how likely the <em>current</em> policy, the one with parameters \(\theta\) you are updating right now, is to have taken the action \(a_t\) that was actually taken in state \(s_t\). The denominator is how likely \(\pi_{\theta_{old}}\), the policy that was running when that action got collected, was to take it. So \(\rho_t\) is exactly 1 when nothing has changed since collection, larger than 1 for actions the new policy now favors more, smaller for ones it favors less, and it drifts further from 1 the further \(\theta\) moves from \(\theta_{old}\).</p>
+
+<p>That ratio is what reweights data collected under \(\pi_{\theta_{old}}\) so it can estimate a gradient for \(\pi_\theta\). The correction is only trustworthy while \(\theta\) stays near \(\theta_{old}\); push far and the ratios become enormous or tiny, the variance explodes, and the clip meant as a safety rail becomes the entire signal. So PPO must alternate: freeze \(\theta_{old}\), collect a batch with it, take a few clipped epochs, discard the batch, repeat.</p>
+
+<p>Collection and learning are welded together. Suppose collecting one iteration's data takes eight minutes across your simulator fleet and the update takes two minutes on the GPU. The GPU is idle 80% of the time, the fleet 20%, and every worker also idles at the end of collection waiting for the slowest one &mdash; easily a two-to-one spread in episode length once success terminates episodes early. Add a preempted spot instance &mdash; a cheap cloud machine the provider may reclaim at any moment, which is why you rented it cheaply &mdash; and the whole batch is compromised, because the surviving data is a biased subset of what you meant to collect.</p>
+
+<h3>14.4.2 Why weighted behavior cloning can</h3>
+
+<p>Chapter 4's AWR family removes the weld. Its update is weighted maximum likelihood on whatever data exists, with weights derived from advantages you can recompute at any time from stored quantities. There is no ratio to invalidate, because there is no ratio. Data from a checkpoint three hours old is still usable &mdash; mildly off-policy, and that mildness is priced in through the advantage weights and Chapter 11's staleness blend. Chapter 9 drew the comparison in full; this is its most consequential operational line. <strong>Off-policy tolerance is what makes asynchrony possible.</strong></p>
+
+<h3>14.4.3 The three roles and the storage bus</h3>
+
+<p>The <strong>learner</strong> (one GPU) cycles: download new rollouts, recompute advantages over all datasets, train on the sampled mix, upload a checkpoint. The <strong>rollout workers</strong> pull the latest checkpoint &mdash; whatever it is, they never check its age &mdash; run several simulator instances behind one shared stateless policy server, and upload finished episodes as datasets. The <strong>evaluator</strong> runs unbiased episodes under fixed conditions and publishes success rates: the only numbers anyone is permitted to believe.</p>
+
+<p>All three communicate exclusively through the storage bus &mdash; in Larchenko's system the bus is literally the Hugging Face Hub, with background sync daemons and no barrier anywhere. The evaluator was not even a separate process: the unbiased rollout strategies (random, full, and curriculum, all three defined in Section 14.5) doubled as the evaluation stream, and a manual DAgger station (Chapter 13) formed a third, human-paced worker.</p>
+
+<p>You have shipped this architecture before: a build server pushing versioned artifacts to object storage while deploy agents poll for the newest tag &mdash; no RPC, no queue with acknowledgements, just immutable named files. Nothing blocks, nothing locks, and a worker offline for an hour catches up by reading. Where the analogy breaks: in CI the artifact is a passive dependency, so a stale one is merely old. Here the checkpoint a worker pulls determines what data it produces, which determines the next checkpoint. That feedback loop is why staleness carries a statistical cost, not just a latency cost &mdash; what Chapter 11's blend exists to price.</p>
+
+<pre class="code"># --- learner: one GPU, runs forever ---
+while True:
+    hub.download_new_rollout_datasets()      # whatever showed up; may be nothing
+    recompute_advantages(all_datasets)       # Ch.11 blend, over ALL data, not just new
+    for _ in range(1000):                    # one "iteration" = ~1000 steps
+        train_step(sample_mix())             # per-source shares, Section 14.5
+    hub.upload_checkpoint()                  # real system: every ~500 steps, background sync
+
+# --- rollout worker: any number of these, all preemptible ---
+while True:
+    ckpt = hub.latest_checkpoint()           # may be minutes old; we do not care
+    eps  = run_episodes(ckpt, strategy=pick())   # random / curriculum / replay / hard-mine: Section 14.5
+    attach_values(eps)                       # value predictions FROZEN at collection time
+    hub.upload_dataset(eps)                  # immutable; never merged into anything</pre>
+
+<p>Two lines deserve a second look. <code>recompute_advantages(all_datasets)</code> runs over everything, not only new arrivals, because advantages depend on group statistics that shift as the policy improves. <code>attach_values(eps)</code> stores the value predictions made <em>at collection time</em> and never re-predicts them &mdash; those frozen numbers are exactly the stale-value anchor Chapter 11's blend consumes, and re-predicting them with a newer network would silently destroy the property that makes the blend correct.</p>
+
+<h3>14.4.4 Why the operational payoff is the real payoff</h3>
+
+<p>Every component <strong>scales independently</strong>: more throughput means starting another rollout machine, with no coordination step and no config to update &mdash; it pulls a checkpoint and starts uploading. Every component also <strong>dies independently</strong>. Workers can run on spot instances; a preemption costs throughput and never correctness, because a half-finished episode is simply never uploaded, and the learner restarts from its last checkpoint having lost at most one iteration.</p>
+
+<p>One knob keeps the whole thing from drifting into the past: each rollout dataset's sampling rate decays every iteration. Rate, not fraction &mdash; the same kind of number as the per-frame 1.00, 0.21, and 0.05 of Section 14.3, where organizer data was drawn at full rate and sim data at a twentieth of it.</p>
+
+<div class="key-eq">
+\[
+\mathrm{share}_k \;=\; \max\!\big(\,\mathrm{floor},\;\; \mathrm{share}_0 \cdot 0.98^{\,k}\,\big),
+\qquad w \;=\; \min(\mathrm{share}_k,\,1).
+\]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+<p>\(\mathrm{share}_k\) is this dataset's sampling <em>rate</em> \(k\) learner iterations after collection &mdash; not a slice of the batch, but a rate relative to a reference source, like Section 14.3's 1.00 for organizer data and 0.05 for sim. \(\mathrm{share}_0\) is the rate on arrival. Each iteration multiplies it by \(0.98\), so it fades geometrically instead of being deleted at a cutoff; \(\mathrm{floor}\), which is \(0.1\) in the LeHome system, stops the fade short of zero. A rate above 1 is legal for a source you deliberately oversample, which is why \(w\) clamps it: sampled more often than the reference, yes; trusted more than fully by Chapter 11's blend, never. One number, two jobs &mdash; how often old data is seen, and how far its frozen value predictions are believed. BC datasets are exempt; a demonstration does not age.</p>
+</div>
+
+<p>Work the decay out, because a decay constant means nothing until it is in hours. Solving \(0.98^{k} = 0.5\) gives \(k = \ln(0.5)/\ln(0.98) = -0.693/-0.0202 \approx 34\) iterations. Now convert iterations to wall-clock in two multiplications. The learner uploads a checkpoint roughly every 40 minutes and about two checkpoints go by per iteration, so one iteration is \(2 \times 40 = 80\) minutes. Then \(34 \times 80 = 2{,}720\) minutes, and \(2{,}720 / 60 = 45\) hours &mdash; a little under two days.</p>
+
+<p>Do the same for the floor, since that tells you when the fading stops rather than when it is half done. Solving \(0.98^{k} = 0.1\) gives \(k = \ln(0.1)/\ln(0.98) = -2.303/-0.0202 \approx 114\) iterations, which at 80 minutes each is \(114 \times 80 = 9{,}120\) minutes, or 152 hours, about six days. Put the two together and you have the life story of a rollout dataset: it halves in influence in two days, keeps sliding for another four, and then sits at a tenth of its arrival rate indefinitely, a permanent thin trickle of old experience. That is the half-life of experience in this system, and it is a number you should be able to state for your own runs.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+<p>You already run this pattern at \(K = 1\). HIL-SERL's actor and learner are two processes: transitions stream one way, parameters the other (Luo et al., 2024). The async loop swaps that live socket for a bus of immutable artifacts, so components need not be online at the same time &mdash; and the price of that decoupling is exactly the staleness you now know how to blend away. When Chapter 15 has you scale past one SO-101, you change the transport, not the architecture. On paper first: which of your config values would become per-dataset shares?</p>
+</div>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+<p>One H200 learner uploaded a checkpoint roughly every 40 minutes. Rollout machines each ran 3&ndash;5 Isaac Sim instances behind one shared stateless policy server, and a manual DAgger station acted as a third, human-paced worker. Everything moved through the Hugging Face Hub; datasets were never merged, only sampled, with rollout shares decaying 0.98&times; per iteration and the BC share fixed. Across ~140 sessions this produced about 12,500 kept episodes and ~4.3M frames &mdash; averaging ~344 frames, about 11 seconds, per episode, because success terminates episodes early. Four checkpoint rollbacks were used deliberately to escape local optima (Larchenko, 2026).</p>
+</div>
+
+<h2>14.5 Rollout collection as a curriculum</h2>
+
+<h3>14.5.1 The obvious plan and its arithmetic problem</h3>
+
+<p>Once workers can restore snapshots and choose which task instance to attempt, collection becomes a decision problem: which episodes are worth the ~30 wall-clock seconds they cost? The obvious plan is uniform random sampling over all instances. It is unbiased, trivial to implement, and wastes most of your fleet.</p>
+
+<p>Here is why, and it follows from Chapter 11's group-baselined advantages. With a binary outcome and an empirical per-task baseline, an episode's advantage takes one of exactly two values, and the signal a task offers scales with how far apart they are:</p>
+
+<div class="key-eq">
+\[
+\hat{A}_{\mathrm{ep}} \in \{\,1-\hat{p}_{succ},\; -\hat{p}_{succ}\,\},
+\qquad
+\operatorname{std}\big(\hat{A}_{\mathrm{ep}}\big) = \sqrt{\hat{p}_{succ}\,(1-\hat{p}_{succ})}\,.
+\]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+<p>\(\hat{p}_{succ}\) is the policy's measured success rate on this particular task instance &mdash; this garment, say &mdash; and it plays the role of the baseline. \(\hat{A}_{\mathrm{ep}}\) is the advantage the whole episode receives, and there are only two possibilities. If the episode succeeds, the outcome was 1 against an expectation of \(\hat{p}_{succ}\), so the advantage is the positive number \(1-\hat{p}_{succ}\). If it fails, the outcome was 0 and the advantage is \(-\hat{p}_{succ}\). The second expression is the standard deviation of that two-valued quantity: how much the advantage varies between episodes, which is the same thing as how much information a fresh rollout carries. \(\sqrt{\hat{p}(1-\hat{p})}\) is largest at \(\hat{p}_{succ} = 0.5\) and zero at both ends.</p>
+</div>
+
+<p>That standard deviation is worth deriving rather than quoting, partly because it takes three lines and partly because you should not take a variance on trust. Write \(\hat{p}\) for \(\hat{p}_{succ}\) to keep the algebra short. Start with the mean: the episode succeeds with probability \(\hat{p}\) and then contributes \(1-\hat{p}\), and it fails with probability \(1-\hat{p}\) and then contributes \(-\hat{p}\).</p>
+
+\[
+\mathbb{E}\big[\hat{A}_{\mathrm{ep}}\big] \;=\; \hat{p}\,(1-\hat{p}) \;+\; (1-\hat{p})\,(-\hat{p}) \;=\; 0 .
+\]
+
+<p>The mean is exactly zero, which is the whole point of subtracting a baseline. Because the mean is zero, the variance is simply the mean of the square, with no correction term to carry:</p>
+
+\[
+\operatorname{Var}\big(\hat{A}_{\mathrm{ep}}\big) \;=\; \hat{p}\,(1-\hat{p})^2 \;+\; (1-\hat{p})\,\hat{p}^2 .
+\]
+
+<p>Both terms carry a factor \(\hat{p}(1-\hat{p})\), so pull it out and watch what is left collapse:</p>
+
+\[
+\hat{p}\,(1-\hat{p})\big[(1-\hat{p}) + \hat{p}\big] \;=\; \hat{p}\,(1-\hat{p})\cdot 1 \;=\; \hat{p}\,(1-\hat{p}) .
+\]
+
+<p>Take the square root and you have \(\operatorname{std}(\hat{A}_{\mathrm{ep}}) = \sqrt{\hat{p}(1-\hat{p})}\), the expression printed above. It is the standard deviation of a single coin flip, which is what a binary-outcome episode is.</p>
+
+<p>Put numbers on it. At \(\hat{p}_{succ} = 0.9\) a success carries \(+0.1\) and a failure \(-0.9\), with standard deviation \(\sqrt{0.9 \times 0.1} = 0.30\). Nine rollouts in ten come back carrying exactly the same advantage, \(+0.1\). It is worth being exact about why that is fatal rather than merely wasteful, because "low-variance advantage" sounds like a mild complaint and it is not.</p>
+
+<p>Recall from Chapter 4 that the update is weighted maximum likelihood, with each sample's weight \(w_i = \exp(\hat{A}_i/\beta)\) &mdash; the exponential of its advantage divided by the temperature \(\beta\). Take \(\beta = 0.5\). At \(\hat{p}_{succ} = 0.9\) each of the nine successful episodes gets \(w = \exp(0.1/0.5) = \exp(0.2) = 1.22\), and the single failure gets \(w = \exp(-0.9/0.5) = \exp(-1.8) = 0.17\). So ninety percent of that garment's frames arrive at the optimizer carrying an identical weight. A weighted regression in which every weight is the same is an unweighted regression, and an unweighted regression onto samples the policy itself just produced is a gradient of approximately zero &mdash; you are teaching the network to do what it already does. Only the one failing episode in ten carries a weight that differs from its neighbors, and it is that contrast, not the absolute size of any weight, that moves \(\theta\) anywhere.</p>
+
+<p>Now run the same computation at \(\hat{p}_{succ} = 0.5\). The advantages are \(\pm 0.5\), the standard deviation is \(0.50\), and the weights are \(\exp(0.5/0.5) = 2.72\) for a success against \(\exp(-0.5/0.5) = 0.37\) for a failure. The ratio between the two weights has not changed &mdash; with a binary outcome the gap between the two advantages is always exactly 1, so the ratio is always \(\exp(1/\beta)\), here \(7.4\). What changed is the composition of the batch. Half the frames now sit on each side of that gap instead of one frame in ten, so the contrast is present in half the gradient mass rather than a tenth of it. The same thirty seconds of simulator time buys 1.67&times; the spread in advantage, and it buys a batch that actually contains a comparison.</p>
+
+<p>At \(\hat{p}_{succ} = 0.05\) you are back to a standard deviation of \(\sqrt{0.05 \times 0.95} = 0.218\), paying for 19 failures per success, and the same collapse happens with the signs reversed. A garment the policy always folds teaches nothing; one it never folds teaches nothing. The frontier carries the gradient, as Figure 14.3 shows.</p>
+
+<figure>
+<svg viewBox="0 0 700 300" width="700" xmlns="http://www.w3.org/2000/svg">
+  <rect x="80" y="55" width="112" height="195" fill="#f3f3f3"/>
+  <rect x="192" y="55" width="336" height="195" fill="#ecf5ee" fill-opacity="0.7"/>
+  <rect x="528" y="55" width="112" height="195" fill="#f3f3f3"/>
+  <line x1="80" y1="250" x2="660" y2="250" stroke="#333" stroke-width="1.2"/>
+  <line x1="80" y1="250" x2="80" y2="50" stroke="#333" stroke-width="1.2"/>
+  <polyline points="80,250 136,136 192,98 248,76 304,64 360,60 416,64 472,76 528,98 584,136 640,250" fill="none" stroke="#4878a8" stroke-width="2.4"/>
+  <line x1="360" y1="60" x2="360" y2="250" stroke="#b04a4a" stroke-width="1.2" stroke-dasharray="4 3"/>
+  <circle cx="360" cy="60" r="4" fill="#b04a4a"/>
+  <text x="360" y="47" font-family="Noto Sans" font-size="11" fill="#b04a4a" text-anchor="middle">peak signal: std = 0.50</text>
+  <circle cx="584" cy="136" r="3.5" fill="#4878a8"/>
+  <text x="600" y="128" font-family="Noto Sans" font-size="10" fill="#666">0.30</text>
+  <circle cx="136" cy="136" r="3.5" fill="#4878a8"/>
+  <text x="98" y="128" font-family="Noto Sans" font-size="10" fill="#666">0.30</text>
+  <text x="70" y="254" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">0.0</text>
+  <text x="70" y="64" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">0.5</text>
+  <text x="80" y="268" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">0.0</text>
+  <text x="360" y="268" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">0.5</text>
+  <text x="640" y="268" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">1.0</text>
+  <text x="360" y="288" font-family="Noto Sans" font-size="12" fill="#333" text-anchor="middle">measured success rate on this task instance &#8212; p&#770;</text>
+  <text x="26" y="150" font-family="Noto Sans" font-size="12" fill="#333" text-anchor="middle" transform="rotate(-90 26 150)">std of episode advantage</text>
+  <text x="136" y="180" font-family="Noto Sans" font-size="11" font-weight="bold" fill="#666" text-anchor="middle">hopeless</text>
+  <text x="136" y="196" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">hard-mine or</text>
+  <text x="136" y="209" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">replay into it</text>
+  <text x="360" y="180" font-family="Noto Sans" font-size="11" font-weight="bold" fill="#4a8a5c" text-anchor="middle">the frontier</text>
+  <text x="360" y="196" font-family="Noto Sans" font-size="10" fill="#4a8a5c" text-anchor="middle">spend your rollouts here</text>
+  <text x="584" y="180" font-family="Noto Sans" font-size="11" font-weight="bold" fill="#666" text-anchor="middle">solved</text>
+  <text x="584" y="196" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">sample only to</text>
+  <text x="584" y="209" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">detect regression</text>
+</svg>
+<figcaption>Figure 14.3 &mdash; How much one rollout teaches you, against how well the policy already does on that task. Notice the flat top, shaded green: anywhere between about 0.2 and 0.8 you get most of the available signal, so the curriculum target needs no precise tuning. Notice too that both tails reach exactly zero &mdash; which is why a fleet sampling uniformly over solved and hopeless tasks looks busy while learning almost nothing.</figcaption>
+</figure>
+
+<p>Sun et al. (2025) make this precise for GRPO-style RL in language models &mdash; targeting moderate-difficulty items and replaying recent rollouts cut fine-tuning time by 23&ndash;62% &mdash; and LeHome's <strong>curriculum</strong> strategy (a sampling rule biasing collection toward instances of a chosen difficulty) generalizes it to robotics.</p>
+
+<h3>14.5.2 The strategies, one at a time</h3>
+
+<p><strong>Random</strong> samples instances uniformly: unbiased, and therefore your measurement instrument rather than your workhorse. <strong>Full</strong> sweeps every instance in order for even coverage. Both are honest and both are inefficient. <strong>Curriculum</strong> prefers instances whose running \(\hat{p}_{succ}\) is nearest a target &mdash; the green band in Figure 14.3, and the direct implementation of the variance argument above.</p>
+
+<p>Physics snapshots buy three sharper strategies with no real-world equivalent at all.</p>
+
+<p><strong>Success replay.</strong> Restore an early snapshot (LeHome used step 5) of an episode that succeeded, re-run from there under much heavier randomization, and keep only the replays that also succeed. This is a machine for manufacturing positive examples in states you know are winnable. Snapshots are saved with probability \(1-\hat{p}_{succ}\), so hard instances are deliberately overrepresented in the bank.</p>
+
+<p><strong>Semi-success replay.</strong> Take an episode that nearly worked, replay its recorded actions open-loop to reach the near-success state, then hand control to the live policy &mdash; endgame practice at the last few seconds of a task the policy rarely reaches on its own.</p>
+
+<p><strong>Hard mining.</strong> Watch the smoothed success-head prediction during a rollout &mdash; Chapter 8's auxiliary value head moonlighting as a difficulty detector. When it drops sharply from a running maximum (LeHome: more than 0.12 below a running max above 0.25), snapshot that state. You have caught a failure precursor: the moment the policy's own estimate of its prospects fell off a cliff. Restore those states later for targeted practice.</p>
+
+<h3>14.5.3 Two hygiene rules</h3>
+
+<p>First, <strong>only unbiased strategies may update success statistics.</strong> Random, full, and curriculum rollouts count; replayed and hard-mined episodes do not. A success replay starts from a state selected <em>because</em> it led to a success, so its outcomes are wildly optimistic; a hard-mined episode starts from a state selected because it looked bad. Let either into \(\hat{p}_{succ}\) and you are steering the curriculum with a broken instrument. Keep two counters, and never let them touch.</p>
+
+<p>Curriculum sitting on the permitted side of that line looks like a contradiction, since curriculum is defined by preferring some instances over others. The distinction is worth holding onto, because it is what makes the rule usable rather than arbitrary. Curriculum biases <em>which garment gets attempted</em>. Once the garment is chosen, the episode starts from an ordinary initial state, drawn the same way it would have been under random sampling. So every trial of that garment is still a fair trial of it, and that garment's own \(\hat{p}_{succ}\) is estimated from fair trials. Success replay and hard mining choose the starting <em>state</em> on the basis of how some earlier episode turned out, which conditions the estimate on the outcome it is supposed to be measuring.</p>
+
+<p>One consequence follows immediately and is easy to trip over. The fleet-wide average success rate <em>is</em> biased under curriculum, and biased downward, because the fleet is deliberately spending most of its time on the instances it finds hardest. That number is not wrong so much as meaningless: it measures your sampling policy as much as your robot policy. This is why the evaluator reports per-instance success rates rather than one headline figure, and why a rising per-garment curve alongside a flat fleet average is a normal, healthy picture rather than a contradiction to debug.</p>
+
+<p>Second, <strong>the buffers must stay fresh.</strong> That is what Section 14.4's 0.98 decay enforces: as a dataset ages its collection-time value predictions drift further from the current policy, which is why Chapter 11 fades stale GAE advantages toward the outcome-only group anchor as the share falls.</p>
+
+<h3>14.5.4 Worked example: one training mix, and what happens when it drifts</h3>
+
+<p>Suppose the learner draws batches of 200 frames from four buckets.</p>
+
+<table>
+<tr><th>Bucket</th><th>Share</th><th>Frames</th><th>What it contributes</th></tr>
+<tr><td>Success replays</td><td>40%</td><td>80</td><td>Dense positive supervision; keeps \(\hat{p}_{succ}\)-style heads calibrated; heavy augmentation turns wins into robustness data</td></tr>
+<tr><td>Semi-success replays</td><td>20%</td><td>40</td><td>Endgame practice at states the unaided policy rarely reaches</td></tr>
+<tr><td>Fresh on-policy</td><td>25%</td><td>50</td><td>The only unbiased view of the current policy; feeds curriculum statistics and anchors the advantage blend</td></tr>
+<tr><td>DAgger corrections</td><td>15%</td><td>30</td><td>Human labels on the failure boundary (Chapter 13); highest value per frame, scarcest supply</td></tr>
+</table>
+
+<p>Now suppose success replays creep from 40% to 60% &mdash; not by decision, but because replays are cheap and the share was never audited. The other three buckets split the remaining 40% in their old proportions, so each is scaled by \(40/60 = 0.667\). Here is every step.</p>
+
+<pre class="code">Success replays      60%           -> 0.60 * 200          = 120 frames
+Semi-success replays 20% * 0.667 = 13.3%  -> 0.133 * 200  =  26.7 frames
+Fresh on-policy      25% * 0.667 = 16.7%  -> 0.167 * 200  =  33.3 frames
+DAgger corrections   15% * 0.667 = 10.0%  -> 0.100 * 200  =  20.0 frames
+                                             check: 120 + 26.7 + 33.3 + 20 = 200
+
+Unbiased frames per batch:  50.0  ->  33.3      (a 33% cut)
+Per 1000-step iteration:    50,000 -> 33,300 unbiased frames</pre>
+
+<p>Stop before the next step, because there is a link in the chain that is easy to assume and worth making explicit. Batch shares say which frames the gradient sees. They do not, by themselves, say how many episodes the fleet collects. The two are connected because the workers are told to collect in roughly the proportion the learner intends to consume &mdash; collecting data that nobody samples is machine time thrown away, so the strategy mix tracks the training mix. When the replay share creeps up in the batch, the collection mix creeps up with it: the fleet spends more of its thirty-second slots restoring snapshots and fewer running fresh episodes from ordinary initial states. Fewer unbiased episodes come back per iteration, in about the same proportion.</p>
+
+<p>That is the chain, stated in order: the batch share drifts, the collection mix follows it, and the statistic the curriculum steers by ends up estimated from fewer trials. It is also the place to cut if you do not want measurement quality riding on a training-mix knob &mdash; pin a fixed fraction of worker time to unbiased rollouts and let the batch shares drift where they like.</p>
+
+<p>Now finish the computation, with the episode count derived rather than assumed. Section 14.4's LeHome average is about 344 frames per episode, so turn frames into episodes:</p>
+
+\[
+\text{before:}\;\; 50{,}000 / 344 = 145.3 \;\text{unbiased episodes per iteration},
+\]
+\[
+\text{after:}\;\; 33{,}300 / 344 = 96.8 \;\text{unbiased episodes per iteration}.
+\]
+
+<p>Those episodes are spread across the instances the curriculum tracks. Suppose there are about ten of them: four garment types, each with two or three distinct starting layouts that the curriculum scores separately. Divide:</p>
+
+\[
+145.3 / 10 = 14.5 \qquad\text{versus}\qquad 96.8 / 10 = 9.7
+\]
+
+<p>unbiased episodes per instance per iteration. A success rate estimated from \(n\) fair trials has standard error \(\sqrt{\hat{p}(1-\hat{p})/n}\), which is worst at \(\hat{p} = 0.5\), so use that:</p>
+
+\[
+\text{before:}\;\; \mathrm{SE} = \sqrt{0.25/14.5} = \sqrt{0.017241} = 0.1313,
+\]
+\[
+\text{after:}\;\; \mathrm{SE} = \sqrt{0.25/9.7} = \sqrt{0.025773} = 0.1605,
+\]
+\[
+0.1605 \,/\, 0.1313 = 1.22 .
+\]
+
+<p>The noise on \(\hat{p}_{succ}\) has risen by 22%, and nobody touched a setting called "measurement".</p>
+
+<p>Read what that does, in order. The curriculum picks instances by comparing \(\hat{p}_{succ}\) to a target, and a noisier \(\hat{p}_{succ}\) means instances land in the wrong zone of Figure 14.3 more often &mdash; you start spending rollouts on garments you only believe are at the frontier. Meanwhile 60% of the gradient mass comes from states that a snapshot taken by an older checkpoint selected: the mix has quietly become behavior cloning of a past self. And the tell is nasty &mdash; training loss <em>falls</em>, because replay frames are repetitive, positive, and easy to fit, while the evaluator's success rate goes flat.</p>
+
+<p>Batch shares are a knob you audit on a schedule, not a constant you set once. Put the realized per-bucket frame counts on your dashboard next to the loss, with unbiased episodes per garment per iteration beside them.</p>
+
+<div class="box checkpoint"><div class="box-title">Checkpoint</div>
+<ul>
+<li>Run the real-versus-simulated tally with your own numbers &mdash; episode length, reset time, instances per machine &mdash; and say what a 10,000-episode pool would cost you in person-days.</li>
+<li>Explain what "the simulator gives you keypoints" means, and name three pieces of Chapter 11's reward machinery that become cheap because of it.</li>
+<li>Write down the randomized-MDP objective, name every symbol, and use it to explain why randomization lowers peak performance in any single domain &mdash; then describe the audit that catches ranges pushed past solvability.</li>
+<li>List the three real-to-real tools and the four moves of the strip-the-model recipe, giving the reason each head is kept, frozen, or dropped.</li>
+<li>Explain why PPO's importance ratio forbids an asynchronous loop and why weighted behavior cloning permits one, then sketch the learner and worker loops from memory, including where value predictions are frozen.</li>
+<li>Derive \(\operatorname{std}(\hat{A}_{\mathrm{ep}}) = \sqrt{\hat{p}_{succ}(1-\hat{p}_{succ})}\), state which rollout strategies may update success statistics and why, and compute a batch's frame counts from its shares.</li>
+</ul>
+</div>
+
+<p><strong>Where to go deeper.</strong> Sun et al. (2025) is the short difficulty-targeted selection paper behind Section 14.5. Larchenko (2026), sections 2&ndash;3 and 9, documents the Hub-based flywheel, the rollout strategies, and the one-week sim-to-real sprint in engineering detail &mdash; read section 9 with Section 14.3 open beside it. The canonical domain-randomization papers, Tobin et al. (2017) and Peng et al. (2018), are optional context; OpenAI et al. (2019) takes randomization to its automated extreme under the name automatic domain randomization (ADR), which is the phrase to search for. Appendix A places Sun et al. and the LeHome report in reading order; the randomization papers are optional context outside the guide. Appendix B's ladder has you build a miniature Figure 14.1 on your own hardware.</p>
+
+</section>

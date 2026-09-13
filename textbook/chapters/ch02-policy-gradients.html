@@ -1,0 +1,589 @@
+<section class="chapter" id="ch02">
+<h1>Chapter 2 &mdash; Policy gradients</h1>
+
+<p>Chapter 1 left you with an optimization problem: find the parameters \(\theta\) of a policy \(\pi_\theta\) that maximize expected return. This chapter develops the most direct attack anyone has found. Write expected return as a scalar function \(J(\theta)\), estimate its gradient from trajectories you actually sampled, and take a step uphill.</p>
+
+<p>Everything descended from that idea shares one load-bearing assumption. REINFORCE assumes it, actor-critic assumes it, and the PPO you have already run on rl-rover assumes it. We expose that assumption at the very end of the chapter, because it is exactly the assumption that stops holding for the generative policies of Part III. If you take one thing from this chapter, take what the assumption is and why it is invisible in classical deep RL.</p>
+
+<p>This chapter goes slowly on purpose. The derivation in Section 2.2 is where most people first bounce off reinforcement learning &mdash; not because it is hard, but because it is usually presented in four lines with no commentary. We will spend several pages on those four lines.</p>
+
+<h2>2.1 The problem: the reward comes from the world</h2>
+
+<h3>2.1.1 What we want</h3>
+
+<p>The quantity to maximize is the expected return of the policy:</p>
+
+\[ J(\theta) \;=\; \mathbb{E}_{\tau \sim \pi_\theta}\!\left[\, \sum_{t=0}^{T} \gamma^{t} r_t \right]. \]
+
+<p>Read that carefully. \(\tau\) is one trajectory, meaning one complete episode \(\tau = (s_0, a_0, r_0, s_1, a_1, r_1, \dots)\). The subscript \(\tau \sim \pi_\theta\) says the trajectories are drawn by actually running the policy in the environment. Inside, \(r_t\) is the reward at environment timestep \(t\) and \(\gamma \in [0,1]\) is the discount factor from Chapter 1. \(T\) is the length of the episode &mdash; the timestep at which the task ends or the time limit cuts it off. The whole expression is a single number for any given \(\theta\), and we want the \(\theta\) that makes it large.</p>
+
+<h3>2.1.2 The obvious thing to try</h3>
+
+<p>You are a software engineer, so your instinct is to build the computation graph, call <code>.backward()</code>, and let autograd sort it out. In supervised learning that works because the loss is a differentiable function of the network's own output: you emit a logit, the loss compares it to a label, and the chain rule walks the derivative back through every layer.</p>
+
+<p>So write the analogous thing for RL. Roll out an episode, sum the rewards, negate it to make a loss, call <code>.backward()</code>. Try it in PyTorch and you get an error, or worse, a silent zero. The reason is that the rewards are Python floats that came back from <code>env.step()</code>. They crossed a boundary that has no derivative attached to it. There is no graph node connecting \(r_t\) back to \(\theta\).</p>
+
+<h3>2.1.3 Why it fails, concretely</h3>
+
+<p>This is not a software limitation you could fix with a better library. It is a statement about where the rewards physically come from. Consider three rewards you might actually collect:</p>
+
+<p>A motor controller saturates because you commanded more current than the driver can deliver, and the arm undershoots; the path from commanded torque to joint angle runs through firmware you did not write and cannot differentiate. A piece of cloth settles onto a table after you release it, and whether it landed folded or crumpled depends on thousands of contact events between fibers. And on your own SO-101 rig, the success reward is a human deciding the task looked done and pressing a button. None of these has a derivative with respect to your network weights, because none is a mathematical function of your weights at all. They are things that happened in the world.</p>
+
+<p>The usual objection is that differentiable simulators exist &mdash; so why not train in one and backpropagate straight through the physics? Two answers. First, gradients through contact are genuinely pathological, not merely inconvenient. Move a gripper finger one millimeter left and it misses the object entirely, so the gradient of the outcome with respect to finger position is zero. Move it one millimeter right and it makes contact, and the gradient becomes enormous and stiff. The true derivative flips between zero and huge across a knife-edge, which makes it close to useless as a descent direction at any step size you would actually take. Second, a perfect differentiable simulator gives you the gradient of the <em>simulator</em>, and Chapter 14 is a whole chapter on why that is not the gradient of reality.</p>
+
+<p>Here is the pivot the rest of the chapter turns on. The one thing \(\theta\) genuinely controls is not the reward. It is <em>which trajectories you are likely to sample</em>. Change the weights and you change the probability distribution over episodes; the world then does whatever it does to each episode and hands back numbers. So we will stop trying to differentiate the reward and instead differentiate the sampling distribution. That single change of target is the entire content of the next section, and it is what makes reinforcement learning possible on hardware that no autograd system will ever see inside.</p>
+
+<h2>2.2 The score-function trick, in slow motion</h2>
+
+<h3>2.2.1 The identity everything rests on</h3>
+
+<p>Start with a fact from first-year calculus. For any probability density \(p_\theta(x)\) that is positive and differentiable in \(\theta\), the chain rule applied to the logarithm gives</p>
+
+\[ \nabla_\theta \log p_\theta(x) \;=\; \frac{\nabla_\theta\, p_\theta(x)}{p_\theta(x)}. \]
+
+<p>Multiply both sides by \(p_\theta(x)\) and you have the identity we need:</p>
+
+\[ \nabla_\theta\, p_\theta(x) \;=\; p_\theta(x)\, \nabla_\theta \log p_\theta(x). \]
+
+<p>That is the whole trick. It is true by definition of the logarithm's derivative, there is nothing statistical about it, and you can verify it in one line as we just did. The quantity \(\nabla_\theta \log p_\theta(x)\) has a name that you will see constantly in papers: it is the <strong>score function</strong> (the gradient of the log-probability with respect to the parameters). Some papers call the whole method the log-derivative trick or the likelihood-ratio estimator; they mean the same thing.</p>
+
+<h3>2.2.2 Why that identity is worth anything</h3>
+
+<p>Here is why we care. On the left is the gradient of a probability, which is not something you can average, because you never observe probabilities directly &mdash; only samples. On the right is a probability <em>multiplied by</em> something, and anything of the form "\(p_\theta(x)\) times a function of \(x\)" is an expectation waiting to happen. The identity converts a derivative you cannot compute into an average you can.</p>
+
+<h3>2.2.3 The derivation, one step at a time</h3>
+
+<p>Write \(R(\tau) = \sum_t \gamma^t r_t\) for the total discounted return of trajectory \(\tau\), and \(p_\theta(\tau)\) for the probability of that trajectory when running \(\pi_\theta\). Then \(J(\theta) = \int p_\theta(\tau) R(\tau)\, d\tau\), and:</p>
+
+\[ \nabla_\theta J \;=\; \nabla_\theta \!\int\! p_\theta(\tau)\, R(\tau)\, d\tau \;=\; \int\! \nabla_\theta p_\theta(\tau)\, R(\tau)\, d\tau \;=\; \int\! p_\theta(\tau)\, \nabla_\theta \log p_\theta(\tau)\, R(\tau)\, d\tau. \]
+
+<p>Take those three equalities one at a time, because each does exactly one job. The first is just the definition of \(J\) written as an integral over trajectories. The second moves the gradient inside the integral, which is legitimate here because the space of trajectories does not itself change with \(\theta\) &mdash; the same episodes remain possible, only the probability the policy assigns to each one moves. Note also that \(R(\tau)\) is not differentiated, because the return of a <em>fixed</em> trajectory does not depend on \(\theta\) at all. The third applies the identity: replace \(\nabla_\theta p_\theta\) with \(p_\theta \nabla_\theta \log p_\theta\). Now the integrand is once again "density times function", so we can write it back as an expectation:</p>
+
+<div class="key-eq">
+\[ \nabla_\theta J(\theta) \;=\; \mathbb{E}_{\tau \sim \pi_\theta}\!\big[\, R(\tau)\, \nabla_\theta \log p_\theta(\tau) \,\big]. \]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The left side is what we want: the direction in weight space that most increases expected return. \(\theta\) is the vector of all your network's parameters. \(\tau\) is one complete episode. \(p_\theta(\tau)\) is how likely that episode was under the current policy, and \(R(\tau)\) is the total discounted reward it collected &mdash; just a number the world handed you. The score \(\nabla_\theta \log p_\theta(\tau)\) is the direction that would make <em>this exact episode</em> more likely next time. \(\mathbb{E}_{\tau \sim \pi_\theta}\) means "average over episodes you get by running the current policy". So: sample episodes, and nudge the weights toward each one in proportion to the reward it earned.
+</div>
+
+<h3>2.2.4 The moment the dynamics disappear</h3>
+
+<p>We are not finished, because \(\nabla_\theta \log p_\theta(\tau)\) still looks like it needs to know the environment. Expand the trajectory probability into its factors:</p>
+
+\[ p_\theta(\tau) \;=\; p(s_0)\, \prod_{t} \pi_\theta(a_t \mid s_t)\; p(s_{t+1} \mid s_t, a_t). \]
+
+<p>The episode starts from some initial state with probability \(p(s_0)\); at each step you pick an action with probability \(\pi_\theta(a_t \mid s_t)\); the world then moves you to a new state with probability \(p(s_{t+1} \mid s_t, a_t)\). Taking the logarithm turns that product into a sum:</p>
+
+\[ \log p_\theta(\tau) \;=\; \log p(s_0) \;+\; \sum_t \log \pi_\theta(a_t \mid s_t) \;+\; \sum_t \log p(s_{t+1} \mid s_t, a_t). \]
+
+<p>Now differentiate with respect to \(\theta\). The initial-state term contains no \(\theta\), so its gradient is zero. Every dynamics term \(\log p(s_{t+1} \mid s_t, a_t)\) also contains no \(\theta\) &mdash; the world's transition probabilities do not care about your network weights &mdash; so all of those gradients are zero too. What is left is only the policy terms:</p>
+
+\[ \nabla_\theta \log p_\theta(\tau) \;=\; \sum_t \nabla_\theta \log \pi_\theta(a_t \mid s_t). \]
+
+<p>Stop and appreciate this, because it is the "aha" of the whole subject. The transition model \(p(s_{t+1} \mid s_t, a_t)\) &mdash; the thing you do not know, cannot write down, and would need a physics engine to approximate &mdash; has vanished from the gradient entirely. It was needed to <em>generate</em> the trajectory, and the robot generated it for us by simply existing. It is not needed to compute the gradient. That property has a name: the method is <strong>model-free</strong> (it requires no model of the environment's dynamics, only the ability to interact with it). This is why policy gradients work on a physical arm at all.</p>
+
+<h3>2.2.5 The loaded die: the whole method in one object</h3>
+
+<p>If the last three subsections felt like symbol-pushing &mdash; you followed each line but could not say what the thing <em>does</em> &mdash; that is the normal experience, and it is not a failure of yours. The derivation is four lines of calculus that encode one physical idea, and the calculus does a poor job of showing you the idea. This subsection is the idea. If you keep only one thing from this chapter, keep this.</p>
+
+<p><strong>The setup.</strong> You have a three-sided die. Each face pays a fixed amount stamped on it: face A pays \$1, face B pays \$2, face C pays \$9. The die is loaded, and you control the loading &mdash; a dial that sets how probable each face is. Right now it is fair: each face comes up a third of the time, so your average payout per roll is \((1+2+9)/3 = \$4\).</p>
+
+<p>Two rules, and they are the whole of reinforcement learning in miniature. <strong>Rule one: you cannot change the payouts.</strong> They are paint on plastic. That is the environment. <strong>Rule two: you cannot read the payouts either</strong> &mdash; the only way to learn what a face pays is to roll it and get paid. You may only turn the dial.</p>
+
+<h3>2.2.6 The move, and the objection you should have</h3>
+
+<p>REINFORCE's instruction is startlingly crude. Roll the die. Whatever face comes up, turn the dial to make <em>that face</em> more likely, by an amount proportional to what it just paid. Repeat.</p>
+
+<p>Suppose you roll B and collect \$2. You now turn the dial to make B more likely. Here is the objection, and if you had it you were reading correctly: <em>B is not the good face.</em> C pays four and a half times more. You just spent your update making a mediocre outcome more likely, using information (\$2) that says nothing about whether \$2 is good or bad. How can a rule this blind ever find C?</p>
+
+<p>Three facts answer it, and they have to be taken together.</p>
+
+<p><strong>First, you are not only pushing B.</strong> The rule applies to every roll, so across many rolls every face gets pushed up &mdash; A when A comes up, C when C comes up. No face is singled out for promotion.</p>
+
+<p><strong>Second, the pushes have different strengths.</strong> A's push is worth 1, B's is worth 2, C's is worth 9. Each face pushes with a force equal to its own payout.</p>
+
+<p><strong>Third, and this is the part the equations hide: the pushes compete, because probabilities must sum to one.</strong> The dial has no absolute setting, only shares. Making B more likely necessarily makes A and C less likely. So the faces are in a tug of war over a rope of fixed length, and each pulls with a force equal to what it pays. C pulls nine times harder than A. It does not matter that no single roll knew C was best; the outcome of the tug of war is decided by the forces, and the forces are the payouts.</p>
+
+<p><strong>Now watch the bookkeeping do the rest.</strong> Roll three hundred times from the fair setting. Each face comes up about a hundred times. Face A accumulates about \(100 \times 1 = 100\) units of upward push, B about \(100 \times 2 = 200\), and C about \(100 \times 9 = 900\). The totals are in the ratio 1 : 2 : 9 &mdash; exactly the ratio of the payouts &mdash; and you never enumerated the faces, never knew their probabilities, and never read a single number off the plastic. <em>The rolling did the weighting for you.</em> That is what an expectation is, and it is why "average over samples" is allowed to stand in for "expected value" in the estimator you just derived.</p>
+
+<h3>2.2.7 Watching the average go up, in numbers</h3>
+
+<p>The tug of war is easy to assert, so let us verify it with arithmetic small enough to check by hand. Take the average effect of one round of pushes: multiply each face's weight by \(1 + 0.05 \times (\text{its payout})\), which is what "push proportional to payout" amounts to when each face has come up equally often. Starting from \(1/3\) each:</p>
+
+<pre class="code">face A:  (1/3) x (1 + 0.05 x 1) = (1/3) x 1.05 = 0.3500
+face B:  (1/3) x (1 + 0.05 x 2) = (1/3) x 1.10 = 0.3667
+face C:  (1/3) x (1 + 0.05 x 9) = (1/3) x 1.45 = 0.4833
+                                          sum = 1.2000   <-- not 1: must renormalize
+
+A: 0.3500 / 1.2 = 0.2917      B: 0.3667 / 1.2 = 0.3056      C: 0.4833 / 1.2 = 0.4028</pre>
+
+<p>Look at what happened to B. Its own roll pushed it <em>up</em> &mdash; and its share still fell, from 0.333 to 0.306, because C was pushed harder and the rope is only so long. That is the answer to the objection in one line: an update that raises a mediocre action can still lower its share. Face A, the worst, fell furthest, from 0.333 to 0.292. Face C rose from 0.333 to 0.403.</p>
+
+<p>And the payoff, which is the only thing we were ever trying to move:</p>
+
+<pre class="code">before:  (1/3)(1) + (1/3)(2) + (1/3)(9)              = $4.00
+after:   0.2917(1) + 0.3056(2) + 0.4028(9)
+       = 0.2917   + 0.6111    + 3.6250              = $4.53</pre>
+
+<p>The average payout rose by fifty-three cents, from a rule that never compared two faces, never knew which was best, and made a mediocre face more likely on the roll we watched. Figure 2.1 shows the same round as a picture. Run the update again and again and the dial walks toward C. That is REINFORCE, and there is nothing else in it.</p>
+
+<figure>
+<svg viewBox="0 0 700 300" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch02f1up" markerWidth="9" markerHeight="9" refX="4.5" refY="1.5" orient="auto">
+      <path d="M4.5,0 L9,9 L0,9 z" fill="#4a8a5c"/>
+    </marker>
+    <marker id="ch02f1arr" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto">
+      <path d="M0,0 L8,3.5 L0,7 z" fill="#666"/>
+    </marker>
+  </defs>
+
+  <text x="112" y="20" text-anchor="middle" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333">Before: fair dial</text>
+  <text x="112" y="36" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">average payout $4.00</text>
+  <line x1="34" y1="232" x2="196" y2="232" stroke="#ccc" stroke-width="1.2"/>
+  <rect x="42" y="152" width="38" height="80" rx="3" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.3"/>
+  <rect x="94" y="152" width="38" height="80" rx="3" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.3"/>
+  <rect x="146" y="152" width="38" height="80" rx="3" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.3"/>
+  <text x="61" y="248" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">A</text>
+  <text x="113" y="248" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">B</text>
+  <text x="165" y="248" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">C</text>
+  <text x="61" y="262" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b0703a">$1</text>
+  <text x="113" y="262" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b0703a">$2</text>
+  <text x="165" y="262" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b0703a">$9</text>
+  <text x="61" y="146" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">.333</text>
+  <text x="113" y="146" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">.333</text>
+  <text x="165" y="146" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">.333</text>
+
+  <text x="350" y="20" text-anchor="middle" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333">Every face pushes up, with force = its payout</text>
+  <line x1="272" y1="232" x2="434" y2="232" stroke="#ccc" stroke-width="1.2"/>
+  <rect x="280" y="152" width="38" height="80" rx="3" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.3"/>
+  <rect x="332" y="152" width="38" height="80" rx="3" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.3"/>
+  <rect x="384" y="152" width="38" height="80" rx="3" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.3"/>
+  <line x1="299" y1="146" x2="299" y2="132" stroke="#4a8a5c" stroke-width="2" marker-end="url(#ch02f1up)"/>
+  <line x1="351" y1="146" x2="351" y2="118" stroke="#4a8a5c" stroke-width="2" marker-end="url(#ch02f1up)"/>
+  <line x1="403" y1="146" x2="403" y2="62" stroke="#4a8a5c" stroke-width="2.6" marker-end="url(#ch02f1up)"/>
+  <text x="299" y="248" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">A</text>
+  <text x="351" y="248" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">B</text>
+  <text x="403" y="248" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">C</text>
+  <text x="299" y="262" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b0703a">x1</text>
+  <text x="351" y="262" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b0703a">x2</text>
+  <text x="403" y="262" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b0703a">x9</text>
+  <text x="350" y="284" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">nobody is pushed down &mdash; but the shares must still add to 1</text>
+
+  <line x1="452" y1="190" x2="486" y2="190" stroke="#666" stroke-width="1.4" marker-end="url(#ch02f1arr)"/>
+  <text x="469" y="182" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">renormalize</text>
+
+  <text x="600" y="20" text-anchor="middle" font-family="Noto Sans" font-size="12" font-weight="bold" fill="#333">After: shares shifted</text>
+  <text x="600" y="36" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#2e6b40">average payout $4.53</text>
+  <line x1="510" y1="232" x2="672" y2="232" stroke="#ccc" stroke-width="1.2"/>
+  <rect x="518" y="162" width="38" height="70" rx="3" fill="#faf0f0" stroke="#b04a4a" stroke-width="1.3"/>
+  <rect x="570" y="159" width="38" height="73" rx="3" fill="#faf0f0" stroke="#b04a4a" stroke-width="1.3"/>
+  <rect x="622" y="135" width="38" height="97" rx="3" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.6"/>
+  <text x="537" y="248" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">A</text>
+  <text x="589" y="248" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">B</text>
+  <text x="641" y="248" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">C</text>
+  <text x="537" y="156" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">.292</text>
+  <text x="589" y="153" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">.306</text>
+  <text x="641" y="129" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#2e6b40">.403</text>
+  <text x="600" y="284" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">B was pushed up, and its share still fell</text>
+</svg>
+<figcaption>Figure 2.1 &mdash; One round of REINFORCE on a three-sided die with hidden payouts. The thing to notice is the middle panel: every face is pushed <em>up</em>, none is pushed down, and yet the right panel shows A and B losing share. That is because probability is a fixed budget &mdash; the arrows are competing for the same rope, and C pulls nine times harder than A. No step of this compares two faces or knows which is best; the payouts settle it by arithmetic. The average rises from \$4.00 to \$4.53 as a consequence, not as a goal any single roll pursued.</figcaption>
+</figure>
+
+<h3>2.2.8 Reading the analogy back into the equation</h3>
+
+<p>Every piece of the estimator you derived is somewhere in that die, so line them up explicitly.</p>
+
+<table class="tbl">
+<thead><tr><th>In the die</th><th>In the equation</th></tr></thead>
+<tbody>
+<tr><td>The dial setting</td><td>The parameters \(\theta\)</td></tr>
+<tr><td>Rolling once</td><td>Sampling a trajectory \(\tau \sim \pi_\theta\)</td></tr>
+<tr><td>The face that came up</td><td>The actions you actually took</td></tr>
+<tr><td>"Turn the dial toward this face"</td><td>The score \(\nabla_\theta \log \pi_\theta(a \mid s)\)</td></tr>
+<tr><td>The payout stamped on it</td><td>The return \(R(\tau)\), which you cannot differentiate</td></tr>
+<tr><td>Push strength = payout</td><td>The product \(R(\tau)\, \nabla_\theta \log \pi_\theta\)</td></tr>
+<tr><td>Faces come up as often as they are likely</td><td>\(\mathbb{E}_{\tau \sim \pi_\theta}[\,\cdot\,]\), estimated by averaging</td></tr>
+<tr><td>Shares must add to one</td><td>\(\pi_\theta\) is a normalized distribution</td></tr>
+</tbody>
+</table>
+
+<p>The last row is worth dwelling on, because it is the one with no visible symbol. Nothing in the estimator explicitly says "push the bad actions down" &mdash; and with all-positive returns, nothing does. The downward motion is a side effect of normalization, which for a softmax or a Gaussian is baked into the policy's own definition. Improvement lives entirely in the <em>differences</em> between pushes.</p>
+
+<p>That should strike you as a fragile way to run an algorithm, and it is. Take the same die and add a million dollars to every face: now they pay \$1,000,001, \$1,000,002 and \$1,000,009. Nothing about the <em>decision</em> has changed &mdash; C is still the face you want, by the same margin &mdash; but the pushes are now nearly identical in strength, the shares barely move, and you would need an astronomical number of rolls to see the difference through the sampling noise. A constant that carries no information about which face is better has wrecked the method.</p>
+
+<p>The fix is to stop working with raw payouts and start working with payouts <em>relative to what you normally get</em>. Subtract the average from each. On the original die the average is \$4, giving pushes of \(1-4 = -3\), \(2-4 = -2\) and \(9-4 = +5\). On the million-dollar die the average is \$1,000,004, giving \(-3\), \(-2\) and \(+5\) &mdash; <em>the same three numbers</em>. The centered version cannot tell the two dice apart, which is exactly right, because as decision problems they are identical. Notice also what centering bought: A and B now carry <em>negative</em> pushes, so bad faces are driven down explicitly instead of merely being out-pulled. That subtraction is the <strong>baseline</strong>, it is the entire subject of Section 2.4, and you now know why it exists before you meet it.</p>
+
+<h3>2.2.9 Where the die breaks down</h3>
+
+<p>An analogy earns its keep by having a stated limit, so here are three.</p>
+
+<p><strong>Three faces, or infinitely many.</strong> A die has faces you can enumerate and will see within a few rolls. A policy over continuous joint torques has infinitely many "faces", and you only ever push the ones you sampled. The estimator learns literally nothing about actions never tried &mdash; which is why exploration matters so much, and why a sparse reward that fires only on a motion you have never stumbled into gives you exactly zero gradient, forever, no matter how long you run.</p>
+
+<p><strong>The die has no situations.</strong> One dial, rolled repeatedly under identical conditions. A policy must choose differently depending on what it sees, so "the dial" is really a function from observations to distributions, and the network's job is to share what it learns across similar situations. The die captures the credit-assignment mechanism and skips generalization entirely.</p>
+
+<p><strong>The payout is immediate.</strong> You roll, you get paid. In an episode you act ninety times and get one number at the end, and the estimator's honest position is that all ninety actions share the credit equally. Section 2.3 recovers what it can &mdash; an action cannot be responsible for rewards that arrived before it &mdash; but the fundamental difficulty stays, and it is what Chapter 3's advantage estimation and Chapter 11's reward shaping are both built to attack.</p>
+
+<h2>2.3 REINFORCE and reward-to-go</h2>
+
+<p>Putting the last two results together gives \(\nabla_\theta J = \mathbb{E}\big[ R(\tau) \sum_t \nabla_\theta \log \pi_\theta(a_t \mid s_t) \big]\). This is correct, but it contains an obvious piece of nonsense: it weights the action taken at timestep 50 by the <em>whole</em> episode return, including the rewards collected at timesteps 0 through 49. An action cannot cause a reward that was already banked before it was taken.</p>
+
+<p>Removing those terms is not an approximation; it is exact. The reason is close to the baseline argument of the next section: multiplying a score function by something that does not depend on the action gives an expectation of zero. The argument needs one extra move over the baseline proof, though, because a past reward like \(r_3\) is not a function of the current state \(s_{10}\) &mdash; it depends on states and actions from earlier in the episode. The extra move is to condition on everything that happened up to time \(t\). Given that history, the past rewards are fixed numbers, and the average of the score over the action you are about to take is zero, so the product of the two averages to zero as well. Then average over histories and it is still zero. So we may drop the past rewards for free. What remains attached to each action is \(\gamma^t G_t\), where \(G_t = \sum_k \gamma^k r_{t+k}\) is the <strong>reward-to-go</strong> (the discounted return counted from timestep \(t\) onward, ignoring everything earlier).</p>
+
+<p>Implementations then make one further simplification that is <em>not</em> free: they drop the leading \(\gamma^t\). Start with why anyone would want to. The factor \(\gamma^t\) shrinks fast. At \(\gamma = 0.99\), by timestep 300 it is down to about \(0.05\), and by timestep 1000 it is about \(0.00004\). Keeping it would therefore mute the gradient coming from everything late in a long episode, almost to silence. A robot that learns nothing from how its episodes actually <em>end</em> is not much use to you, so implementations drop the factor on purpose. You will not find \(\gamma^t\) in any codebase you read.</p>
+
+<p>There is a price, and it is worth stating exactly. For \(\gamma \lt 1\) that factor genuinely belongs in the true gradient, so removing it changes the expectation and the resulting estimator is mildly biased. Concretely, what you get instead is an estimator that counts each state by how often you actually visit it, rather than by how often you visit it discounted by how late in the episode you get there. That difference has a name attached to it &mdash; the factor \(d^\pi\), which we will meet in Section 2.4 when we state the policy gradient theorem. File the whole thing as a deliberate, well-understood approximation rather than an oversight. The estimator everyone actually uses is therefore:</p>
+
+<div class="key-eq">
+\[ \nabla_\theta J(\theta) \;\approx\; \mathbb{E}_{\tau \sim \pi_\theta}\!\Big[ \sum_t \nabla_\theta \log \pi_\theta(a_t \mid s_t)\; G_t \Big] \]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+For every timestep \(t\) in every episode you collected: look at the action \(a_t\) you took in state \(s_t\), and ask what small change to the weights \(\theta\) would have made that action more likely. That direction is \(\nabla_\theta \log \pi_\theta(a_t \mid s_t)\). Scale it by \(G_t\), the total discounted reward that arrived <em>after</em> that moment. Add all of those scaled directions up, average over episodes, and step that way. In one sentence: make each action more likely in proportion to how well things went afterwards.
+</div>
+
+<p>Averaging that over \(N\) sampled trajectories is the <strong>REINFORCE</strong> estimator (Williams, 1992). Figure 2.2 is the picture worth keeping in your head. Notice what the estimator does <em>not</em> require: a differentiable reward, a known transition model, or a dense signal. It requires exactly two things &mdash; the ability to sample from \(\pi_\theta\), and the ability to compute \(\nabla_\theta \log \pi_\theta(a \mid s)\) for an action you sampled. Hold onto that second requirement. Section 2.6 is entirely about it.</p>
+
+<p>The trick generalizes far beyond RL; the same estimator shows up in variational inference and anywhere else you must differentiate through a sampling step. But its generality is also its weakness. The reward enters only as a scalar multiplier on the whole score vector, so the estimator learns nothing from a trajectory's internal <em>structure</em>. It cannot tell you which of the two hundred actions in a failed fold attempt was the fatal one; it pushes all two hundred down a little and waits for averaging to sort out which were to blame. That is the <strong>credit assignment</strong> problem, and leaving it entirely to averaging is where the variance disaster of the next section comes from.</p>
+
+<figure>
+<svg viewBox="0 0 680 262" width="680" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans">
+  <defs>
+    <marker id="ch02f1up" markerWidth="9" markerHeight="9" refX="4.5" refY="4.5" orient="auto">
+      <path d="M0,1 L8,4.5 L0,8 z" fill="#4a8a5c"/>
+    </marker>
+    <marker id="ch02f1dn" markerWidth="9" markerHeight="9" refX="4.5" refY="4.5" orient="auto">
+      <path d="M0,1 L8,4.5 L0,8 z" fill="#b04a4a"/>
+    </marker>
+  </defs>
+  <circle cx="70" cy="130" r="11" fill="#eaf1f8" stroke="#4878a8" stroke-width="2"/>
+  <text x="70" y="160" font-size="12" fill="#333" text-anchor="middle">start</text>
+  <rect x="558" y="42" width="104" height="76" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="2"/>
+  <text x="610" y="85" font-size="12" fill="#333" text-anchor="middle">success</text>
+  <path d="M 80 122 C 190 55, 340 38, 556 66" fill="none" stroke="#4a8a5c" stroke-width="2.5"/>
+  <circle cx="556" cy="66" r="4" fill="#4a8a5c"/>
+  <text x="252" y="38" font-size="12" fill="#333" text-anchor="middle">G = 9.2</text>
+  <line x1="310" y1="82" x2="310" y2="52" stroke="#4a8a5c" stroke-width="2" marker-end="url(#ch02f1up)"/>
+  <path d="M 80 132 C 200 122, 390 132, 556 98" fill="none" stroke="#4a8a5c" stroke-width="1.8" stroke-dasharray="7 4"/>
+  <circle cx="556" cy="98" r="4" fill="#4a8a5c"/>
+  <text x="278" y="114" font-size="12" fill="#333" text-anchor="middle">G = 7.5</text>
+  <line x1="340" y1="158" x2="340" y2="136" stroke="#4a8a5c" stroke-width="2" marker-end="url(#ch02f1up)"/>
+  <path d="M 80 138 C 200 196, 360 236, 528 220" fill="none" stroke="#b04a4a" stroke-width="2"/>
+  <circle cx="528" cy="220" r="4" fill="#b04a4a"/>
+  <text x="258" y="200" font-size="12" fill="#333" text-anchor="middle">G = 0.4</text>
+  <line x1="330" y1="196" x2="330" y2="222" stroke="#b04a4a" stroke-width="2" marker-end="url(#ch02f1dn)"/>
+  <text x="425" y="34" font-size="11" fill="#666">log-probability pushed up</text>
+  <text x="400" y="248" font-size="11" fill="#666">pushed down (after baseline)</text>
+</svg>
+<figcaption>Figure 2.2 &mdash; The policy gradient in one picture. Three episodes sampled from the same start state; each is scored by the return \(G\) it happened to collect, and probability mass shifts toward the high scorers. Notice that nothing here requires knowing <em>why</em> the red trajectory failed &mdash; the method only reweights whole behaviors it has already seen, which is both its generality and its inefficiency. With a baseline (Section 2.4), below-average trajectories are actively pushed down rather than merely pushed up less.</figcaption>
+</figure>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+REINFORCE does not need a differentiable reward &mdash; a very common misreading. You never backpropagate through \(r_t\) or through the simulator; the gradient flows only through \(\log \pi_\theta\), and the return is a constant multiplier. Second misreading: with all-positive returns, every sampled action is pushed <em>up</em>, and improvement comes only from actions being pushed up by different amounts while the probabilities renormalize. That is correct in expectation but has dreadful variance. Third: in code, always detach the advantage or return before multiplying, or autograd will happily backpropagate into your critic through the actor loss.
+</div>
+
+<h2>2.4 Variance, and why the naive version is unusable</h2>
+
+<p>Set aside the small \(\gamma^t\) bias we just discussed, which is not what this section is about; the exact reward-to-go estimator, before that simplification, is unbiased. Run it on infinitely many episodes and you get the true gradient. It is also so noisy that on a real robot it is worthless. That combination &mdash; correct on average, useless in practice &mdash; is worth sitting with, because the entire engineering history of policy gradients is about variance reduction, not correctness.</p>
+
+<h3>2.4.1 The 100/101 problem, worked out</h3>
+
+<p>To keep the arithmetic small, work at the level of whole trajectories rather than individual timesteps. Write \(g\) for the summed score of one episode, \(g = \sum_t \nabla_\theta \log \pi_\theta(a_t \mid s_t)\), and weight it by the return of that whole episode. That is the Section 2.2 form of the estimator, not the reward-to-go form we just built. Nothing in the variance argument depends on which of the two you use; the trajectory-level version simply has fewer numbers to carry.</p>
+
+<p>Suppose your rover samples two episodes. Episode A returns 100; episode B returns 101. Say the score vectors happen to be, in some two-parameter toy policy,</p>
+
+\[ g_A = \nabla_\theta \log p_\theta(\tau_A) = (1.0,\, -0.4), \qquad g_B = \nabla_\theta \log p_\theta(\tau_B) = (-0.8,\, 1.2). \]
+
+<p>REINFORCE averages the score vectors weighted by the returns:</p>
+
+<pre class="code">100 * g_A = (100 *  1.0, 100 * -0.4) = ( 100.0, -40.0)
+101 * g_B = (101 * -0.8, 101 *  1.2) = ( -80.8, 121.2)
+sum                                  = (  19.2,  81.2)
+average (divide by 2)                = (   9.6,  40.6)   &lt;- the update</pre>
+
+<p>Now split that same update into two pieces by writing the weights as \(100 = 100.5 - 0.5\) and \(101 = 100.5 + 0.5\). That \(100.5\) is the average of the two returns you actually sampled. Strictly, a baseline computed from the same batch it is applied to is very mildly biased, because it peeks at the returns you happened to draw; everyone does it anyway, and the bias shrinks away as the batch grows.</p>
+
+<pre class="code">common part:  100.5 * (g_A + g_B)/2 = 100.5 * ( 0.1,  0.4) = (10.05, 40.20)
+signal part:    0.5 * (g_B - g_A)/2 =   0.25 * (-1.8,  1.6) = (-0.45,  0.40)
+check: (10.05, 40.20) + (-0.45, 0.40) = (9.60, 40.60)      &lt;- matches above</pre>
+
+<p>Look at the two pieces. The common part has length \(\sqrt{10.05^2 + 40.20^2} = \sqrt{101.0 + 1616.0} \approx 41.4\). The signal part has length \(\sqrt{0.45^2 + 0.40^2} = \sqrt{0.2025 + 0.16} \approx 0.60\). The common part is about 69 times larger than the signal part, and it points in a completely different direction.</p>
+
+<p>Here is the sting. The common part contains no information at all. It is \(100.5\) times an average of score vectors, and by the identity we prove below, the expected value of a score vector is exactly zero. So the piece that dominates your update by a factor of 69 has mean zero: it is pure noise. The only piece that says "episode B was better than episode A" is the little \((-0.45, 0.40)\) vector, half a percent of the total weight.</p>
+
+<h3>2.4.2 What that costs on real hardware</h3>
+
+<p>Noise averages out, but slowly. The standard error of a sample mean shrinks as \(1/\sqrt{N}\), so shrinking the per-sample noise by a factor of \(k\) buys you the same accuracy with \(k^2\) times fewer samples. Now run that backwards. Treat the 69 above as roughly the factor by which a baseline cuts the noise from batch to batch. It is an estimate, not an identity: 69 is the ratio of two vector lengths in one particular two-episode sample, and the honest version of the claim is that the batch-to-batch spread falls by something of that order. Even taken loosely, \(69^2 \approx 4{,}800\), so without the fix you need something like four or five thousand times as many episodes to see through the noise.</p>
+
+<p>On an Isaac Sim farm with four thousand parallel environments, that is annoying. On your single SO-101 arm it is fatal, and the arithmetic is worth doing out loud. Suppose 100 episodes with a baseline would get you a usable gradient. At perhaps thirty seconds per episode including the reset, that is 3,000 seconds, under an hour. Without the baseline you need \(100 \times 4{,}800 = 480{,}000\) episodes. At the same thirty seconds each that is 14.4 million seconds, or about 167 days: five and a half months of continuous running, resets included, with no failures. Manipulation makes it worse still: with the sparse binary success rewards typical of real tasks (Chapter 11), most episodes return exactly zero and contribute nothing but noise to the average. This is why nobody runs plain REINFORCE on hardware. Figure 2.3 shows the same phenomenon as a picture.</p>
+
+<figure>
+<svg viewBox="0 0 680 300" width="680" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans">
+  <defs>
+    <marker id="ch02f2tick" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">
+      <path d="M0,1 L7,4 L0,7 z" fill="#666"/>
+    </marker>
+  </defs>
+  <text x="20" y="20" font-size="11" fill="#666">One component of the gradient estimate, over many repeated two-episode batches</text>
+  <text x="381" y="36" font-size="10" fill="#666">true gradient (identical in both rows)</text>
+
+  <text x="20" y="54" font-size="12" fill="#333">without a baseline: weights 100 and 101</text>
+  <text x="660" y="54" font-size="11" fill="#b0703a" text-anchor="end">spread (1 s.d.) about 27</text>
+  <rect x="240" y="68" width="270" height="40" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+  <line x1="375" y1="42" x2="375" y2="124" stroke="#666" stroke-width="1.4" stroke-dasharray="5 4"/>
+  <circle cx="135" cy="81" r="4" fill="#b0703a"/>
+  <circle cx="205" cy="95" r="4" fill="#b0703a"/>
+  <circle cx="270" cy="81" r="4" fill="#b0703a"/>
+  <circle cx="320" cy="95" r="4" fill="#b0703a"/>
+  <circle cx="370" cy="81" r="4" fill="#b0703a"/>
+  <circle cx="405" cy="95" r="4" fill="#b0703a"/>
+  <circle cx="450" cy="81" r="4" fill="#b0703a"/>
+  <circle cx="490" cy="95" r="4" fill="#b0703a"/>
+  <circle cx="530" cy="81" r="4" fill="#b0703a"/>
+  <circle cx="575" cy="95" r="4" fill="#b0703a"/>
+
+  <line x1="110" y1="124" x2="610" y2="124" stroke="#666" stroke-width="1.4" marker-end="url(#ch02f2tick)"/>
+  <line x1="160" y1="120" x2="160" y2="128" stroke="#666" stroke-width="1"/>
+  <line x1="260" y1="120" x2="260" y2="128" stroke="#666" stroke-width="1"/>
+  <line x1="360" y1="120" x2="360" y2="128" stroke="#666" stroke-width="1"/>
+  <line x1="460" y1="120" x2="460" y2="128" stroke="#666" stroke-width="1"/>
+  <line x1="560" y1="120" x2="560" y2="128" stroke="#666" stroke-width="1"/>
+  <text x="160" y="142" font-size="10" fill="#666" text-anchor="middle">-40</text>
+  <text x="260" y="142" font-size="10" fill="#666" text-anchor="middle">-20</text>
+  <text x="360" y="142" font-size="10" fill="#666" text-anchor="middle">0</text>
+  <text x="460" y="142" font-size="10" fill="#666" text-anchor="middle">20</text>
+  <text x="560" y="142" font-size="10" fill="#666" text-anchor="middle">40</text>
+
+  <rect x="371" y="117" width="8" height="14" fill="#b04a4a" opacity="0.85"/>
+  <line x1="379" y1="130" x2="470" y2="158" stroke="#b04a4a" stroke-width="1"/>
+  <text x="475" y="162" font-size="10" fill="#b04a4a">the entire bottom row fits in here</text>
+
+  <text x="20" y="186" font-size="12" fill="#333">with baseline b = 100.5: weights -0.5 and +0.5</text>
+  <text x="660" y="186" font-size="11" fill="#4a8a5c" text-anchor="end">spread (1 s.d.) about 0.4</text>
+  <text x="20" y="202" font-size="10" fill="#666">horizontal axis magnified 10x below (same units, stretched)</text>
+  <rect x="355" y="214" width="40" height="40" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+  <line x1="375" y1="210" x2="375" y2="266" stroke="#666" stroke-width="1.4" stroke-dasharray="5 4"/>
+  <circle cx="340" cy="227" r="4" fill="#4a8a5c"/>
+  <circle cx="350" cy="241" r="4" fill="#4a8a5c"/>
+  <circle cx="360" cy="227" r="4" fill="#4a8a5c"/>
+  <circle cx="365" cy="241" r="4" fill="#4a8a5c"/>
+  <circle cx="375" cy="227" r="4" fill="#4a8a5c"/>
+  <circle cx="380" cy="241" r="4" fill="#4a8a5c"/>
+  <circle cx="385" cy="227" r="4" fill="#4a8a5c"/>
+  <circle cx="390" cy="241" r="4" fill="#4a8a5c"/>
+  <circle cx="400" cy="227" r="4" fill="#4a8a5c"/>
+  <circle cx="405" cy="241" r="4" fill="#4a8a5c"/>
+
+  <line x1="290" y1="272" x2="470" y2="272" stroke="#666" stroke-width="1.4" marker-end="url(#ch02f2tick)"/>
+  <line x1="325" y1="268" x2="325" y2="276" stroke="#666" stroke-width="1"/>
+  <line x1="350" y1="268" x2="350" y2="276" stroke="#666" stroke-width="1"/>
+  <line x1="375" y1="268" x2="375" y2="276" stroke="#666" stroke-width="1"/>
+  <line x1="400" y1="268" x2="400" y2="276" stroke="#666" stroke-width="1"/>
+  <line x1="425" y1="268" x2="425" y2="276" stroke="#666" stroke-width="1"/>
+  <text x="325" y="290" font-size="10" fill="#666" text-anchor="middle">2</text>
+  <text x="350" y="290" font-size="10" fill="#666" text-anchor="middle">2.5</text>
+  <text x="375" y="290" font-size="10" fill="#666" text-anchor="middle">3</text>
+  <text x="400" y="290" font-size="10" fill="#666" text-anchor="middle">3.5</text>
+  <text x="425" y="290" font-size="10" fill="#666" text-anchor="middle">4</text>
+</svg>
+<figcaption>Figure 2.3 &mdash; What a baseline actually does. Each dot is one gradient estimate from a fresh two-episode batch, and the dashed line is the true gradient, which is <em>identical</em> in both rows because subtracting an action-independent baseline does not change the expectation. What changes is the spread: it shrinks by a factor of about seventy, which by the \(1/\sqrt{N}\) rule means roughly five thousand times fewer episodes to reach the same accuracy. Notice that the bottom row had to be drawn at ten times the horizontal magnification of the top row to be visible at all &mdash; at the top row's scale, all ten of its dots would fall inside that small red segment on the axis. The lesson to carry forward: variance reduction, not bias correction, is what makes these methods run.</figcaption>
+</figure>
+
+<h3>2.4.3 The fix: subtract a baseline</h3>
+
+<p>The fix is to subtract a number from \(G_t\) before using it as a weight. Call it a <strong>baseline</strong>, written \(b(s_t)\): any quantity that may depend on the state but must <em>not</em> depend on the action. With \(b = 100.5\) in the example above, the weights become \(-0.5\) and \(+0.5\), and the update becomes exactly the small signal vector \((-0.45, 0.40)\). The common-mode noise is gone. Each pair of samples now expresses a <em>preference</em> rather than a shared enthusiasm.</p>
+
+<p>An analogy from grading. Telling a student "you scored 85" mixes two things: how hard the exam was, and how well the student did. Telling them "you scored 3 points above the class average" strips out the difficulty and keeps only the part that is about them. The class average is the baseline. Where this breaks down: the curve must be computed <em>without</em> looking at which answer this particular student gave. If you let the baseline depend on the action &mdash; say, by curving against only the students who gave the same answer &mdash; you destroy the comparison you were trying to make and the gradient becomes biased. That is the single condition the whole method rests on.</p>
+
+<h3>2.4.4 Why subtracting it is free</h3>
+
+<p>The remarkable fact is that <em>any</em> action-independent baseline leaves the gradient exactly unbiased. The proof is five lines and every one of them is elementary. For a fixed state \(s\), with discrete actions:</p>
+
+\[
+\begin{aligned}
+\mathbb{E}_{a \sim \pi_\theta}\!\big[\, b(s)\, \nabla_\theta \log \pi_\theta(a \mid s) \big]
+&= \sum_a \pi_\theta(a \mid s)\; b(s)\; \nabla_\theta \log \pi_\theta(a \mid s) \\
+&= b(s) \sum_a \pi_\theta(a \mid s)\, \frac{\nabla_\theta \pi_\theta(a \mid s)}{\pi_\theta(a \mid s)} \\
+&= b(s) \sum_a \nabla_\theta \pi_\theta(a \mid s) \\
+&= b(s)\, \nabla_\theta \sum_a \pi_\theta(a \mid s) \;=\; b(s)\, \nabla_\theta 1 \;=\; 0.
+\end{aligned}
+\]
+
+<p>Line by line: the first line just writes the expectation as a sum over actions weighted by their probabilities. The second pulls \(b(s)\) out front, because it does not depend on \(a\), and expands the score using our identity. The third cancels \(\pi_\theta(a \mid s)\) top and bottom. The fourth swaps the finite sum and the gradient, and then uses the fact that probabilities sum to one &mdash; and the gradient of the constant 1 is zero. Replace sums with integrals for continuous actions and nothing changes. So subtracting \(b\) alters the variance and leaves the mean untouched. In statistics this is called a <strong>control variate</strong>.</p>
+
+<p>The most useful baseline is the state value itself, \(b(s_t) = V^\pi(s_t)\), which turns the weight into \(G_t - V(s_t)\). That is a one-sample estimate of the <strong>advantage</strong> \(A^\pi(s,a) = Q^\pi(s,a) - V^\pi(s)\): how much better this action turned out than what the policy would have gotten on average from that state. Better-than-average actions are pushed up, worse-than-average actions are pushed down, and it no longer matters whether the raw returns are all positive.</p>
+
+<p>The <strong>policy gradient theorem</strong> (Sutton et al., 1999) states the general form, and it is the license for everything that follows in this book:</p>
+
+<div class="key-eq">
+\[ \nabla_\theta J(\theta) \;\propto\; \mathbb{E}_{s \sim d^{\pi},\, a \sim \pi_\theta}\!\big[ \nabla_\theta \log \pi_\theta(a \mid s)\; Q^{\pi}(s,a) \big] \]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The symbol \(\propto\) means "equal up to a positive constant" &mdash; the direction is right, the scale is absorbed into your learning rate. \(d^\pi\) is the discounted state-visitation distribution: how often the current policy actually finds itself in each state, so \(s \sim d^\pi\) means "states drawn from your own rollouts, not from anywhere you like". \(a \sim \pi_\theta\) means the action was sampled by the current policy. \(Q^\pi(s,a)\) is the expected return from taking action \(a\) in state \(s\) and then following \(\pi\). The whole statement: the true gradient is an average, over states you visit and actions you take, of "make this action more likely" scaled by how good the action is.
+</div>
+
+<p>By the baseline argument just proved, \(Q^\pi\) may be replaced by \(A^\pi = Q^\pi - V^\pi\) without changing anything. The theorem's real message is that the exact gradient depends only on value quantities you can <em>learn to estimate</em>. That is the door into actor-critic. One caveat to plant now for Chapter 11: when the value estimate is imperfect, subtracting all of it can inject its errors into your gradient, and a damped baseline \(\alpha V\) with \(\alpha \lt 1\) is sometimes the better control variate.</p>
+
+<h3>2.4.5 A second worked example: one REINFORCE update by hand</h3>
+
+<p>Take the smallest interesting problem. One state, two actions, a softmax policy with logits \(\theta = (\theta_1, \theta_2) = (0, 0)\), so \(\pi_\theta(a^1) = \pi_\theta(a^2) = 0.5\). Action \(a^1\) pays \(r = 1\); action \(a^2\) pays \(r = 0\). Episodes are one step long, so \(G_0 = r\).</p>
+
+<p>For a softmax the score has a clean closed form. It is usually quoted rather than derived, but the derivation is one line of calculus and you should see it. The log-probability of action \(a^i\) is \(\log \pi_\theta(a^i) = \theta_i - \log \sum_j e^{\theta_j}\). Differentiate that with respect to \(\theta_j\). The first term contributes \(1\) when \(j = i\) and \(0\) otherwise. The second contributes \(-e^{\theta_j} / \sum_k e^{\theta_k}\), which is exactly \(-\pi_\theta(a^j)\). Put the two together:</p>
+
+\[ \nabla_{\theta_j} \log \pi_\theta(a^i) \;=\; \mathbf{1}[i = j] \;-\; \pi_\theta(a^j), \]
+
+<p>where \(\mathbf{1}[\cdot]\) is the indicator: 1 when the statement in brackets is true, 0 when it is false. At \(\theta = (0,0)\) both probabilities are \(0.5\), so the two score vectors are the ones computed below.</p>
+
+<p>Use learning rate 1 throughout. <em>Case 1, no baseline, you sample \(a^1\).</em> The weight is \(G_0 = 1\):</p>
+
+<pre class="code">grad log pi(a1) = (1 - 0.5, 0 - 0.5) = ( 0.5, -0.5)
+grad log pi(a2) = (0 - 0.5, 1 - 0.5) = (-0.5,  0.5)
+
+update = 1 * 1 * ( 0.5, -0.5) = (0.5, -0.5)
+theta  = (0, 0) + (0.5, -0.5) = (0.5, -0.5)
+pi(a1) = e^0.5 / (e^0.5 + e^-0.5) = 1.6487 / (1.6487 + 0.6065)
+       = 1.6487 / 2.2552 = 0.731</pre>
+
+<p>One lucky sample moved the policy from 50% to 73%. <em>Case 2, no baseline, you sample \(a^2\).</em> The weight is \(G_0 = 0\), so the update is the zero vector and nothing happens. The bad action taught you nothing.</p>
+
+<p>Now add the baseline \(b = 0.5\), the policy's current expected reward. <em>Case 3</em> samples \(a^1\), weight \(1 - 0.5 = +0.5\); <em>case 4</em> samples \(a^2\), weight \(0 - 0.5 = -0.5\), with the score pointing the other way:</p>
+
+<pre class="code">case 3: update = 1 * ( 0.5) * ( 0.5, -0.5) = (0.25, -0.25)
+case 4: update = 1 * (-0.5) * (-0.5,  0.5) = (0.25, -0.25)
+
+theta  = (0.25, -0.25)   # either way
+pi(a1) = 1 / (1 + e^-0.5) = 1 / 1.6065 = 0.622</pre>
+
+<p>Stop and compare cases 3 and 4. They give the <em>same update</em>. Whichever action you happened to sample, the baseline version moves the policy to \(\pi(a^1) = 0.622\). Now check the means. Without a baseline the update is \((0.5,-0.5)\) half the time and \((0,0)\) half the time, averaging \((0.25,-0.25)\). With a baseline it is \((0.25,-0.25)\) every time. Identical expectation, and the variance has gone from nonzero to exactly zero. That is the mechanism of Figure 2.3, computed by hand instead of drawn. Do not read across the two too literally: this toy is small enough that the right baseline removes <em>all</em> the variance, which is the best case, whereas the figure shows the more typical outcome of a large reduction rather than a total one. And note what happened in case 4: the baseline extracted a useful update from a <em>failure</em>, which the naive estimator threw away.</p>
+
+<div class="box jargon"><div class="box-title">Words you will hear</div>
+<strong>Score function</strong> &mdash; \(\nabla_\theta \log \pi_\theta(a \mid s)\); also "log-derivative trick", "likelihood-ratio estimator". <strong>Vanilla policy gradient (VPG)</strong> &mdash; REINFORCE plus a learned value baseline; the thing PPO improves on. <strong>Control variate</strong> &mdash; the statistics name for a baseline: a zero-mean term subtracted to cut variance. <strong>Unbiased</strong> &mdash; correct on average over infinite samples, which says nothing about how noisy any one sample is. <strong>Credit assignment</strong> &mdash; deciding which of many actions caused an outcome. <strong>On-policy</strong> &mdash; the update is only valid for data generated by the current policy; <strong>off-policy</strong> methods reuse older data (Chapter 4).
+</div>
+
+<h2>2.5 Actor-critic in one page</h2>
+
+<p>The baseline \(V^\pi(s)\) is not something you are handed. An <strong>actor-critic</strong> method makes it learnable, by training a second network to predict it. The <strong>critic</strong> \(V_\phi(s)\) is that network &mdash; often just an extra output head on the policy's trunk &mdash; and it has its own parameter vector \(\phi\), kept deliberately separate from the policy's \(\theta\). Hold onto that separation; the pitfall box above and the <code>.detach()</code> in the code below are both about nothing else. The critic is trained by ordinary regression. You can fit it to the observed returns \(G_t\), or you can <strong>bootstrap</strong> it &mdash; that is, train it toward its own prediction one step ahead, \(r_t + \gamma V_\phi(s_{t+1})\), instead of waiting for the episode to finish. The <strong>actor</strong> is \(\pi_\theta\) itself, updated by the policy gradient with an advantage estimate \(\hat{A}_t\) in place of the raw return. Figure 2.4 shows how the pieces connect.</p>
+
+<p>The two obvious advantage estimators bracket a spectrum. The <strong>Monte Carlo</strong> estimate &mdash; Monte Carlo meaning simply "use the actual observed return, no shortcuts" &mdash; is \(\hat{A}_t = G_t - V(s_t)\). It uses the real return, so it is unbiased, but it carries all the noise of the actual episode. At the other end is the one-step <strong>TD</strong> residual, \(\hat{A}_t = \delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)\). TD stands for <em>temporal difference</em>: the gap between what the critic predicted for this state and what one real step plus the critic's prediction for the next state say it should have been. That estimator replaces most of the episode with the critic's guess, so it is far quieter, but it is biased by however wrong the critic currently is. GAE, in Chapter 3, interpolates smoothly between the two with a parameter \(\lambda\), and that is the estimator you will actually use.</p>
+
+<p>Two habits from practice are worth naming. Advantages are almost always normalized per batch to zero mean and unit standard deviation; technically that is a batch-computed baseline plus a rescaling &mdash; so, like any batch-computed baseline, mildly biased &mdash; and it exists to keep the effective step size stable across batches with different reward scales. And an <strong>entropy bonus</strong> &mdash; a small term in the actor loss rewarding the policy for staying stochastic &mdash; stops the policy collapsing to one deterministic action before it has explored. In Stable-Baselines3 that is <code>ent_coef</code>. One full iteration:</p>
+
+<pre class="code"># one actor-critic iteration (on-policy)
+batch   = collect_rollouts(pi_theta, n_steps)        # fresh data, current policy
+returns = discounted_returns(batch.rewards, gamma)   # G_t
+adv     = returns - V_phi(batch.states)              # or TD / GAE (Chapter 3)
+adv     = (adv - adv.mean()) / (adv.std() + 1e-8)    # per-batch normalization
+logp    = log_prob(pi_theta, batch.states, batch.actions)
+actor_loss  = -(logp * adv.detach()).mean()          # detach: no grad into critic
+critic_loss = ((V_phi(batch.states) - returns)**2).mean()
+(actor_loss + 0.5 * critic_loss).backward(); opt.step()</pre>
+
+<figure>
+<svg viewBox="0 0 680 306" width="680" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans">
+  <defs>
+    <marker id="ch02f3arr" markerWidth="9" markerHeight="9" refX="4.5" refY="4.5" orient="auto">
+      <path d="M0,1 L8,4.5 L0,8 z" fill="#666"/>
+    </marker>
+    <marker id="ch02f3blu" markerWidth="9" markerHeight="9" refX="4.5" refY="4.5" orient="auto">
+      <path d="M0,1 L8,4.5 L0,8 z" fill="#4878a8"/>
+    </marker>
+    <marker id="ch02f3grn" markerWidth="9" markerHeight="9" refX="4.5" refY="4.5" orient="auto">
+      <path d="M0,1 L8,4.5 L0,8 z" fill="#4a8a5c"/>
+    </marker>
+  </defs>
+  <text x="340" y="24" font-size="11" fill="#b04a4a" text-anchor="middle">the environment is not differentiable: no gradient crosses these arrows</text>
+
+  <rect x="30" y="46" width="160" height="60" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="2"/>
+  <text x="110" y="70" font-size="12" fill="#333" text-anchor="middle">Actor</text>
+  <text x="110" y="88" font-size="11" fill="#666" text-anchor="middle">policy pi_theta(a | s)</text>
+
+  <rect x="260" y="46" width="160" height="60" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="2"/>
+  <text x="340" y="70" font-size="12" fill="#333" text-anchor="middle">Environment</text>
+  <text x="340" y="88" font-size="11" fill="#666" text-anchor="middle">unknown dynamics</text>
+
+  <rect x="490" y="46" width="160" height="60" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="2"/>
+  <text x="570" y="70" font-size="12" fill="#333" text-anchor="middle">Rollout buffer</text>
+  <text x="570" y="88" font-size="11" fill="#666" text-anchor="middle">(s_t, a_t, r_t)</text>
+
+  <rect x="490" y="182" width="160" height="60" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="2"/>
+  <text x="570" y="206" font-size="12" fill="#333" text-anchor="middle">Critic V_phi(s)</text>
+  <text x="570" y="224" font-size="11" fill="#666" text-anchor="middle">own parameters phi</text>
+
+  <rect x="260" y="182" width="160" height="60" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="2"/>
+  <text x="340" y="206" font-size="12" fill="#333" text-anchor="middle">Advantage</text>
+  <text x="340" y="224" font-size="10" fill="#666" text-anchor="middle">Ahat_t = G_t - V_phi(s_t)</text>
+
+  <rect x="30" y="182" width="160" height="60" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="2"/>
+  <text x="110" y="206" font-size="12" fill="#333" text-anchor="middle">Actor update</text>
+  <text x="110" y="224" font-size="10" fill="#666" text-anchor="middle">-log pi(a|s) times Ahat_t</text>
+
+  <line x1="190" y1="66" x2="252" y2="66" stroke="#666" stroke-width="1.6" marker-end="url(#ch02f3arr)"/>
+  <text x="221" y="59" font-size="10" fill="#666" text-anchor="middle">a_t</text>
+  <line x1="260" y1="92" x2="198" y2="92" stroke="#666" stroke-width="1.6" marker-end="url(#ch02f3arr)"/>
+  <text x="229" y="105" font-size="10" fill="#666" text-anchor="middle">s_t</text>
+  <line x1="420" y1="76" x2="482" y2="76" stroke="#666" stroke-width="1.6" marker-end="url(#ch02f3arr)"/>
+  <text x="451" y="69" font-size="10" fill="#666" text-anchor="middle">s_t , r_t</text>
+  <line x1="570" y1="106" x2="570" y2="174" stroke="#666" stroke-width="1.6" marker-end="url(#ch02f3arr)"/>
+  <text x="580" y="144" font-size="10" fill="#666">returns G_t</text>
+  <line x1="486" y1="212" x2="428" y2="212" stroke="#666" stroke-width="1.6" marker-end="url(#ch02f3arr)"/>
+  <text x="457" y="205" font-size="10" fill="#666" text-anchor="middle">V(s_t)</text>
+  <line x1="256" y1="212" x2="198" y2="212" stroke="#666" stroke-width="1.6" marker-end="url(#ch02f3arr)"/>
+  <text x="227" y="205" font-size="10" fill="#666" text-anchor="middle">advantage</text>
+  <line x1="110" y1="178" x2="110" y2="114" stroke="#4878a8" stroke-width="1.8" marker-end="url(#ch02f3blu)"/>
+  <text x="120" y="150" font-size="10" fill="#4878a8">gradient step</text>
+  <line x1="570" y1="272" x2="570" y2="250" stroke="#4a8a5c" stroke-width="1.8" marker-end="url(#ch02f3grn)"/>
+  <text x="570" y="290" font-size="10" fill="#4a8a5c" text-anchor="middle">gradient step: fit V_phi to G_t</text>
+</svg>
+<figcaption>Figure 2.4 &mdash; The actor-critic loop, and the two places a gradient exists. Data flows clockwise: the actor acts, the world hands back a state and a reward, transitions are banked, the critic learns to predict returns, the difference becomes an advantage, and the advantage weights the actor's update. Both gradients live entirely inside your own code &mdash; the blue one, which is the only gradient that reaches the policy, and the green one, which is ordinary regression fitting the critic to observed returns. Neither ever crosses into the orange boxes; that is Section 2.1 drawn as a diagram.</figcaption>
+</figure>
+
+<p>Note the phrase <em>fresh data</em> in the first line of the pseudocode. The policy gradient theorem's expectation is taken under the <em>current</em> policy's own trajectory distribution. The moment you take one gradient step, the rollouts you already collected were generated by a different policy \(\pi_{\theta_{old}}\), and reusing them naively biases the gradient. The principled correction is the importance ratio \(\rho_t(\theta) = \pi_\theta(a_t \mid s_t) / \pi_{\theta_{old}}(a_t \mid s_t)\), and Chapter 3 builds PPO around keeping that ratio near 1 so that a limited amount of reuse stays safe. This <strong>on-policy</strong> constraint &mdash; new data for every update &mdash; is why the whole family is so sample-hungry: cheap in a simulator running thousands of environments in parallel, brutal on one physical arm. Chapter 4 is the off-policy escape route, and it is the hinge of this book.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+SB3's PPO on rl-rover is exactly this chapter's actor-critic plus Chapter 3's clip. <code>ActorCriticPolicy</code> is one object holding an actor (a diagonal Gaussian over wheel commands) and a critic (a scalar value head) &mdash; separate MLPs by default, a shared trunk only if <code>net_arch</code> says so. This chapter's score functions live in <code>common/policies.py</code>: <code>evaluate_actions()</code> calls <code>distribution.log_prob(actions)</code>, and <code>ppo.py</code> forms <code>ratio = th.exp(log_prob - old_log_prob)</code>. Put a breakpoint on that <code>log_prob</code> call and you are watching \(\nabla_\theta \log \pi_\theta\) get assembled, one batch at a time.
+</div>
+
+<h2>2.6 The hidden requirement, and the bridge to Part III</h2>
+
+<p>Go back and look at every estimator in this chapter. REINFORCE, the baseline version, the policy gradient theorem, the actor loss in the pseudocode: all contain the same factor, \(\nabla_\theta \log \pi_\theta(a \mid s)\). Using any of them means you can evaluate the exact log-density of a sampled action and differentiate it with respect to the weights.</p>
+
+<p>For classical deep RL policies that is trivial. A softmax over discrete actions is an explicit probability vector; take a log and index into it. A diagonal Gaussian &mdash; SB3's default for the rover's continuous wheel commands &mdash; has a closed-form log-density that fits in five lines:</p>
+
+<pre class="code"># diagonal Gaussian policy: log pi(a|s) in closed form
+mu, log_std = policy_net(obs)          # network emits mean and log sigma per dim
+var  = (2 * log_std).exp()             # sigma squared
+logp = -0.5 * (((a - mu) ** 2) / var   # squared-error term, per action dimension
+               + 2 * log_std           # the log sigma normalizer
+               + math.log(2 * math.pi)).sum(-1)   # sum over action dimensions
+logp.backward()                        # autograd now has grad_theta log pi</pre>
+
+<p>The requirement is met so cheaply, in every tutorial and every library, that it becomes invisible. Most people who have trained PPO for a year have never once thought of it as a requirement.</p>
+
+<p>It stops being met in Chapter 5. Modern robot policies emit whole action <strong>chunks</strong> \(a_{t:t+H}\) &mdash; a short block of \(H\) future actions produced in one shot &mdash; by iteratively transforming random noise, and the network learns a denoiser (diffusion, Chapter 6) or a velocity field (flow matching, Chapter 7) rather than a density. No line of code in such a model computes \(\log \pi_\theta(a_{t:t+H} \mid o)\). The likelihood of a generated chunk is buried inside a multi-step integration path, and it has no closed form of the kind a Gaussian hands you for free.</p>
+
+<p>Be careful how you state this, though, because the strong version &mdash; "the gradient cannot be computed at all" &mdash; is simply false, and you will meet papers that depend on its being false. The likelihood is not unavailable <em>in principle</em>. For a continuous-time flow you can recover it by integrating along the generation path, accumulating the divergence of the velocity field as you go; and there is a live line of work &mdash; you will see it under names like DPPO and Flow-GRPO &mdash; that sidesteps the integral entirely by treating the chain of denoising steps as its own small MDP and running PPO on <em>those</em> steps instead. What is true is that all of these are expensive, high-variance, and nothing like the free lunch a Gaussian gives you. In practice \(\log \pi_\theta\) is off the table, and REINFORCE, actor-critic and PPO stall at the same wall for the same reason.</p>
+
+<p>Tractability is also not the only obstacle, and arguably not the most important one. A policy-gradient update does not just push probability mass toward good actions; it pushes mass <em>away</em> from actions that scored badly. For a generative policy whose whole value is that it has learned a narrow manifold of physically coherent action chunks, pushing away is how you shove its predictions off that manifold and get incoherent motion out the other side. Chapter 9 puts the two worlds side by side, covers both failure modes, and works through which parts of your PPO intuition transfer and which do not.</p>
+
+<p>What survives the crash is not the estimator but this chapter's central <em>quantity</em>: the advantage. Once you have \(\hat{A}\), you can weight training data by it (Chapter 4), condition the policy on it as an input (Chapter 10), engineer better estimates of it (Chapter 11), and rank candidate action chunks by it at inference time (Chapter 12). Every one of those is a way of doing policy improvement without ever differentiating a log-probability. The estimator is disposable. The advantage is not. That sentence is the thesis of the rest of this book.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+None of this chapter's estimators run on Larchenko's policy. \(\pi_{0.5}\) generates action chunks by flow matching, so \(\log \pi_\theta(a_{t:t+H} \mid o)\) &mdash; the term every equation in this chapter differentiates &mdash; is not something you can cheaply evaluate, and PPO was off the table from the first day (Larchenko, 2026). The chapter's central quantity survives intact, though: his solution estimates advantages with a success-probability value head \(\hat{p}_{succ}\), GAE, and a damped \(\alpha V\) baseline (Chapter 11), then consumes those advantages through AWR weighting (Chapter 4) and RECAP conditioning (Chapter 10).
+</div>
+
+<div class="box checkpoint"><div class="box-title">Checkpoint</div>
+<ul>
+<li>Explain to a colleague who has only done supervised learning why you cannot call <code>.backward()</code> on a sum of environment rewards, and why a differentiable simulator does not rescue you.</li>
+<li>Derive \(\nabla_\theta J = \mathbb{E}[R(\tau) \nabla_\theta \log p_\theta(\tau)]\) from the identity \(\nabla_\theta p = p \nabla_\theta \log p\), and say where the transition model drops out and why that makes the method model-free.</li>
+<li>State the REINFORCE estimator as an English instruction, and name what it does and does not require of your policy.</li>
+<li>Prove in one line that any action-independent baseline leaves the gradient unbiased, and explain why \(b = V(s)\) turns the weight into an advantage.</li>
+<li>Work the 100/101 example and the two-action bandit by hand, and use the \(1/\sqrt{N}\) rule to turn a variance reduction into saved episodes on your SO-101.</li>
+<li>Point to the exact factor in every equation here that stops being available for a flow-matching policy, say why "unavailable in practice" is the accurate claim rather than "impossible in principle", and name the quantity that survives.</li>
+</ul>
+</div>
+
+<p><strong>Where to go deeper.</strong> The original REINFORCE paper is Williams (1992), and it is short and readable. The policy gradient theorem with function approximation is Sutton et al. (1999); Sutton and Barto (2018) covers both with full derivations in its policy-gradient chapter and is the gentlest complete treatment in print. Schulman et al. (2016), the GAE paper, is the sharpest treatment of the bias-variance spectrum that Section 2.5 only sketched, and is the natural bridge into Chapter 3. Appendix A places each of these in a suggested reading order.</p>
+
+</section>

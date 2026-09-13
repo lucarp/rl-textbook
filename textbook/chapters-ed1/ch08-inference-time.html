@@ -1,0 +1,175 @@
+<section class="chapter" id="ch08">
+<h1>Chapter 8 &mdash; Inference-time optimization</h1>
+
+<p>Every previous chapter changed the policy's weights. This one holds the checkpoint fixed and changes only how it is executed. A generative chunk policy is not a controller; it is a sampler with unfinished business: how many of the \(H\) predicted actions to execute, at what speed, how to splice consecutive chunks, how hard to push the advantage condition from Chapter 6, how many candidate chunks to draw before committing. Each of these choices moves the measured success rate &mdash; sometimes by more than a careful reward change does &mdash; and all of them cost zero gradient steps. This chapter inventories the knobs, then shows how to tune them online, for free, with a bandit.</p>
+
+<h2>8.1 Free success rate</h2>
+
+<p>A policy from Chapter 5 answers each query with a chunk \(a_{t:t+H}\) &mdash; in LeHome, \(H = 30\) joint-delta actions, one second of motion at 30&nbsp;Hz. Training fixed the distribution of chunks; the execution loop still owns three families of decisions.</p>
+
+<p><strong>Execution length.</strong> Execute only the first \(n_e \le H\) actions, then re-query the policy from a fresh observation. Small \(n_e\) means frequent re-planning: the policy sees its own errors quickly and corrects them, which is what closed-loop control means for a chunked policy. It also means more chunk boundaries (each one a potential discontinuity), more compute, and less benefit from the smooth within-chunk trajectory. Larchenko's tuned values were 3&ndash;5 out of 30: the policy re-plans six to ten times per predicted second.</p>
+
+<p><strong>Playback speed.</strong> A chunk is a time-indexed trajectory, and nothing forces you to replay it at the training frame rate. Larchenko's BEHAVIOR-1K entry (Larchenko et al., 2025) resampled 26 predicted actions onto 20 control ticks with cubic splines &mdash; a 1.3x speedup &mdash; and disabled compression whenever the gripper state changed, so grasps ran at full resolution. Slower playback buys precision near contacts; faster playback buys cycle time.</p>
+
+<p><strong>Chunk switching.</strong> When a new chunk replaces an old one mid-motion, how much should the old chunk constrain the new? Larchenko parameterizes this with an <strong>anchor length</strong> \(n_a\) &mdash; how many of the old actions the new chunk must respect &mdash; which brings us to the mechanism that makes smooth switching possible at all.</p>
+
+<h2>8.2 Action-chunk inpainting: executing while you think</h2>
+
+<p>The problem is latency. A VLA forward pass takes tens to hundreds of milliseconds, and the arm does not stop moving while you think. Run inference synchronously and the robot pauses at every chunk boundary &mdash; stop-motion manipulation, unusable for anything dynamic. Run it asynchronously &mdash; start generating chunk \(k{+}1\) while chunk \(k\) executes &mdash; and the new chunk is conditioned on an observation that is several control steps stale by the time it arrives. Executed naively, it disagrees with the actions the arm performed in the meantime: the trajectory jumps at the boundary, and with delta-action policies the jump can be violent.</p>
+
+<p><strong>Real-time chunking</strong> (Black et al., 2025) resolves this by framing next-chunk generation as <strong>inpainting</strong> &mdash; the image-editing move where a model fills a masked region consistently with the unmasked rest. By the time chunk \(k{+}1\) is ready, the first \(d\) of its actions will already have been executed from chunk \(k\)'s tail; they are not up for discussion. So freeze them: constrain the new chunk's first \(d\) actions to equal that committed tail exactly, pull the next few actions softly toward the old chunk with a decaying weight, and let the remainder be generated freely (Figure 8.1). Mechanically the constraint is a correction applied to the velocity field \(v_\theta\) during the \(K\) integration steps &mdash; guidance, not retraining &mdash; so any flow or diffusion chunk policy supports it out of the box. In Larchenko's solution the correction is active over only part of the integration schedule, gated by a threshold \(u_{ip}\) on the flow time \(u\) (the tech report writes \(t_{ip}\)) &mdash; soft inpainting, with \(u_{ip}\) itself a tuned knob. Under injected latencies that break naive asynchronous swapping and temporal ensembling (averaging the overlapping actions of successive chunks), real-time chunking keeps success rates flat.</p>
+
+<figure>
+<svg viewBox="0 0 700 260" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch08f1arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#666"/>
+    </marker>
+  </defs>
+  <rect x="255" y="32" width="60" height="178" fill="#b04a4a" opacity="0.07"/>
+  <line x1="255" y1="32" x2="255" y2="210" stroke="#b04a4a" stroke-width="1" stroke-dasharray="4 3"/>
+  <line x1="315" y1="32" x2="315" y2="210" stroke="#b04a4a" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="285" y="24" font-family="Noto Sans" font-size="11" fill="#b04a4a" text-anchor="middle">inference latency</text>
+
+  <text x="68" y="78" font-family="Noto Sans" font-size="12" fill="#333" text-anchor="end">chunk k</text>
+  <rect x="75" y="60" width="30" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <rect x="105" y="60" width="30" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <rect x="135" y="60" width="30" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <rect x="165" y="60" width="30" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <rect x="195" y="60" width="30" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <rect x="225" y="60" width="30" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <rect x="255" y="60" width="30" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="2"/>
+  <rect x="285" y="60" width="30" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="2"/>
+  <rect x="315" y="60" width="30" height="26" rx="6" fill="none" stroke="#666" stroke-dasharray="4 3"/>
+  <rect x="345" y="60" width="30" height="26" rx="6" fill="none" stroke="#666" stroke-dasharray="4 3"/>
+  <text x="165" y="102" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">already executed</text>
+  <text x="345" y="102" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">superseded</text>
+
+  <path d="M 285 88 C 285 112, 285 126, 285 146" fill="none" stroke="#666" stroke-width="1.3" marker-end="url(#ch08f1arr)"/>
+  <text x="293" y="122" font-family="Noto Sans" font-size="10" fill="#666">copied</text>
+
+  <text x="248" y="168" font-family="Noto Sans" font-size="12" fill="#333" text-anchor="end">chunk k+1</text>
+  <rect x="255" y="150" width="30" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="2"/>
+  <rect x="285" y="150" width="30" height="26" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="2"/>
+  <rect x="315" y="150" width="30" height="26" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <rect x="345" y="150" width="30" height="26" rx="6" fill="#f8efe8" stroke="#b0703a" opacity="0.75"/>
+  <rect x="375" y="150" width="30" height="26" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <rect x="405" y="150" width="30" height="26" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <rect x="435" y="150" width="30" height="26" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <rect x="465" y="150" width="30" height="26" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <rect x="495" y="150" width="30" height="26" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="285" y="196" font-family="Noto Sans" font-size="10" fill="#4878a8" text-anchor="middle">frozen prefix</text>
+  <line x1="345" y1="178" x2="345" y2="206" stroke="#b0703a" stroke-width="0.8"/>
+  <text x="345" y="218" font-family="Noto Sans" font-size="10" fill="#b0703a" text-anchor="middle">soft blend, decaying weight</text>
+  <text x="450" y="196" font-family="Noto Sans" font-size="10" fill="#4a8a5c" text-anchor="middle">generated freely</text>
+
+  <line x1="45" y1="238" x2="620" y2="238" stroke="#333" stroke-width="1" marker-end="url(#ch08f1arr)"/>
+  <text x="630" y="242" font-family="Noto Sans" font-size="11" fill="#333">env time t</text>
+</svg>
+<figcaption>Figure 8.1 &mdash; Real-time chunking as inpainting. While chunk k+1 is generated (shaded latency window), the robot keeps executing chunk k. The actions that will run during generation are frozen into the new chunk, the next few are softly blended toward the old chunk, and the rest are generated freely.</figcaption>
+</figure>
+
+<h2>8.3 Classifier-free guidance on the advantage condition</h2>
+
+<p>Chapter 6 trained an advantage-conditioned policy with a stochastic gate: during training the advantage token is sometimes masked to a neutral value, so a single network learns both the conditional velocity field (what good executions look like) and the unconditional one (what typical executions look like). That gating is exactly the <strong>condition dropout</strong> of <strong>classifier-free guidance</strong> (Ho and Salimans, 2022), and it unlocks a powerful inference-time move. At each of the \(K\) integration steps, run the action expert twice &mdash; once with the high-advantage condition \(c_A\), once with the condition nulled &mdash; and step along an extrapolated field:</p>
+
+<div class="key-eq">
+\[
+\tilde v(a^u,u,o)\;=\;v_\theta(a^u,u,o,\varnothing)\;+\;g\,\bigl[\,v_\theta(a^u,u,o,c_A)\;-\;v_\theta(a^u,u,o,\varnothing)\,\bigr]
+\]
+</div>
+
+<p>With \(g = 1\) you recover plain conditional sampling: act like the good episodes. With \(g \gt 1\) you extrapolate: the difference \(v_\theta(\cdot,c_A) - v_\theta(\cdot,\varnothing)\) is the direction in action space that separates good behavior from average behavior, and guidance keeps walking along it past the point where the training data stops. Formally, guided sampling draws from a distribution proportional to \(p(a \mid o, c_A)\,p(\text{good} \mid a,o)^{\,g-1}\) &mdash; equivalently \(p(a \mid o)\,p(\text{good} \mid a,o)^{\,g}\): it sharpens an implicit classifier of success without ever training one. (Check the reduction: at \(g = 1\) the exponent vanishes and you are back to plain conditional sampling.) This is the cleanest sense in which a conditioning policy can act better than the best data it was trained on.</p>
+
+<p>How far can you push \(g\)? Farther than image generation suggests. Larchenko searched scales 0&ndash;2, and the bandit of Section 8.5 kept pinning the top arm; after the ladder was extended it settled at \(g\) between 7 and 9 depending on garment type &mdash; "surprisingly high." Two readings. First, most training frames carry a masked condition, so the network learns to lean on it only weakly; the conditional&ndash;unconditional difference is a small vector that needs a large multiplier before it matters. Second, a 30-step chunk of 12-dimensional joint deltas lives on a far more forgiving manifold than a natural image: moderate extrapolation still lands on feasible motions. The cost is mild &mdash; two action-expert passes per integration step, sharing one VLM prefix cache.</p>
+
+<h2>8.4 Best-of-N with the Q-like head</h2>
+
+<p>The auxiliary heads of Chapter 5 included an action-conditional one: a <strong>Q-like head</strong> at the tail of the action expert that reads the denoised chunk and predicts a success residual. That head turns sampling into search. Draw \(N\) chunks from different noise seeds \(z_1,\dots,z_N\), score each with the head, and execute the argmax (Figure 8.2) &mdash; the robot analog of best-of-N or verifier-guided decoding in LLMs, where a reward model rescores candidate generations before one is emitted.</p>
+
+<p>The economics: cost grows linearly in \(N\), but only in the small action expert, since all candidates share the prefix pass. The returns diminish fast &mdash; in LeHome, \(N = 2\) or 3 helped consistently; beyond 3, nothing. The reason is instructive: best-of-N does not pick the best among good chunks, it vetoes the occasional bad one. At multimodal decision points &mdash; which sleeve to grab first &mdash; the sampler sometimes commits to a mode that leads nowhere, and even a weak verifier can spot it. Larchenko reports the head's correlation with final episode outcome was approximately zero, yet selection still helped; when every candidate scored negative, the client simply retried with a larger batch. A verifier does not need to be well calibrated to filter disasters. It does need to not be anti-calibrated &mdash; see the pitfalls box.</p>
+
+<figure>
+<svg viewBox="0 0 700 240" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch08f2arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#666"/>
+    </marker>
+  </defs>
+  <text x="440" y="22" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">Q-like head scores each candidate; argmax is executed</text>
+
+  <rect x="20" y="98" width="112" height="44" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="76" y="117" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">observation</text>
+  <text x="76" y="132" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">o_t</text>
+
+  <line x1="132" y1="120" x2="158" y2="120" stroke="#666" stroke-width="1.3" marker-end="url(#ch08f2arr)"/>
+
+  <rect x="162" y="98" width="138" height="44" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="231" y="117" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">flow sampler</text>
+  <text x="231" y="132" font-family="Noto Sans" font-size="11" fill="#333" text-anchor="middle">N chunks, noise z_i</text>
+
+  <path d="M 300 120 C 380 60, 470 42, 555 45" fill="none" stroke="#999" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <path d="M 300 120 C 390 105, 470 92, 555 95" fill="none" stroke="#4a8a5c" stroke-width="3"/>
+  <path d="M 300 120 C 385 140, 470 148, 555 150" fill="none" stroke="#999" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <path d="M 300 120 C 380 175, 470 197, 555 200" fill="none" stroke="#999" stroke-width="1.5" stroke-dasharray="5 4"/>
+
+  <text x="567" y="49" font-family="Noto Sans" font-size="11" fill="#666">+0.12</text>
+  <text x="567" y="99" font-family="Noto Sans" font-size="12" fill="#4a8a5c" font-weight="bold">+0.31</text>
+  <text x="614" y="99" font-family="Noto Sans" font-size="11" fill="#4a8a5c">execute</text>
+  <text x="567" y="154" font-family="Noto Sans" font-size="11" fill="#666">+0.05</text>
+  <text x="567" y="204" font-family="Noto Sans" font-size="11" fill="#b04a4a">-0.24</text>
+  <text x="614" y="204" font-family="Noto Sans" font-size="10" fill="#b04a4a">vetoed</text>
+</svg>
+<figcaption>Figure 8.2 &mdash; Best-of-N chunk selection. The sampler draws N candidate chunks from different noise seeds; the action-conditional Q-like head scores each; the argmax is executed. The main effect is vetoing the occasional bad sample, not fine-ranking good ones.</figcaption>
+</figure>
+
+<h2>8.5 Tuning seven knobs for free</h2>
+
+<p>Count the knobs so far: execution length, playback speed, anchor length, inpainting onset, guidance scale &mdash; plus a <strong>noise temperature</strong> (a scale on the sampling noise, typically applied to the initial \(z\)) and the best-of-N count. Seven, per garment type, each with a handful of candidate values. A grid over even four values per knob is \(4^7 \approx 16{,}000\) configurations, and each needs dozens of 30-second rollouts with a binary outcome before its estimate means anything. Grid search is dead on arrival.</p>
+
+<p>But the asynchronous flywheel of Chapter 10 is already paying for hundreds of rollouts a day. Tuning can piggyback on them: treat each candidate knob value as an arm of a <strong>multi-armed bandit</strong>, choose arms per episode, and update from the episode's success bit. <strong>Thompson sampling</strong> (Thompson, 1933) is the natural algorithm when outcomes are binary: keep a Beta posterior over each arm's success probability; each episode, sample one plausible value from every posterior and play the arm whose sample wins. Arms that look good get played more, arms with wide posteriors keep getting occasional tries, and nothing is ever ruled out by one noisy early failure. Larchenko runs it <strong>factorized</strong> &mdash; one independent bandit per knob, which assumes knob interactions are weak &mdash; with rewards centered by the per-garment mean success rate, updates from unbiased episodes only, and posteriors decayed toward the prior at each checkpoint iteration, because the best knob values drift as the policy improves.</p>
+
+<pre class="code"># one Beta bandit per knob (factorized); arms = candidate values
+S = {arm: 1.0 for arm in arms}    # prior successes: Beta(1,1)
+F = {arm: 1.0 for arm in arms}    # prior failures
+
+def choose():
+    draws = {arm: np.random.beta(S[arm], F[arm]) for arm in arms}
+    return max(draws, key=draws.get)
+
+def update(arm, success):          # after the episode ends
+    S[arm] += success
+    F[arm] += 1 - success
+
+def decay(factor=0.9):             # once per checkpoint iteration
+    for arm in arms:               # forget slowly: the world drifts
+        S[arm] = 1 + factor * (S[arm] - 1)
+        F[arm] = 1 + factor * (F[arm] - 1)</pre>
+
+<p><strong>Worked example.</strong> Tune \(n_e \in \{3, 5, 10\}\): arms A, B, C, all starting at Beta(1,1) &mdash; uniform over success probability.</p>
+
+<ul>
+<li>Pull 1: draws 0.62, 0.41, 0.77 &rarr; play C; episode fails &rarr; C becomes Beta(1,2).</li>
+<li>Pull 2: draws 0.35, 0.88, 0.29 &rarr; play B; success &rarr; B: Beta(2,1).</li>
+<li>Pull 3: draws 0.71, 0.66, 0.14 &rarr; play A; failure &rarr; A: Beta(1,2).</li>
+<li>Pull 4: draws 0.20, 0.93, 0.55 &rarr; play B; success &rarr; B: Beta(3,1).</li>
+<li>Pull 5: draws 0.44, 0.72, 0.61 &rarr; play B; failure &rarr; B: Beta(3,2).</li>
+</ul>
+
+<p>After five pulls the posterior means are 0.33 (A), 0.60 (B), 0.33 (C), but the next pull is not automatically B: the chance that A or C outdraws B on the next pull is about one third (each alone, about one in five), so A and C keep getting tested while B accumulates evidence. That automatic explore&ndash;exploit balance &mdash; driven by posterior width, with no schedule to tune &mdash; is why five noisy rollouts already produce a sensible allocation while a grid search would still be evaluating its first cell.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+Seven per-garment-type knobs &mdash; execution length, playback stretch, anchor length, inpainting onset, guidance scale, noise temperature, best-of-N &mdash; tuned by a factorized Thompson bandit whose reward is success minus the garment's mean success rate. Only unbiased episodes update it; posteriors decay each iteration; the bandit is frozen for submission. Final values: \(n_e\) 3&ndash;5 of 30, \(g\) 7&ndash;9, \(N\) 2&ndash;3, temperature 0.7&ndash;0.9. The high guidance scale surfaced only because the bandit kept pinning the top arm as the ladder was extended; the paper reports no per-knob ablations.
+</div>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+LeRobot chunk policies expose the first knob directly: <code>n_action_steps</code> versus <code>chunk_size</code> is exactly \(n_e\) versus \(H\) for ACT or a pi0-style policy on your SO-101 &mdash; sweep it before retraining anything. On rl-rover, action-repeat and control rate are the same kind of knob. And your HIL-SERL critic is a ready-made verifier: score a few sampled actions with \(Q\) and execute the argmax.
+</div>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+(1) Guidance scale too high leaves the action manifold: confident nonsense, jerky saturated motions &mdash; watch the arm as \(g\) grows. (2) Best-of-N with a miscalibrated Q head amplifies its errors: if the head systematically prefers a wrong mode, \(N \gt 1\) makes the policy worse. Validate selection against random choice first. (3) Bandit feedback is delayed by a whole episode and confounded with checkpoint updates &mdash; decay posteriors, and never update from biased replay episodes.
+</div>
+
+<p><strong>Where to go deeper.</strong> Real-time chunking is Black et al. (2025); classifier-free guidance is Ho and Salimans (2022), applied verbatim to flow-matching velocity fields. The seven-knob inventory, the surprisingly high guidance scales, and the factorized bandit are Section 7 of Larchenko (2026). For Thompson sampling beyond the Beta&ndash;Bernoulli case, the tutorial by Russo et al. (2018) is the standard reference; Appendix A links all of them.</p>
+
+</section>

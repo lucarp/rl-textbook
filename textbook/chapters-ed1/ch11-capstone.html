@@ -1,0 +1,117 @@
+<section class="chapter" id="ch11">
+<h1>Chapter 11 &mdash; Capstone: replicating LeHome</h1>
+
+<p>You now hold every piece: policy gradients and why they break on flow-matching policies (Chapters 2&ndash;5), advantage-weighted cloning and conditioning (Chapters 4 and 6), reward and advantage engineering (Chapter 7), inference-time search (Chapter 8), human-in-the-loop imitation (Chapter 9), and the asynchronous sim loop (Chapter 10). This chapter assembles them into one project: replicate Ilia Larchenko's prizewinning LeHome solution, stage by stage, on hardware you own. Each stage has a deliverable and a numeric gate. You advance on numbers, not vibes.</p>
+
+<h2>11.1 What you are replicating</h2>
+
+<p>The LeHome Challenge 2026 (ICRA) asked teams to fold garments &mdash; long- and short-sleeved tops, long pants, shorts &mdash; with a bimanual SO-ARM101 rig, first in an NVIDIA Isaac Lab simulation, then on a real robot in Vienna. Success is binary and geometric: each garment carries keypoints, and an episode succeeds when a conjunction of pairwise keypoint-distance conditions holds (five for tops, four for pants). Larchenko's solution &mdash; a Pi0.5-derived VLA with auxiliary value heads, sampler-side AWR, RECAP-style advantage conditioning, and an asynchronous flywheel mediated by the Hugging Face Hub &mdash; won the online round at 79.63% success across 62 teams and took second in the real-world final (Larchenko, 2026). Everything is open: the tech report, the Apache-2.0 solution repo, the organizers' environment and success checker, and both sim and real checkpoints on the Hub. Open code plus open weights plus an open evaluator is what makes this a replicable capstone rather than an admiration exercise.</p>
+
+<p>Before cloning anything, define the metric that ends each stage. The unit is always a <strong>success rate</strong> \(\hat{p}_{succ}\) over \(n\) scored episodes, and the resolution of that estimate is set by the binomial standard error:</p>
+
+<div class="key-eq">
+\[ \mathrm{SE}(\hat{p}_{succ}) = \sqrt{\frac{\hat{p}_{succ}(1-\hat{p}_{succ})}{n}} \]
+</div>
+
+<p><strong>Worked example.</strong> Stage B lands at \(\hat{p}_{succ}=0.42\) and Stage C at \(0.50\) &mdash; is the +8 points real? With \(n=200\) episodes each, \(\mathrm{SE}\approx\sqrt{0.46\cdot 0.54/200}\approx 0.035\); the difference has \(\mathrm{SE}\approx\sqrt{2}\cdot 0.035\approx 0.050\), so the 95% interval on the delta is \(\pm 9.8\) points &mdash; the claim does not survive. Resolving 8 points near \(p\approx 0.5\) needs \(n \approx 2\,(1.96)^2\,p(1-p)/\Delta^2 \approx 300\) episodes per condition. At roughly 30 s per sim episode, 600 episodes is about five hours on one Isaac instance. Budget that time into every gate below; Figure 11.1 shows the full pipeline.</p>
+
+<figure>
+<svg viewBox="0 0 700 200" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch11f1arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#666"/>
+    </marker>
+  </defs>
+  <rect x="10" y="38" width="120" height="66" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="70" y="60" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333" font-weight="bold">Stage A</text>
+  <text x="70" y="76" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">run his stack</text>
+  <text x="70" y="92" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">1&#8211;2 wk</text>
+  <rect x="152" y="38" width="120" height="66" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="212" y="60" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333" font-weight="bold">Stage B</text>
+  <text x="212" y="76" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">BC baseline</text>
+  <text x="212" y="92" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">2&#8211;3 wk</text>
+  <rect x="294" y="38" width="120" height="66" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <text x="354" y="60" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333" font-weight="bold">Stage C</text>
+  <text x="354" y="76" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">RL loop</text>
+  <text x="354" y="92" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">4&#8211;6 wk</text>
+  <rect x="436" y="38" width="120" height="66" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="496" y="60" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333" font-weight="bold">Stage D</text>
+  <text x="496" y="76" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">inference opts</text>
+  <text x="496" y="92" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">1 wk</text>
+  <rect x="578" y="38" width="112" height="66" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="634" y="60" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333" font-weight="bold">Stage E</text>
+  <text x="634" y="76" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">real robot</text>
+  <text x="634" y="92" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">open-ended</text>
+  <line x1="130" y1="71" x2="150" y2="71" stroke="#666" stroke-width="1.5" marker-end="url(#ch11f1arr)"/>
+  <line x1="272" y1="71" x2="292" y2="71" stroke="#666" stroke-width="1.5" marker-end="url(#ch11f1arr)"/>
+  <line x1="414" y1="71" x2="434" y2="71" stroke="#666" stroke-width="1.5" marker-end="url(#ch11f1arr)"/>
+  <line x1="556" y1="71" x2="576" y2="71" stroke="#666" stroke-width="1.5" marker-end="url(#ch11f1arr)"/>
+  <text x="70" y="128" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">gate: his checkpoint</text>
+  <text x="70" y="142" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">scores as published</text>
+  <text x="212" y="128" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">gate: BC success</text>
+  <text x="212" y="142" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">per garment, with CI</text>
+  <text x="354" y="128" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">gate: delta over B</text>
+  <text x="354" y="142" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">outside the CI</text>
+  <text x="496" y="128" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">gate: each knob's</text>
+  <text x="496" y="142" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">delta measured</text>
+  <text x="634" y="128" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">gate: real SR over</text>
+  <text x="634" y="142" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">50+ episodes</text>
+  <text x="350" y="180" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">durations assume ~15&#8211;20 h/week; do not start a stage before the previous gate passes</text>
+</svg>
+<figcaption>Figure 11.1 &mdash; The staged replication pipeline. Every arrow is guarded by a numeric gate; a stage that has not passed its gate is not a foundation, it is a liability.</figcaption>
+</figure>
+
+<h2>11.2 Stage A &mdash; run before you build (1&ndash;2 weeks)</h2>
+
+<p>Clone the challenge environment and the solution repo, get Isaac Lab rendering on your GPU (one consumer card runs one sim instance comfortably; his rollout machines ran three to five each), and run the official evaluation with <em>his</em> published sim checkpoint on the public garments &mdash; ten seen plus two unseen per type. You will not reproduce 79.63% exactly, because eight garments per type were private; the gate is landing within a few points of his published per-type numbers (74.5 / 70.0 / 80.5 / 93.5) on the garments you can see.</p>
+
+<p>The second deliverable matters as much as the score: a one-page written map of the codebase &mdash; where the model lives, where each auxiliary head attaches, where reward and advantages are computed, how the sampler applies AWR priorities, how the stateless policy server talks to rollout workers. You are about to modify this system; Stage A is where you earn the right to.</p>
+
+<h2>11.3 Stage B &mdash; the BC baseline (2&ndash;3 weeks)</h2>
+
+<p>Fine-tune the base policy (Pi0.5 lineage, or the provided base checkpoint) on the organizers' scripted-demonstration dataset with no RL machinery at all: no advantage signal, no reward pipeline, plain flow-matching behavior cloning (Chapter 5). (If you start from his provided checkpoint, keep its advantage token masked to neutral; a plain Pi0.5 base has none.) Evaluate per garment type at the sample sizes you fixed in 11.1. This number is the honest baseline; every later stage must beat it or explain itself.</p>
+
+<p>Stage B also forces you through his training code at your scale: the multi-dataset sampler, the per-timestep action normalization, the frozen SigLIP encoder (a contrastively pretrained vision encoder). Downscale deliberately &mdash; LoRA adapters (low-rank adapters: fine-tuning small added matrices instead of all weights) or a reduced batch with gradient accumulation &mdash; and record training throughput (steps/s, VRAM) as part of the deliverable, because Stage C's feasibility depends on it.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Skipping Stages A and B and "starting with the interesting part" means debugging RL on top of an unverified stack. When success rates stall, you will not know whether the advantage math is wrong, the eval harness is wrong, or the policy was never trained correctly to begin with. A reproduced checkpoint score and a BC baseline convert those three unknowns into one.</div>
+
+<h2>11.4 Stage C &mdash; the RL loop (4&ndash;6 weeks)</h2>
+
+<p>Now add the learning loop, in dependency order. First the <strong>auxiliary heads</strong> (Chapter 5): success, garment type, completion, and keypoint distances, all linear probes off the shared query token, plus the action-conditional Q-like head (future keypoints and the success residual) at the action expert's tail; the keypoint targets need sim-privileged state, which is why this lives in Stage C, not B. Second, <strong>reward</strong> from the success checker itself (Chapter 7): checkpoint densification, gradual proximity credit for tops, and failure withdrawal so the episode return stays binary. Third, <strong>advantages</strong>: value from the success head with the damped baseline, GAE with \(\gamma=0.999\), \(\lambda=0.99\), blended toward a GRPO-style per-garment segment anchor as rollout datasets age, plus potential-based completion shaping:</p>
+
+<div class="key-eq">
+\[ \hat{V}_t = \alpha\,(\hat{p}_{succ} - R_{acc}), \qquad \tilde{A}_t = w\,\hat{A}^{\mathrm{GAE}}_t + (1-w)\,\hat{A}^{\mathrm{grp}}_t + \hat{A}^{\Phi}_t \]
+</div>
+
+<p>with damping \(\alpha=0.5\) and \(w\) tied to the dataset's decaying sampling share &mdash; Chapter 7's Section 7.6 formula verbatim, the \(\hat{A}^{\mathrm{grp}}\) anchor computed per garment-type segment. Fourth, consume \(\tilde{A}_t\) both ways: AWR through the sampler, \(P(i)\propto e^{\mathrm{clip}(\tilde{A}_i,-2,2)}\) &mdash; the Chapter 4 AWR weight \(w_i=\exp(\hat{A}_i/\beta)\) with \(\beta=1\) and clipped advantages, applied through sampling probabilities instead of the loss; the blend weight \(w\) above is unrelated to \(w_i\) &mdash; and the RECAP advantage token with stochastic masking to unlock guidance later (Chapters 4 and 6). Fifth, the asynchronous flywheel (Chapter 10): trainer, rollout workers, and a DAgger station communicating only through the Hub.</p>
+
+<p>Size it to one workstation honestly. Full fine-tuning of the roughly 2.7B-parameter backbone-plus-expert with AdamW wants 40&ndash;50 GB of VRAM; LoRA with the frozen encoder fits in 24 GB. Run one or two Isaac instances, time-shared or alternating with training, and restrict the curriculum to one or two garment types. Expect one full iteration &mdash; collect rollouts, recompute advantages, roughly a thousand train steps, push a checkpoint &mdash; to take a day, not the forty-minute checkpoint cadence his H200 sustained. The gate: a statistically resolved improvement over Stage B on at least one garment type, at the sample sizes from 11.1.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+Training ran on a single H200 (batch 192, bf16, frozen SigLIP, about 300k steps), pushing a checkpoint roughly every 40 minutes; separate RTX PRO 6000 machines each ran 3&ndash;5 Isaac Sim instances behind one stateless policy server, and the repo asks for 500+ GB of disk. Final pool: about 12,500 rollout episodes over about 140 sessions. Your single-GPU loop iterates perhaps ten times slower &mdash; scope Stage C accordingly.</div>
+
+<h2>11.5 Stage D &mdash; inference-time optimization (1 week)</h2>
+
+<p>With the policy frozen, harvest the cheap wins of Chapter 8, one at a time so each has an attributable delta. Sweep the classifier-free guidance scale \(g\): his bandit pinned values of 7&ndash;9 after he had initially searched 0&ndash;2, so sweep wide. Add best-of-N scored by the action-conditional success-residual head; \(N=2\) or \(3\) helped consistently, larger did not. Then let the factorized Thompson-sampling bandit tune the seven per-garment knobs jointly &mdash; execution length, playback stretch, anchor length, inpainting onset, guidance scale, noise temperature, and \(N\) &mdash; updating only on unbiased episodes. Run the sweeps before the bandit: you want attribution first, optimization second. The gate is a table, one measured delta per accepted knob.</p>
+
+<h2>11.6 Stage E &mdash; to the real robot</h2>
+
+<p>Here is the honest fork: LeHome is bimanual, and you own one SO-101 leader/follower pair.</p>
+
+<p><strong>Path (a): replicate properly.</strong> A second pair costs roughly $250&ndash;450 in kit form plus two wrist cameras. Then follow his sim-to-real recipe: arms 46 cm apart, foot-pedal DAgger takeover with leaders tracking followers, the camera-overlay alignment tool, per-source speed factors to normalize motion intensity, and the strip-the-model step &mdash; keep the action objective plus garment-type and completion heads; drop advantage conditioning, CFG, and best-of-N on real, where no advantage signal exists.</p>
+
+<p><strong>Path (b): adapt.</strong> A single-arm simplified garment task &mdash; a towel fold with one arm plus a fixture (a clamp or weighted edge standing in for the second gripper) &mdash; reusing the same machinery end to end: teleop demonstrations on your rig, a sim scene aligned to your cameras, DAgger corrections with intervention weighting (Chapter 9), then a real fine-tune under heavy augmentation. This is your hil-serl workflow with a VLA policy in place of SAC.</p>
+
+<p>Either path exercises every skill a robotics-RL job asks for; path (b) costs less and demands more engineering judgment. The gate: a real-robot success rate over at least 50 scored episodes, with the protocol written down before you run it.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Letting sim work expand forever. Larchenko spent three months in sim and one week on sim-to-real &mdash; and zero-shot still failed, because the latest checkpoints had overfit sim down to the image-resize pipeline. Timebox Stages C and D, start real-robot transfer from a late-but-not-latest checkpoint, and accept that touching the real arm early beats one more sim point.</div>
+
+<h2>11.7 What to publish</h2>
+
+<p>The portfolio artifact is the point of the capstone. Publish a repo with the per-stage evaluation table &mdash; success rates with confidence intervals, A through E &mdash; a short tech note in the style of his report (what you changed, what it bought, what failed), and rollout videos with reward, value, and advantage overlays, exactly the debug views his pipeline saved. Include negative results; they are evidence of measurement, not weakness. This mirrors how Larchenko's own open-sourcing built credibility: his paper is an engineering case study with almost no ablations, yet it became a calling card because every claim ships with runnable code, checkpoints, and an evaluator anyone can rerun. For a job search, that is the model to copy &mdash; and after this book, you can.</p>
+
+<p><strong>Where to go deeper.</strong> Read Larchenko (2026) end to end now that you have the vocabulary, alongside the lineage papers Pi0.5 (Physical Intelligence, 2025a) and Pi*0.6 (Physical Intelligence, 2025b) for the base policy and RECAP; his BEHAVIOR-1K solution report (2025) documents the inherited machinery. Appendix A gives links, reading order, and what to skim versus study for all of these; the LeHome simulator paper (Wu et al., 2026) is optional context beyond the guide.</p>
+
+</section>

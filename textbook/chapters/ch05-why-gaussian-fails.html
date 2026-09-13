@@ -1,0 +1,409 @@
+<section class="chapter" id="ch05">
+<h1>Chapter 5 &mdash; Why one Gaussian is not a policy</h1>
+
+<p>Everything you have built so far shares one hidden assumption, and this chapter is about breaking it. In your rover project, in the gridworlds, in the SAC-style policy HIL-SERL runs on your SO-101 today, the policy has the same shape: a network looks at the observation and produces the <em>center</em> of a bell curve, and the action is a random draw from it. That is not a detail of the library you used. It is a claim about the world &mdash; that at any moment there is one right thing to do, and everything else is a small perturbation of it.</p>
+
+<p>For a rover chasing a waypoint that claim is true. For a pair of arms folding a shirt it is false in a way that destroys the policy rather than degrading it. This chapter's job is to make you feel that failure, then introduce &mdash; from zero &mdash; the class of models that fixes it: <strong>generative models</strong>, whose job is to produce samples from a complicated distribution rather than predict one number.</p>
+
+<p>You will not learn the mechanics of diffusion or flow matching here; those are Chapters 6 and 7. What you get is the problem they solve, the vocabulary they are written in, and the one intuition &mdash; iterative refinement &mdash; both are built on. Everyone finds this confusing at first, so take it slowly.</p>
+
+<h2>5.1 What your policy has been until now</h2>
+
+<h3>5.1.1 The shape of a Gaussian policy</h3>
+
+<p>Open the Stable-Baselines3 policy you trained on the rover. An MLP maps the observation \(o\) to a vector \(\mu_\theta(o)\), one entry per action dimension. Alongside it sits a much smaller parameter: a per-dimension standard deviation \(\sigma\), stored as \(\log \sigma\) and, by default, not a function of the observation. To act you draw a vector of independent standard normal numbers \(z\), one per action dimension, and return \(a = \mu_\theta(o) + \sigma \odot z\). The circle-dot \(\odot\) means multiply entry by entry: one \(\sigma_j\) scaling one \(z_j\), never mixing dimensions.</p>
+
+<p>That is a <strong>Gaussian policy</strong>: \(\pi_\theta(a \mid o) = \mathcal{N}\big(\mu_\theta(o),\, \Sigma\big)\), with \(\Sigma\) diagonal, built from the \(\sigma_j\). PPO can use it because its log-density has a closed form you write on one line and differentiate for free.</p>
+
+<p>Read \(\Sigma\) as the covariance matrix, and read <em>diagonal</em> as a real restriction rather than an implementation convenience. Diagonal means the policy adds independent noise to each action dimension. It has no way to say that joint 1 going high should come with joint 2 going low, because it draws every \(z_j\) on its own with no reference to the others. Remember that; it comes back in Section 5.4, where it is the reason one of the obvious repairs fails.</p>
+
+<div class="key-eq">\[
+\log \pi_\theta(a \mid o) \;=\; \sum_{j=1}^{d} \left[\, -\frac{\big(a_j - \mu_{\theta,j}(o)\big)^2}{2\,\sigma_j^2} \;-\; \log \sigma_j \;-\; \frac{1}{2}\log 2\pi \,\right]
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The left side is one number: how plausible this exact action \(a\) was under the current policy, on a log scale. On the right, \(d\) is the number of action dimensions and \(j\) indexes them, so the sum walks the action vector one entry at a time. \(a_j\) is the \(j\)-th number you sent to the robot; \(\mu_{\theta,j}(o)\) is the network's preferred value for it given \(o\); \(\sigma_j\) is how far from that preference the policy will wander. The first term asks "how many \(\sigma\)-widths off-center did we land, squared" &mdash; further out, lower log-probability. The \(-\log \sigma_j\) term is the price of vagueness, stopping the policy from shrinking \(\sigma\) to nothing for free. The last is a constant that cancels in every ratio.
+</div>
+
+<h3>5.1.2 What that looks like geometrically</h3>
+
+<p>Picture the space of possible actions as a plane, one axis per action dimension. A Gaussian puts down a single hill of probability with exactly one peak, at \(\mu_\theta(o)\); move away in any direction and the probability falls off smoothly and never comes back up. So it is <strong>unimodal</strong> &mdash; one most-likely value and no others &mdash; and the region it considers plausible is one connected blob. There is no way to say "this action is good, that faraway action is also good, and everything between is terrible." A Gaussian cannot express a hole.</p>
+
+<h3>5.1.3 Why it was exactly right for the rover</h3>
+
+<p>None of this hurt you on rl-rover. At a given rover state &mdash; some heading error, some distance to the waypoint &mdash; there is essentially one sensible pair of wheel commands, and steering a little more or less is a graded change in quality. There is no second, equally good command far from the first. PPO's job was to slide \(\mu_\theta(o)\) toward the right value and let \(\sigma\) shrink as confidence grew; the noise was never a claim about the world, it was your exploration mechanism.</p>
+
+<p>The Gaussian also gave you three services free, all used constantly in Chapters 2 and 3: cheap <em>sampling</em>, cheap differentiable <em>evaluation</em> of \(\log \pi_\theta(a \mid o)\), and reparametrized gradients &mdash; the trick of writing \(a = \mu_\theta(o) + \sigma \odot z\) with all the randomness pushed into \(z\), so a gradient can flow through the sampled action back into \(\mu_\theta\) and \(\sigma\) as if nothing random had happened. You already wrote that third one two paragraphs ago; it is worth knowing it has a name, because papers use the word without stopping to explain it. Hold onto the second. Section 5.7 is about losing it.</p>
+
+<h2>5.2 Where it breaks: multimodality</h2>
+
+<h3>5.2.1 What we want, and the obvious thing to try</h3>
+
+<p>Now change the setting. You have a pile of teleoperated demonstrations and want a policy that reproduces them. Call the demonstrator's policy \(\pi_\beta\) &mdash; the distribution over actions a human actually produced at each observation. The obvious thing to try is <strong>behavior cloning</strong>: keep the Gaussian head, train \(\mu_\theta(o)\) by minimizing squared error to the demonstrated action. With \(\sigma\) fixed that is exactly maximum-likelihood training of the Gaussian &mdash; the principled fit, not a hack.</p>
+
+<p>That equivalence is load-bearing, so look back at the log-density a few paragraphs up and check it. With every \(\sigma_j\) held fixed, the only term on the right-hand side that depends on \(\mu\) at all is \(-\big(a_j - \mu_{\theta,j}(o)\big)^2 / \big(2\sigma_j^2\big)\); the \(-\log \sigma_j\) and the constant do not move when \(\mu\) moves. Making the data as likely as possible under the Gaussian and making the squared error as small as possible are therefore the same optimization, term for term, differing only by a positive scale factor and a sign. <strong>Maximum likelihood</strong>, if the phrase is new to you, just means choosing the parameters that assign the highest probability to the data you actually collected. So the squared-error loss you have been using out of habit is not an arbitrary choice of distance &mdash; it is a distributional claim, and the rest of this section is about what that claim costs.</p>
+
+<h3>5.2.2 Exactly how and why it fails</h3>
+
+<p>Put a mug on the table, handle pointing away from the robot, and have a human teleoperate a grasp ten times. On roughly half the attempts the operator swings the gripper around the left of the mug; on the other half, around the right. Both work, and the operator is indifferent. No feature in the camera image predicts the choice, because the choice does not depend on the image.</p>
+
+<p>So the demonstrated distribution \(\pi_\beta(a \mid o)\) here has two <strong>modes</strong> &mdash; two separate peaks, with a valley between them where almost no demonstration lives. Fit a unimodal Gaussian to it by maximum likelihood and here is what you get.</p>
+
+<div class="key-eq">\[
+\mu^\star(o) \;=\; \arg\min_{\mu}\; \mathbb{E}_{a \sim \pi_\beta(\cdot \mid o)}\Big[\,\big\lVert a - \mu \big\rVert^2\,\Big] \;=\; \mathbb{E}_{a \sim \pi_\beta(\cdot \mid o)}\big[\,a\,\big]
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+Read it right to left. \(\pi_\beta(\cdot \mid o)\) is the distribution of actions the human produced at this observation \(o\), and \(a\) is one such action, so \(\mathbb{E}_{a \sim \pi_\beta}[\,a\,]\) is the plain average of all demonstrated actions there. The middle expression is what behavior cloning minimizes: the expected squared distance \(\lVert a - \mu\rVert^2\) between a demonstrated action and the mean \(\mu\) your network outputs. \(\mu^\star(o)\) is the \(\mu\) making that as small as possible. The equation says these are the same thing: under squared error, the best mean is the average of the data. That is the exact optimum, not poor optimization &mdash; more data only makes your network hit it more precisely.
+</div>
+
+<h3>5.2.3 Worked example: the mean lands in the mug</h3>
+
+<p>Now with real numbers. Reduce the grasp to a scalar: the approach angle \(a\), normalized so \(a = -1\) is "swing left", \(a = +1\) is "swing right", \(a = 0\) is "straight at the mug". Six demonstrations, three of each, with a little human variation.</p>
+
+<pre class="code">demonstrated actions at observation o:
+  left  swings:  -1.2   -1.0   -0.8
+  right swings:  +0.8   +1.0   +1.2</pre>
+
+<p>The maximum-likelihood Gaussian has mean equal to the sample average:</p>
+
+<p>\[ \mu^\star = \frac{(-1.2) + (-1.0) + (-0.8) + (0.8) + (1.0) + (1.2)}{6} = \frac{0.0}{6} = 0.0 \]</p>
+
+<p>Now let the Gaussian fit its width too, rather than holding \(\sigma\) fixed the way the behavior-cloning setup above did. Both fits give the same \(\mu^\star\), so nothing you just computed changes; you are simply asking for one more number. The maximum-likelihood \(\sigma^2\) is the average squared deviation from that mean:</p>
+
+<p>\[ \sigma^2 = \frac{1.44 + 1.00 + 0.64 + 0.64 + 1.00 + 1.44}{6} = \frac{6.16}{6} = 1.0267 \]</p>
+
+<p>\[ \sigma = \sqrt{1.0267} = 1.0132 \]</p>
+
+<p>So the fitted policy is \(\mathcal{N}(0.0,\, 1.0132^2)\). Its most likely action &mdash; what you get with exploration noise off, as at deployment &mdash; is \(a = 0.0\): straight into the mug, and the action <em>furthest</em> from every demonstration you collected, the nearest being \(0.8\) away.</p>
+
+<p>Now ask how often the noisy policy is safe. Say the mug body occupies the band \(\lvert a \rvert \lt 0.6\), so any sample inside collides. Measure the edge of that band in standard deviations from the mean:</p>
+
+<p>\[ \frac{0.6 - 0.0}{1.0132} = 0.5922 \]</p>
+
+<p>Write \(\Phi\) for the standard normal <strong>cumulative distribution function</strong> &mdash; the probability that a standard normal draw lands below a given point. Any normal table gives \(\Phi(0.5922) \approx 0.7231\), and so does <code>scipy.stats.norm.cdf(0.5922)</code>. The mug band is symmetric about the mean, so the mass inside it is the mass below the upper edge minus the mass below the lower edge:</p>
+
+<p>\[ P\big(\lvert a \rvert \lt 0.6\big) = \Phi(0.5922) - \Phi(-0.5922) \]</p>
+
+<p>You only looked up one of those two numbers, and you do not need the other: a standard normal is symmetric about zero, so \(\Phi(-x) = 1 - \Phi(x)\) for any \(x\). The second term is therefore \(1 - 0.7231\), which leaves</p>
+
+<p>\[ P\big(\lvert a \rvert \lt 0.6\big) = 0.7231 - \big(1 - 0.7231\big) = 2 \times 0.7231 - 1 = 0.4462 \]</p>
+
+<p>About <strong>45% of sampled actions crash into the mug</strong>, and the mode of the policy is the worst action available &mdash; while the training loss sits at its global minimum. That is the part that catches people: the fit is perfect and the policy is unusable.</p>
+
+<h3>5.2.4 The same failure with two arms</h3>
+
+<p>The mug is a toy; bimanual manipulation makes this the default condition. When two arms fold a shirt, sometimes the left reaches across and leads while the right stabilizes the hem, and sometimes it is the reverse. Both are fine and both appear in the data. The average is "both arms half-leading", so both reach for the center of the table at once and collide over the garment.</p>
+
+<p>Say the general form out loud, because the chapter turns on it: <strong>mode averaging does not produce a mediocre action, it produces an action that appears in no demonstration at all.</strong> A mediocre action would be recoverable. This one is off the <strong>data manifold</strong> &mdash; away from the thin region of action space where your demonstrations actually live &mdash; and off the manifold you have collected no evidence at all about what happens next, so the network's output there is extrapolation dressed up as a prediction (Figure 5.1).</p>
+
+<figure><svg viewBox="0 0 700 246" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch05f1arrG" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4a8a5c"/></marker>
+<marker id="ch05f1arrR" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#b04a4a"/></marker>
+</defs>
+<text x="170" y="22" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">Two valid demo modes</text>
+<circle cx="170" cy="50" r="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="182" y="54" font-family="Noto Sans" font-size="11" fill="#666">start</text>
+<rect x="130" y="150" width="80" height="48" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="170" y="178" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">mug</text>
+<path d="M 170 58 C 90 70, 70 128, 122 160" fill="none" stroke="#4a8a5c" stroke-width="2" marker-end="url(#ch05f1arrG)"/>
+<text x="60" y="110" font-family="Noto Sans" font-size="11" fill="#4a8a5c">mode A</text>
+<path d="M 170 58 C 250 70, 270 128, 218 160" fill="none" stroke="#4a8a5c" stroke-width="2" marker-end="url(#ch05f1arrG)"/>
+<text x="252" y="110" font-family="Noto Sans" font-size="11" fill="#4a8a5c">mode B</text>
+<line x1="170" y1="58" x2="170" y2="142" stroke="#b04a4a" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ch05f1arrR)"/>
+<text x="176" y="100" font-family="Noto Sans" font-size="11" fill="#b04a4a">mean</text>
+<text x="170" y="220" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b04a4a">invalid: hits the mug</text>
+<text x="537" y="22" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">Action density at this observation</text>
+<line x1="390" y1="180" x2="685" y2="180" stroke="#666" stroke-width="1"/>
+<path d="M 395 179 C 425 179 430 85 455 85 C 480 85 495 176 535 176 C 575 176 590 85 615 85 C 640 85 645 179 675 179" fill="#eaf1f8" stroke="#4878a8" stroke-width="2"/>
+<path d="M 400 179 C 470 175 480 120 535 120 C 590 120 600 175 670 179" fill="none" stroke="#b0703a" stroke-width="2"/>
+<circle cx="535" cy="178" r="4" fill="#b04a4a"/>
+<text x="450" y="72" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4878a8">demos (two modes)</text>
+<text x="535" y="110" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b0703a">Gaussian fit</text>
+<line x1="455" y1="180" x2="455" y2="186" stroke="#666" stroke-width="1"/>
+<line x1="535" y1="180" x2="535" y2="186" stroke="#666" stroke-width="1"/>
+<line x1="615" y1="180" x2="615" y2="186" stroke="#666" stroke-width="1"/>
+<text x="455" y="198" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">a = &minus;1.0</text>
+<text x="535" y="198" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">a = 0</text>
+<text x="615" y="198" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">a = +1.0</text>
+<text x="535" y="216" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b04a4a">mean falls in the valley</text>
+<text x="537" y="236" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">action a (approach angle, normalized)</text>
+</svg><figcaption>Figure 5.1 &mdash; Mode averaging, seen two ways. On the left, two demonstrated grasp trajectories go around opposite sides of the mug while the Gaussian mean (dashed red) drives straight into it. On the right, the same failure as densities: blue is the demonstrated distribution with its two peaks, orange the best-fitting single Gaussian, its mean at \(a = 0\) where the data has no mass. Notice the fit is not sloppy &mdash; it is optimal, and that is the problem.</figcaption></figure>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Three things that look like fixes and are not. <em>Widening \(\sigma\)</em> does not help: a wider bell still peaks in the valley. <em>More demonstrations</em> makes it worse &mdash; more data means a more accurate mean, and the mean is the broken part. <em>Watching the loss</em> tells you nothing, because the squared-error minimizer <em>is</em> the conditional mean; the curve looks textbook while the robot fails. The diagnostic that works: plot the demonstrated actions at a fixed observation and count the clusters.
+</div>
+
+<h2>5.3 Action chunks, and why they make this worse</h2>
+
+<h3>5.3.1 What a chunk is and why it exists</h3>
+
+<p>Modern imitation policies do not emit one action at a time. They emit an <strong>action chunk</strong> \(a_{t:t+H}\) &mdash; the next \(H\) actions produced as a single output, then executed for some number of steps before the policy is queried again (Zhao et al., 2023). The \(\pi\)-family uses \(H = 50\) at 50 Hz, one second of motion per query; the LeHome fine-tune uses \(H = 30\) at 30 Hz, also one second. How many of those \(H\) actions you execute before re-querying is a separate knob, and it belongs to Chapter 12.</p>
+
+<p>There are three reasons chunking won, and each is worth stating separately. There is also one cost, which the three benefits tend to hide, so it gets a paragraph of its own at the end.</p>
+
+<p><strong>Temporal consistency.</strong> A policy re-sampled fifty times a second can flip between mode A and mode B mid-reach: left, left, right, left. On a physical arm that dithering looks like a seizure. A chunked policy commits to one coherent motion.</p>
+
+<p><strong>Latency amortization.</strong> A 3-billion-parameter model does not run in the 33 ms budget of a 30 Hz loop. Suppose one query takes 100 ms. Querying every step is impossible. Query once and then execute all 30 actions and you spend 100 ms of compute per 1000 ms of motion &mdash; a 10% duty cycle, which one GPU holds comfortably. Execute fewer and the duty cycle rises in proportion: run 10 of the 30 before re-querying and you are querying three times as often, for 30% of the wall clock.</p>
+
+<p><strong>Fewer places for error to compound.</strong> Behavior cloning drifts because each small error moves you to a slightly unfamiliar state, where you make a larger error. Chunking cuts decision points per second by however many actions you execute per query &mdash; a factor of \(H\) if you run the whole chunk, less if you re-query early &mdash; and so cuts the chances for that loop to start.</p>
+
+<p><strong>What it costs.</strong> None of this is free, and the bill is paid in reactivity. Committing to a stretch of motion means not looking at the world for the duration of that stretch. If the grasp slips at step 4 of a 30-step commitment, or a human nudges the shirt, the policy plays out the remaining 26 actions anyway, because it has nothing newer to condition on. That is the open-loop cost, and it scales with exactly the same number that buys you the three benefits above. It is why real systems execute only part of each chunk before re-querying with a fresh observation &mdash; LeHome executes 3 to 5 of its 30 &mdash; and it is why Chapter 12 exists: choosing that execution length is choosing where to sit between smooth committed motion and fast reaction.</p>
+
+<h3>5.3.2 The arithmetic, and why it raises the stakes</h3>
+
+<p>A second, shorter worked example. The bimanual SO-101 has two 6-DOF arms, so \(d = 12\) joint commands per timestep, with \(H = 30\).</p>
+
+<p>\[ \text{chunk dimension} \;=\; H \times d \;=\; 30 \times 12 \;=\; 360 \]</p>
+
+<p>One decision is a single point in a 360-dimensional space. Now count modes. Suppose one second of folding contains three moments where two choices are equally good: which arm leads, which sleeve goes first, and whether the grasp is a pinch or a scoop. If the choices are independent, the number of distinct valid chunks is</p>
+
+<p>\[ 2 \times 2 \times 2 \;=\; 2^3 \;=\; 8 \]</p>
+
+<p>Eight widely separated peaks in a 360-dimensional space, and the Gaussian's answer is their average, a point near none of them. Single-step multimodality gave you a bad action; chunk-level multimodality gives you a bad <em>second</em>.</p>
+
+<p>File away one more consequence, because Section 5.7 and Chapter 9 both come back to it: inside a chunk there is no per-timestep action distribution. The model produced 360 numbers in one shot, so there is no \(\pi_\theta(a_t \mid s_t)\) for the seventeenth action &mdash; it was never separately chosen.</p>
+
+<h2>5.4 What a generative model actually is</h2>
+
+<h3>5.4.1 The obvious repairs, and where they stop</h3>
+
+<p>Try the two repairs any engineer thinks of first.</p>
+
+<p><strong>Repair one: a mixture of Gaussians.</strong> Output \(M\) means, widths, and mixing weights; sample a component, then a value. This genuinely fixes the mug, but you must pick \(M\) in advance, and in 360 dimensions where the mode count varies by observation, any fixed \(M\) is wrong somewhere.</p>
+
+<p><strong>Repair two: discretize.</strong> Chop each action dimension into bins and predict a categorical distribution per dimension &mdash; a classification problem, which you know how to train. Per dimension this is beautifully multimodal: joint 1 can put half its mass on "left" and half on "right". But the dimensions are predicted independently, so the model's distribution is their product, and a product that says half-left/half-right for both joints also puts a quarter of its mass on "joint 1 left, joint 2 right" &mdash; a chimera that appears in no demonstration.</p>
+
+<p>That failure is instructive: what is missing is <em>coupling</em>. Once you commit to "left", every other number in the chunk must follow suit. Hold that thought &mdash; Sections 5.5 and 5.6 buy coupling in two different ways.</p>
+
+<p>Chapter 6 opens by taking these same two repairs apart in more detail and adding a third, going autoregressive one dimension at a time. That repetition is deliberate. Here the repairs exist to isolate the word <em>coupling</em>, which is what Section 5.6 is about; there they exist to motivate diffusion specifically. If the arguments feel familiar when you meet them again in twenty pages, you have not missed a distinction &mdash; you are meant to already agree with them.</p>
+
+<h3>5.4.2 The definition</h3>
+
+<p>A <strong>generative model</strong> is a model whose output is a <em>sample</em> from a complicated distribution, produced by transforming a simple random draw. You already know how to build a network mapping an input to an output; a generative model also takes a random input &mdash; noise &mdash; arranged so that as the noise varies over its simple distribution, the output varies over the complicated one you want.</p>
+
+<div class="key-eq">\[
+z \sim \mathcal{N}(0, I), \qquad a \;=\; T_\theta(z,\, o), \qquad a \;\sim\; \pi_\theta(\cdot \mid o)
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+Three steps of a recipe. First, draw \(z\): a vector of independent standard normal numbers, the same shape as the action chunk you want &mdash; 360 numbers for the bimanual SO-101. \(\mathcal{N}(0,I)\) means mean zero, unit variance, no correlations, the one distribution every library samples in a single line. Second, push \(z\) through \(T_\theta\), a network with parameters \(\theta\) that also sees the observation \(o\), and call the output \(a\). The letter \(T\) stands for <em>transport</em>; the second framing in this section says why. Third &mdash; a definition, not a computation &mdash; the policy \(\pi_\theta(\cdot \mid o)\) simply <em>is</em> whatever distribution \(a\) has when \(z\) is random. You never write a formula for \(\pi_\theta\); you define it by saying how to draw from it. Section 5.1 went the other way round: there you wrote the density formula first and a way to sample fell out of it. Here you write the sampler first, and the density is whatever that sampler happens to produce. That is a real trade, and Section 5.7 is the bill.
+</div>
+
+<p>You have already built one of these, in Section 5.1. The Gaussian policy draws \(z \sim \mathcal{N}(0,I)\) and returns \(a = \mu_\theta(o) + \sigma \odot z\), which is exactly the recipe above with \(T_\theta(z, o) = \mu_\theta(o) + \sigma \odot z\). So the difference between a Gaussian policy and a diffusion policy is not that one is generative and the other is not. Both are generative models. The Gaussian simply uses the simplest possible generator: stretch the noise ball along each axis, slide it to \(\mu_\theta(o)\), stop. A ball stretched and slid is still a single connected ball, which is precisely why it cannot cover two separated blobs with a gap between them. Everything in Chapters 6 and 7 is about making \(T_\theta\) richer than an affine map, and Section 5.6 is about why that turns out to be hard to do in one step.</p>
+
+<h3>5.4.3 Two ways to hold the idea in your head</h3>
+
+<p><strong>Framing one: sampler versus density.</strong> There are two different things you might want from a probability model: to <em>draw</em> from it &mdash; give me a plausible action &mdash; or to <em>evaluate</em> it &mdash; here is an action, how likely was it? The Gaussian gave you both, which is why it never occurred to you these were separate abilities. They are. A generative model gives you the first and not, cheaply, the second. For control the first is what you need: acting means producing an action, not scoring one. Density evaluation was never for the robot; it was for the RL algorithm. That is the bill Section 5.7 hands you.</p>
+
+<p><strong>Framing two: transport.</strong> Picture a cloud of noise points, a fuzzy ball at the origin, and elsewhere in the same space the cloud of real demonstrated chunks &mdash; lumpy, several separated blobs. A generative model is a rule for <em>moving</em> the first cloud onto the second: every noise point is carried to a data-like point, and if the rule is right the moved cloud matches the data cloud, blobs and all. Nothing is left in the valley.</p>
+
+<div class="box jargon"><div class="box-title">Words you will hear</div>
+<strong>Generative model</strong> &mdash; any model you can draw new samples from, as opposed to one that predicts a label or a number. <strong>Latent</strong> &mdash; the random input \(z\); "latent space" is where it lives. <strong>Mode</strong> &mdash; a local peak of a distribution, one distinct way of doing the task; <strong>unimodal</strong> means one peak, <strong>multimodal</strong> several. <strong>Mode collapse</strong> &mdash; a sampler that only ever produces one mode. <strong>Density</strong> (or likelihood) &mdash; the number \(\pi_\theta(a\mid o)\); a model is "likelihood-free" when it can sample but not compute this. <strong>Denoiser</strong> &mdash; a network trained to remove noise from a corrupted input; Chapter 6 turns one into a sampler.
+</div>
+
+<h3>5.4.4 An analogy, and where it breaks</h3>
+
+<p>Think of two programs in a manufacturing pipeline. One is the <strong>stamping machine</strong>: press a button, a part comes out. The other is the <strong>QA inspector</strong>: hand it a part, it returns a score. Different interfaces, and you cannot in general build one from the other. The machine is the sampler; the inspector is the density. If your job is to make parts you need the machine, and being unable to score a part is no obstacle.</p>
+
+<p><strong>Where the analogy breaks.</strong> A real stamping machine's virtue is that every part is identical &mdash; variation is the defect. A generative model's virtue is the opposite: it must produce variation, in the proportions the data shows. Keep the interface half of the analogy; throw away the uniformity half.</p>
+
+<h2>5.5 The landscape in one page</h2>
+
+<p>Generative modeling is a large field and you do not need most of it. You need enough of the map that paper titles stop being opaque. Six families, and Figure 5.2 lays them out along the two axes that matter here: what each one learns from, and what each one costs you.</p>
+
+<p><strong>Variational autoencoders (VAEs)</strong> (Kingma &amp; Welling, 2014). An encoder maps a data point to a small latent \(z\), a decoder maps \(z\) back, and the training signal is reconstruction error plus a penalty keeping the latent close to \(\mathcal{N}(0,I)\). Sampling is one cheap pass. The cost: the reconstruction term is a squared error, so samples come out blurred. You have met one already, since ACT, the action-chunking transformer, is a conditional VAE (Zhao et al., 2023). ACT works well in practice despite the blurring, because the chunk structure and a narrow per-task dataset do much of the disambiguating for it &mdash; which is why LeRobot still ships it and why you will see it succeed on your own bench. But the blurring is real, it is worst exactly where the demonstrations are most ambiguous, and it is why the field kept looking.</p>
+
+<p><strong>Generative adversarial networks (GANs)</strong> (Goodfellow et al., 2014). A generator turns noise into samples; a discriminator tries to tell real from generated; the generator's signal is "fool the discriminator." Samples are sharp, sampling is one pass. The cost is the adversary: a two-player game that oscillates and frequently collapses onto a single mode &mdash; the exact failure you were escaping.</p>
+
+<p><strong>Autoregressive / token models.</strong> Chop the action into discrete tokens, then predict them one at a time with cross-entropy, each conditioned on all previous ones. The signal is next-token prediction &mdash; the most reliable objective in modern machine learning &mdash; and because each token sees the earlier ones, Section 5.4's coupling problem disappears. The costs: a tokenizer that discretizes continuous actions without destroying precision, and sequential generation. <strong>This branch is live, not historical.</strong> RT-2 (Brohan et al., 2023) put robot actions in a language model's vocabulary, \(\pi_{0.5}\) uses the FAST action tokenizer throughout pre-training (Physical Intelligence, 2025a), and LeHome keeps FAST tokens in its prefix to shape the representation during training (Larchenko, 2026).</p>
+
+<p><strong>Energy-based / implicit models</strong> (Florence et al., 2021, for the robotics version). Learn a scalar \(E_\theta(o, a)\) &mdash; low energy means good action &mdash; and define the distribution as proportional to \(\exp(-E_\theta)\). Natively multimodal: put low energy on two separate regions and you are done. The cost lands on sampling, which needs either an optimizer or MCMC &mdash; Markov chain Monte Carlo: draw a sample by running a random walk that slowly settles into the distribution you want. Either way you are running an inner search loop for every single action, which is elegant on paper and awkward on a robot with a 33 ms budget.</p>
+
+<p><strong>Diffusion models</strong> (Ho et al., 2020; brought to manipulation by Chi et al., 2023). Corrupt data with noise at many levels, train a network to undo the corruption with a plain regression loss, then generate by starting from pure noise and denoising repeatedly. Training is stable supervised regression, and the sampler is genuinely multimodal on continuous outputs. The cost is many sequential network calls. Chapter 6 builds it from scratch.</p>
+
+<p><strong>Flow matching</strong> (Lipman et al., 2023). Same spirit, but along near-straight paths, which simplifies the target and lets far fewer steps suffice. Chapter 7 builds it; it is what the \(\pi\)-family and LeHome use.</p>
+
+<figure><svg viewBox="0 0 700 300" width="700" xmlns="http://www.w3.org/2000/svg">
+<rect x="12" y="18" width="118" height="32" rx="6" fill="#f2f2f2" stroke="#999"/>
+<rect x="134" y="18" width="286" height="32" rx="6" fill="#f2f2f2" stroke="#999"/>
+<rect x="424" y="18" width="264" height="32" rx="6" fill="#f2f2f2" stroke="#999"/>
+<text x="20" y="39" font-family="Noto Sans" font-size="11" font-weight="bold" fill="#333">family</text>
+<text x="142" y="39" font-family="Noto Sans" font-size="11" font-weight="bold" fill="#333">what it learns from (training signal)</text>
+<text x="432" y="39" font-family="Noto Sans" font-size="11" font-weight="bold" fill="#333">what it costs you</text>
+
+<rect x="12" y="54" width="118" height="36" rx="6" fill="#f7f9fb" stroke="#bbb"/>
+<rect x="134" y="54" width="286" height="36" rx="6" fill="#f7f9fb" stroke="#bbb"/>
+<rect x="424" y="54" width="264" height="36" rx="6" fill="#f7f9fb" stroke="#bbb"/>
+<text x="20" y="77" font-family="Noto Sans" font-size="11" fill="#333">VAE</text>
+<text x="142" y="77" font-family="Noto Sans" font-size="11" fill="#333">reconstruct data, keep latent Gaussian</text>
+<text x="432" y="77" font-family="Noto Sans" font-size="11" fill="#333">samples come out averaged</text>
+
+<rect x="12" y="94" width="118" height="36" rx="6" fill="#f7f9fb" stroke="#bbb"/>
+<rect x="134" y="94" width="286" height="36" rx="6" fill="#f7f9fb" stroke="#bbb"/>
+<rect x="424" y="94" width="264" height="36" rx="6" fill="#f7f9fb" stroke="#bbb"/>
+<text x="20" y="117" font-family="Noto Sans" font-size="11" fill="#333">GAN</text>
+<text x="142" y="117" font-family="Noto Sans" font-size="11" fill="#333">fool a discriminator network</text>
+<text x="432" y="117" font-family="Noto Sans" font-size="11" fill="#333">unstable; mode collapse</text>
+
+<rect x="12" y="134" width="118" height="36" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+<rect x="134" y="134" width="286" height="36" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+<rect x="424" y="134" width="264" height="36" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+<text x="20" y="157" font-family="Noto Sans" font-size="11" fill="#333">autoregressive</text>
+<text x="142" y="157" font-family="Noto Sans" font-size="11" fill="#333">next-token prediction, cross-entropy</text>
+<text x="432" y="157" font-family="Noto Sans" font-size="11" fill="#333">tokenizer; one pass per token</text>
+
+<rect x="12" y="174" width="118" height="36" rx="6" fill="#f7f9fb" stroke="#bbb"/>
+<rect x="134" y="174" width="286" height="36" rx="6" fill="#f7f9fb" stroke="#bbb"/>
+<rect x="424" y="174" width="264" height="36" rx="6" fill="#f7f9fb" stroke="#bbb"/>
+<text x="20" y="197" font-family="Noto Sans" font-size="11" fill="#333">energy-based</text>
+<text x="142" y="197" font-family="Noto Sans" font-size="11" fill="#333">score actions against negatives</text>
+<text x="432" y="197" font-family="Noto Sans" font-size="11" fill="#333">sampling needs search</text>
+
+<rect x="12" y="214" width="118" height="36" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+<rect x="134" y="214" width="286" height="36" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+<rect x="424" y="214" width="264" height="36" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+<text x="20" y="237" font-family="Noto Sans" font-size="11" fill="#333">diffusion</text>
+<text x="142" y="237" font-family="Noto Sans" font-size="11" fill="#333">denoise data at many noise levels</text>
+<text x="432" y="237" font-family="Noto Sans" font-size="11" fill="#333">many steps (Chapter 6)</text>
+
+<rect x="12" y="254" width="118" height="36" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+<rect x="134" y="254" width="286" height="36" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+<rect x="424" y="254" width="264" height="36" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+<text x="20" y="277" font-family="Noto Sans" font-size="11" fill="#333">flow matching</text>
+<text x="142" y="277" font-family="Noto Sans" font-size="11" fill="#333">regress a velocity toward data</text>
+<text x="432" y="277" font-family="Noto Sans" font-size="11" fill="#333">a few steps (Chapter 7)</text>
+</svg><figcaption>Figure 5.2 &mdash; The six families, by what they learn from and what that costs. Green marks the two robotics converged on; orange marks the other live branch, token models, which you meet inside \(\pi_{0.5}\)'s pre-training. Notice the deciding factor is the middle column, not sample quality: stable training signals won.</figcaption></figure>
+
+<p>So why did robot learning converge on diffusion and flow matching? Training is ordinary supervised regression, multimodality is native with no fixed mode count, and they work directly on continuous chunks &mdash; no tokenizer, no precision lost to binning. Sample quality also degrades gracefully as you cut steps, giving you a real-time knob instead of a cliff.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+LeRobot ships all of this as trainable policy classes: <code>act</code> (the conditional VAE), <code>diffusion</code>, and the flow-matching <code>pi0</code> ports, alongside the SAC-with-Gaussian policy HIL-SERL runs today. Two evenings. First, measure your own multimodality &mdash; but condition, or you measure the wrong thing. Use the first timestep of each SO-101 cube episode, where the arm is at home and the observation is near-identical across takes, or group episodes by matched cube pose. Scatter-plot the recorded action within that group: two clusters are two ways of doing one thing. Spread from the cube sitting somewhere different each take is initial-condition variation, not this chapter's multimodality. Second, train <code>diffusion</code> on those episodes and read its config for <code>horizon</code> and the denoising-step count.
+</div>
+
+<h2>5.6 Why iterative refinement</h2>
+
+<h3>5.6.1 The obvious generative model, and why it struggles</h3>
+
+<p>Take the definition from Section 5.4 literally: build one network, feed it \(z\) and \(o\), have it output all 360 numbers of the chunk in one forward pass. Why did the field not stop there?</p>
+
+<p>The trouble is what that single function must do. The noise \(z\) lives in a smooth, connected ball; the data lives in several separated blobs. So \(T_\theta\) must tear the ball into pieces, mapping one region of noise space to blob A and a neighboring region to blob B with nothing in between &mdash; changing extremely fast across the boundary. Networks trained by gradient descent are biased toward smooth functions, so asking one to be nearly discontinuous in 360 dimensions is asking against the grain.</p>
+
+<p>The training signal makes it worse. Train \(T_\theta\) by squared error and you are back in Section 5.2: the optimum averages. Train it against a discriminator and you have a GAN. A sharp, multimodal answer in one pass needs an adversary or a trick.</p>
+
+<h3>5.6.2 The fix: many small steps</h3>
+
+<p>The trick that won is <strong>iterative refinement</strong>. Instead of one big commitment the model makes \(K\) small edits: it starts at pure noise and, at each step, looks at where it is and nudges it toward being more data-like.</p>
+
+<div class="key-eq">\[
+a^{(0)} = z \sim \mathcal{N}(0, I), \qquad a^{(k+1)} \;=\; a^{(k)} \;+\; \Delta_\theta\big(a^{(k)},\, k,\, o\big), \qquad k = 0, 1, \ldots, K-1
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+\(a^{(k)}\) is the candidate action chunk after \(k\) edits &mdash; a full 360-number chunk at every stage, starting as garbage and ending as a real motion. The parenthesized superscript counts refinement steps; it has nothing to do with the environment timestep \(t\), and confusing the two is the most common beginner error here. \(a^{(0)} = z\) says step zero is a fresh draw of Gaussian noise. \(\Delta_\theta\) is the network: it takes the current candidate, the step index \(k\) so it knows how far along it is, and the observation \(o\), and returns a small correction of the same shape. \(K\) is how many edits you make &mdash; ten, in the \(\pi\)-family &mdash; and the chunk you execute is \(a^{(K)}\).
+</div>
+
+<h3>5.6.3 Why the fix works</h3>
+
+<p>Four reasons, and the third is the one that people quite reasonably refuse to accept on faith.</p>
+
+<p><strong>Each step asks an easy question.</strong> The one-shot model had to answer "which of the eight valid chunks should this noise vector become?" The refinement model only answers "given where I am now, which direction is slightly more data-like?" Near any particular point that is usually unambiguous &mdash; if you have already drifted toward the left-arm-leads region, the local answer is "keep going left." A locally unimodal question has a well-defined average answer, so a plain regression loss is a correct training signal, and training stays stable.</p>
+
+<p><strong>The commitment is carried in the state.</strong> Section 5.4's coupling problem dissolves, because the model reads \(a^{(k)}\) at every step. Once the first few edits lean the chunk toward "left arm leads", every later edit sees that lean in its input and stays consistent.</p>
+
+<p><strong>What breaks the tie at the very first step.</strong> The paragraph above explains why later steps stay consistent once the chunk has already leaned one way. It does not explain what makes it lean in the first place, and that is the honest objection: at step zero the candidate is pure noise, so is the "slightly more data-like direction" there not just an average over all eight modes &mdash; the exact Section 5.2 failure you just learned to fear? The answer is that \(z\) is not a coin flip you are averaging over. It is 360 numbers, and the network reads every one of them. The question it is asked is never "what is the average of all valid chunks"; it is "starting from <em>this particular</em> noise vector, which way is more data-like?" Two draws are two different starting points in a 360-dimensional space, and different starting points already sit nearer different modes, so their conditional averages genuinely point in different directions. The noise carries information, and the model is conditioned on it from the first step to the last.</p>
+
+<p>Now the caveat, because that argument is not airtight at the very beginning. Extremely close to step zero the noise really is close to uninformative about which mode is nearer, and the network's answer really is close to a blend of the directions toward all of them. What rescues it is that a blend of <em>directions</em> is a different object from a blend of <em>actions</em>: an early step that points broadly "toward the data" is correct for every mode at once, and it moves the candidate, and once the candidate has moved the modes are no longer symmetric around it. Working that out precisely takes a two-mode example with numbers in it, and Chapter 7 does exactly that &mdash; it is the right place for it, because flow matching's training target is a velocity you can write down and average by hand. Take this reason on trust for one more chapter; you will get the arithmetic.</p>
+
+<p><strong>Coarse-to-fine comes for free.</strong> Early steps, on near-pure noise, can only decide which region of chunk space we head for; later steps fine-tune details. Neither behavior had to be designed; both fall out of feeding the candidate back in.</p>
+
+<pre class="code"># (1) one shot: the network must commit immediately
+mu = net(o)                          # (H, d) -- the whole chunk at once
+a  = mu + sigma * normal(0, 1, mu.shape)   # noise added AFTER the decision
+# that noise cannot move `a` between modes; it only blurs the valley point
+
+# (2) iterative refinement: K chances to change its mind
+a = normal(0, 1, (H, d))             # pure noise: 360 numbers, not a coin flip
+for k in range(K):                   # K is small -- 10 in the pi-family
+    a = a + delta_theta(a, k, o)     # reads the CURRENT a, so the draw steers it
+return a                             # the chunk a_{t:t+H}</pre>
+
+<p>Figure 5.3 puts the two side by side.</p>
+
+<figure><svg viewBox="0 0 700 300" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch05f3arrR" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#b04a4a"/></marker>
+<marker id="ch05f3arrN" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#666"/></marker>
+<marker id="ch05f3arrB" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4878a8"/></marker>
+<marker id="ch05f3arrG" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4a8a5c"/></marker>
+</defs>
+<rect x="10" y="30" width="330" height="258" rx="6" fill="none" stroke="#ccc"/>
+<rect x="360" y="30" width="330" height="258" rx="6" fill="none" stroke="#ccc"/>
+<text x="175" y="22" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">one shot: commit immediately</text>
+<text x="525" y="22" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333">iterative refinement: K small steps</text>
+
+<rect x="60" y="46" width="230" height="30" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+<text x="175" y="66" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">observation o, noise draw z</text>
+<line x1="175" y1="76" x2="175" y2="94" stroke="#666" stroke-width="1.2" marker-end="url(#ch05f3arrN)"/>
+<rect x="60" y="98" width="230" height="32" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+<text x="175" y="119" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">one forward pass of the network</text>
+<line x1="175" y1="132" x2="175" y2="232" stroke="#b04a4a" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ch05f3arrR)"/>
+<path d="M 30 244 C 62 244 78 186 105 186 C 132 186 148 241 175 241 C 202 241 218 186 245 186 C 272 186 288 244 320 244" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<circle cx="175" cy="241" r="5" fill="#b04a4a"/>
+<text x="105" y="178" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#4878a8">mode A</text>
+<text x="245" y="178" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#4878a8">mode B</text>
+<text x="175" y="264" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b04a4a">lands in the valley</text>
+<text x="175" y="279" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">(no demo looks like this)</text>
+
+<text x="525" y="46" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">two noise draws</text>
+<circle cx="505" cy="58" r="5" fill="#f2f2f2" stroke="#666"/>
+<circle cx="545" cy="58" r="5" fill="#f2f2f2" stroke="#666"/>
+<polyline points="505,64 496,86 487,110 478,134 470,156 462,172 456,182" fill="none" stroke="#4878a8" stroke-width="2" marker-end="url(#ch05f3arrB)"/>
+<circle cx="496" cy="86" r="2.5" fill="#4878a8"/><circle cx="487" cy="110" r="2.5" fill="#4878a8"/>
+<circle cx="478" cy="134" r="2.5" fill="#4878a8"/><circle cx="470" cy="156" r="2.5" fill="#4878a8"/>
+<polyline points="545,64 554,86 563,110 572,134 580,156 588,172 594,182" fill="none" stroke="#4a8a5c" stroke-width="2" marker-end="url(#ch05f3arrG)"/>
+<circle cx="554" cy="86" r="2.5" fill="#4a8a5c"/><circle cx="563" cy="110" r="2.5" fill="#4a8a5c"/>
+<circle cx="572" cy="134" r="2.5" fill="#4a8a5c"/><circle cx="580" cy="156" r="2.5" fill="#4a8a5c"/>
+<text x="400" y="104" font-family="Noto Sans" font-size="10" fill="#666">K small steps</text>
+<path d="M 380 244 C 412 244 428 186 455 186 C 482 186 498 241 525 241 C 552 241 568 186 595 186 C 622 186 638 244 670 244" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="455" y="172" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#4878a8">mode A</text>
+<text x="595" y="172" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#4878a8">mode B</text>
+<text x="525" y="264" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4a8a5c">different z, different mode</text>
+<text x="525" y="279" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">nothing is averaged</text>
+</svg><figcaption>Figure 5.3 &mdash; One shot versus many steps, against the same two-mode action density. On the left, a single forward pass must answer immediately, and a squared-error signal drives it to the average: the red dot in the valley. On the right, each step re-reads the current candidate before nudging it, so the path bends toward whichever mode it has drifted into. The two draws end in different modes because every step is conditioned on the current candidate, and that candidate still carries the 360-number noise vector it started from &mdash; the tie-break argued just above, and calculated in Chapter 7.</figcaption></figure>
+
+<h3>5.6.4 Sculpting versus printing</h3>
+
+<p>Printing is one-shot: set the plate, press once, and whatever was on the plate is what you get. If the plate is wrong the print is wrong, and there is no intermediate state where you could have noticed. Sculpting is iterative: start from a rough block, take a small pass, step back and look, take the next pass based on that. Each pass is a small, local, low-risk decision, and the global shape emerges from the sequence.</p>
+
+<p><strong>Where it breaks, in two places.</strong> A sculptor works toward one statue they have in mind, while our sampler's whole purpose is that different starting blocks become different statues &mdash; randomness is a feature here and a flaw there. And sculpting only removes material, while a refinement step can move a candidate any direction, including undoing an earlier nudge.</p>
+
+<h2>5.7 The price you pay</h2>
+
+<p>Section 5.1 listed three services the Gaussian rendered: cheap sampling, cheap differentiable log-probability, reparametrized gradients. A generative policy keeps the first and loses the second, and that loss is why the second half of this book exists. The third survives only in a weakened form: the refinement loop is still a differentiable function of \(\theta\), so gradients can in principle be pushed back through it, but doing so means backpropagating through \(K\) network calls, and there is no log-density waiting at the end of it for a policy gradient to use. Sampling stays cheap. Scoring is what you lose.</p>
+
+<p>For a Gaussian you get \(\log \pi_\theta(a \mid o)\) by subtracting, squaring, dividing, and summing. Now ask the same of the sampler in Section 5.6: what is the log-probability of the chunk that came out of a ten-step refinement loop? A number exists &mdash; the loop is a definite procedure with a definite output distribution &mdash; but computing it means unwinding the whole loop and accounting for how each step stretched or squeezed the space around the sample. Chapter 9 works out how expensive that is and why the estimate's noise is fatal.</p>
+
+<p>Then stack on the problem Section 5.3 planted. Even a perfect chunk-level log-probability is not the quantity PPO wants. The importance ratio \(\rho_t(\theta) = \pi_\theta(a_t \mid s_t)/\pi_{\theta_{old}}(a_t \mid s_t)\) is written per environment timestep, and inside a chunk there are no per-timestep decisions to take the ratio of. The clip at \(1 \pm \epsilon\) is a statement about a ratio of densities. No cheap density, no ratio, no clip, no PPO.</p>
+
+<p>The good news is one sentence, and it is why Chapter 4 was the hinge: the <em>training loss</em> of a refinement model is a per-sample regression, and regressions can be weighted and conditioned. Multiply a sample's loss by an advantage-derived weight and you get RL-flavored improvement without touching a density &mdash; AWR, applied to a generative policy. Or feed the advantage in as an extra input and ask the sampler for a good chunk &mdash; RECAP, in Chapter 10.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+Larchenko's winning policy is exactly the model class this chapter argues toward: a flow-matching action expert emitting 30-step, 12-dimensional joint-delta chunks: one second of motion at the 30 Hz simulation rate, and the same 30 steps stretched over 1.5 s when the real round ran at 20 Hz (Larchenko, 2026). Multimodality is no theoretical concern there; folding a shirt has ties at every stage, starting with which arm leads. The tech report states the consequence plainly: PPO-style log-probability policy gradients "don't transfer cleanly to flow-matching VLAs," so improvement runs through weighted sampling or conditioning instead.
+</div>
+
+<div class="box checkpoint"><div class="box-title">Checkpoint</div>
+<ul>
+<li>Explain why a Gaussian policy was right for your rover and wrong for a folding dataset, in terms of one peak versus several.</li>
+<li>Justify why fitting a unimodal model by maximum likelihood to bimodal data puts the mean in the valley, and reproduce the six-demo example: \(\mu^\star = 0\), \(\sigma = 1.0132\), a 45% collision rate.</li>
+<li>Say what an action chunk is and why it exists, compute its dimension for a bimanual SO-101 at \(H=30\), and explain why chunking multiplies modes rather than reducing them.</li>
+<li>Define a generative model without using the word "diffusion", and explain the difference between sampling from a distribution and evaluating its density.</li>
+<li>Name the six families in Figure 5.2 with their training signals, and say why robotics converged on the two green ones.</li>
+<li>Explain iterative refinement in three sentences, including why many small steps let a plain regression loss produce a sharply multimodal sampler &mdash; and name what it costs you.</li>
+</ul>
+</div>
+
+<p><strong>Where to go deeper.</strong> For the multimodality argument made empirically rather than rhetorically, Chi et al. (2023) opens with this comparison across manipulation benchmarks, and Florence et al. (2021) makes the same case from the energy-based side. Zhao et al. (2023) is the readable original for action chunking and doubles as a clean conditional VAE in robotics. Appendix A carries the Chi and Zhao papers with reading notes and says which sections to skip; Florence is a short optional detour with no entry there, as are the VAE, GAN and RT-2 citations above. Chapters 6 and 7 build the two green rows of Figure 5.2 from nothing.</p>
+
+</section>

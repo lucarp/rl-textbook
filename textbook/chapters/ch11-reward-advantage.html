@@ -1,0 +1,457 @@
+<section class="chapter" id="ch11">
+<h1>Chapter 11 &mdash; Reward and advantage engineering</h1>
+
+<p>Every algorithm in this book eventually consumes one number. PPO clips around it (Chapter 3). Advantage-weighted regression exponentiates it into a sample weight (Chapter 4). RECAP thresholds it into a conditioning token (Chapter 10). That number is the advantage estimate \(\hat{A}_t\) &mdash; "how much better than average was this action, in this state." Chapters 3 through 10 assumed it exists. This chapter builds it, for a task that hands you exactly one bit of ground truth per episode, several hundred timesteps after the actions that decided the outcome.</p>
+
+<p>Nothing here is deep mathematics. It is bookkeeping, arithmetic, and one theorem, arranged so the resulting scalar is dense in time, low in variance, robust to a stale critic, and still faithful to the task. Five moves get you there: reward densification, potential-based shaping, a value function you get for free, a damped baseline, and a staleness-proof anchor.</p>
+
+<h2>11.1 The reward problem</h2>
+
+<h3>11.1.1 What the environment actually tells you</h3>
+
+<p>LeHome defines success the way most real robot tasks do: as a <strong>predicate</strong> &mdash; a yes/no test &mdash; on the final state. Every garment carries labeled <strong>keypoints</strong>, marked points on the mesh such as the cuffs, the shoulder seams, the hem. The checker measures distances between specific pairs and declares success when a conjunction &mdash; an AND, all at once &mdash; of pairwise distance conditions holds. <strong>Proximity pairs</strong> must end <em>within</em> a threshold: a cuff close to its target on the torso, which is what "the sleeve is folded in" means geometrically. <strong>Spread pairs</strong> must stay <em>beyond</em> one, which stops the checker accepting a garment wadded into a ball. Five conditions for tops, four for pants (Larchenko, 2026) &mdash; that is the official checker; for his own dense reward Larchenko expanded long pants to seven conditions, which is where Chapter 8's 21-output keypoint head gets its width. So the truthful reward is</p>
+
+\[ r_t = 0 \quad \text{for all } t \lt T, \qquad r_T = \mathbb{1}[\text{success}] \]
+
+<p>where \(T\) is the final timestep and \(\mathbb{1}[\cdot]\) is the indicator function, 1 when the statement inside is true and 0 otherwise. One bit, at the end. That is all the environment owes you.</p>
+
+<h3>11.1.2 The obvious thing to try, and exactly how it fails</h3>
+
+<p>The obvious thing is to just use it &mdash; not a silly idea, since it is what you did on rl-rover and what HIL-SERL does on your SO-101 today. Here is why it fails on a 600-step folding task, in two ways that compound.</p>
+
+<p><strong>First, it is sparse.</strong> An untrained policy essentially never folds a garment &mdash; not "rarely," but essentially never, because success needs four or five geometric conditions to hold at once after a specific sequence of bimanual grasps. So almost every episode returns \(G = 0\). Chapter 2 showed that the policy gradient is built from <em>differences</em> in return between trajectories; when all returns are the same number, every difference is zero and so is the gradient. You can burn a week of simulator time and learn nothing while the loss curve looks healthy. Figure 1.2 is a picture of this.</p>
+
+<p><strong>Second, it is long-horizon.</strong> An episode runs roughly 600 steps at 30 Hz, about twenty seconds. Suppose one does succeed. That single bit must be apportioned across 600 action choices, and Monte Carlo credit assignment cannot tell which mattered: the grasp at step 140 that lifted the sleeve cleanly and the twitch at step 502 that did nothing get identical credit. Chapter 3 quantified this &mdash; Monte Carlo return variance grows with the horizon, because all 600 stochastic choices dump their noise into the same scalar.</p>
+
+<p>So <strong>densification</strong> &mdash; moving reward earlier in time, closer to the actions that caused it &mdash; is not a refinement here. Without it there is no signal to start from.</p>
+
+<h3>11.1.3 Four routes to a denser reward</h3>
+
+<p>Four standard routes, ordered by how far each strays from the objective you care about &mdash; that distance is what eventually bites you.</p>
+
+<ul>
+<li><strong>Hand-shaped rewards.</strong> Write dense terms yourself: distance to a goal pose, action smoothness, a penalty for dropping the garment. Cheap and fully under your control. But every hand-written term is a chance to quietly redefine the task. Section 11.3 gives the one provably safe form.</li>
+<li><strong>Learned reward models.</strong> Fit a network to predict reward from pixels or preference comparisons. Flexible, and often the only option when success is hard to program. But the policy optimizes the model's <em>errors</em> as eagerly as its signal &mdash; <strong>reward hacking</strong>, where the agent finds inputs on which the reward model is confidently wrong &mdash; so it needs constant re-fitting.</li>
+<li><strong>Success classifiers.</strong> Automate only the final judgment: a binary classifier on images answering "did this succeed," as in HIL-SERL (Luo et al., 2024). Faithful, because you approximate the real predicate and nothing else. But still sparse in time &mdash; you automated the human, not the signal.</li>
+<li><strong>Task-criteria checkpoints.</strong> Decompose the evaluator's own conditions into partial milestones, paying out when one is first reached. The most grounded route: you invent no new metric, only reveal partial progress on the real one. The cost is access &mdash; it needs the checker's internal state, which is <strong>privileged information</strong>, data available to training but not to the deployed policy's sensors. Normally that means simulation only (Chapter 14).</li>
+</ul>
+
+<p>Larchenko (2026) took the fourth route, plus Section 11.3's shaping. The LeHome simulator ships a hand-shaped "niceness" reward, route one, ready to use. He ignored it &mdash; a small act of discipline the rest of this chapter justifies.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+Today <em>you</em> are the reward function: your button press at the end of a HIL-SERL episode is \(r_T\), and nothing else in the loop knows whether the task went well. Step one is route three, HIL-SERL's own recipe &mdash; label a few hundred wrist and scene frames success/failure, train a small binary classifier, keep the button as an override for false positives. Do keep it; classifiers trained on 300 images fail in embarrassing ways. Route four is closed on hardware: it needs privileged garment state your SO-101 cannot observe, which is why checkpoint rewards live in simulation.
+</div>
+
+<h2>11.2 Checkpoint rewards from the task's own criteria</h2>
+
+<h3>11.2.1 Decomposing a conjunction</h3>
+
+<p>Route four generalizes far beyond garments, because programmatic success checkers are almost always conjunctions &mdash; A <em>and</em> B <em>and</em> C &mdash; and a conjunction decomposes into an ordering of partial satisfactions.</p>
+
+
+<p>For a long-sleeved top the milestones follow the physical order of the fold: first "sleeves folded onto the body," a subset of the proximity conditions, then "body folded in half," the rest. So award a <strong>checkpoint reward</strong> of 0.5 the first time the sleeve conditions hold, and the remaining 0.5 at full success. Cumulative reward then reaches exactly 1.0 on precisely the episodes the official checker accepts. Shorts get no mid checkpoint &mdash; one fold has no halfway point &mdash; while tops and long pants do. In the LeHome solution that first 0.5 is not a lump; it is granted <em>gradually</em>, in proportion to the reduction of the primary proximity distance. Which should make you uneasy.</p>
+
+<h3>11.2.2 First exploit: farming a progress bonus</h3>
+
+<p>If the policy earns reward whenever the cuff gets closer, what stops it dragging the sleeve halfway in, letting it slip back, and dragging it in again? Nothing. That is a reward pump, and a policy-gradient method will find it within a few thousand episodes. It will never fold anything; it will oscillate forever, collecting on every inbound swing.</p>
+
+<p>The fix is a <strong>running-min</strong> rule: track the minimum distance achieved so far this episode, and pay only when the current distance sets a <em>new</em> minimum. Sliding back out earns nothing, and re-approaching earns nothing until the sleeve goes strictly further than ever. Progress is paid for at most once, so cyclic motion cannot farm it &mdash; the pump is sealed by construction, not by tuning.</p>
+
+<h3>11.2.3 Second exploit: bank and thrash</h3>
+
+<p>Checkpoints create a second exploit the running-min rule does not touch. A policy can bank the 0.5 by half-folding cleanly, then thrash the garment into a heap for the remaining 400 steps. Episode return: 0.5. The true objective says 0.</p>
+
+<p>The fix is <strong>reward withdrawal</strong>. If the episode ends in failure, take everything back: emit negative reward spread uniformly over the frames after the cumulative-reward peak, summing to exactly what was granted (Figure 11.1). Let \(t_{\text{peak}}\) be the <em>first</em> frame at which cumulative reward reaches its maximum &mdash; equivalently, the frame on which the last reward was granted, since nothing is paid out after it. Frames \(t_{\text{peak}}+1\) through \(T\) are the ones that share the clawback, and there are \(T - t_{\text{peak}}\) of them:</p>
+
+\[ r_t \;\gets\; r_t \;-\; \frac{\sum_k r_k}{\,T - t_{\text{peak}}\,} \quad \text{for } t \gt t_{\text{peak}}, \text{ failed episodes only} \qquad\Longrightarrow\qquad \sum_{t=0}^{T} r_t \;=\; \mathbb{1}[\text{success}] \]
+
+<div class="box plain"><div class="box-title">In plain words</div>
+On the left, \(r_t\) is the reward at frame \(t\); \(t_{\text{peak}}\) is the first frame at which the running total reaches its highest value, which is the same as the frame on which the last reward was granted; \(T\) is the last frame; \(\sum_k r_k\) is everything granted over the episode. Divide that total by the number of frames after the peak and subtract it from each &mdash; a uniform clawback. On the right is the consequence: the rewards sum to 1 if the checker says success and 0 if it does not. An episode's <em>total</em> reward is still identically the original binary objective. You have not redefined the task, added a term, or introduced a coefficient to tune. What changed is only <em>when within the episode</em> the credit appears.
+</div>
+
+<p>Concretely: a failure scores 0 whether or not it passed a checkpoint, so bank-and-thrash pays nothing, while <em>inside</em> a failed episode the frames that reached the milestone now carry positive reward and the frames after the disaster carry negative reward.</p>
+
+<p><em>An analogy from your day job.</em> Withdrawal is a database transaction rollback: you write rows during the transaction, and at commit time either they stick or every write is reversed and the ledger balances as if nothing happened. <em>Where it breaks down:</em> a real rollback is invisible afterward. Here the writes are the entire point &mdash; the learner sees the intermediate rewards, and their <em>timing</em> survives the rollback even though their sum does not.</p>
+
+<figure>
+<svg viewBox="0 0 680 260" width="680" xmlns="http://www.w3.org/2000/svg">
+  <text x="60" y="22" font-family="Noto Sans" font-size="12" font-weight="600" fill="#4a8a5c">Success episode</text>
+  <text x="640" y="22" font-family="Noto Sans" font-size="11" fill="#4a8a5c" text-anchor="end">episode return = 1</text>
+  <line x1="60" y1="40" x2="650" y2="40" stroke="#ccc" stroke-dasharray="3,4"/>
+  <line x1="60" y1="70" x2="650" y2="70" stroke="#ccc" stroke-dasharray="3,4"/>
+  <text x="52" y="44" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">1.0</text>
+  <text x="52" y="74" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">0.5</text>
+  <text x="52" y="104" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">0</text>
+  <line x1="60" y1="100" x2="650" y2="100" stroke="#666"/>
+  <polygon points="650,100 642,96 642,104" fill="#666"/>
+  <text x="658" y="104" font-family="Noto Sans" font-size="11" fill="#666">t</text>
+  <polyline points="60,100 240,100 240,70 560,70 560,40 640,40" fill="none" stroke="#4878a8" stroke-width="2.5"/>
+  <circle cx="240" cy="70" r="4" fill="#4a8a5c"/>
+  <text x="248" y="64" font-family="Noto Sans" font-size="11" fill="#4a8a5c">+0.5 mid checkpoint (sleeves in)</text>
+  <circle cx="560" cy="40" r="4" fill="#4a8a5c"/>
+  <text x="552" y="32" font-family="Noto Sans" font-size="11" fill="#4a8a5c" text-anchor="end">+0.5 success</text>
+
+  <text x="60" y="146" font-family="Noto Sans" font-size="12" font-weight="600" fill="#b04a4a">Failure episode, with withdrawal</text>
+  <text x="640" y="146" font-family="Noto Sans" font-size="11" fill="#b04a4a" text-anchor="end">episode return = 0</text>
+  <rect x="430" y="152" width="190" height="73" rx="6" fill="#b04a4a" opacity="0.08"/>
+  <line x1="60" y1="195" x2="650" y2="195" stroke="#ccc" stroke-dasharray="3,4"/>
+  <text x="52" y="199" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">0.5</text>
+  <text x="52" y="229" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">0</text>
+  <line x1="60" y1="225" x2="650" y2="225" stroke="#666"/>
+  <polygon points="650,225 642,221 642,229" fill="#666"/>
+  <text x="658" y="229" font-family="Noto Sans" font-size="11" fill="#666">t</text>
+  <polyline points="60,225 240,225 240,195 430,195 620,225 640,225" fill="none" stroke="#4878a8" stroke-width="2.5"/>
+  <circle cx="240" cy="195" r="4" fill="#4a8a5c"/>
+  <text x="248" y="188" font-family="Noto Sans" font-size="11" fill="#4a8a5c">+0.5 mid checkpoint</text>
+  <line x1="424" y1="189" x2="436" y2="201" stroke="#b04a4a" stroke-width="2"/>
+  <line x1="424" y1="201" x2="436" y2="189" stroke="#b04a4a" stroke-width="2"/>
+  <text x="430" y="172" font-family="Noto Sans" font-size="11" fill="#b04a4a" text-anchor="middle">garment ruined</text>
+  <text x="525" y="243" font-family="Noto Sans" font-size="11" fill="#b04a4a" text-anchor="middle">&minus;0.5 withdrawn, spread over remaining frames</text>
+</svg>
+<figcaption>Figure 11.1 &mdash; Cumulative reward \(R_{acc}\) over two episodes. On top, checkpoints split the terminal bit into two milestones. Below, the checkpoint is granted, the garment is later ruined, and the banked 0.5 is withdrawn. Notice the bottom curve ends at exactly zero, yet the bump in the middle still tells the estimator which frames were the good ones.</figcaption>
+</figure>
+
+<pre class="code"># offline reward post-processing, per episode (before advantages)
+r = zeros(T)                          # array indices 0..T-1, so "after peak" is T-peak-1 frames
+if mid_checkpoint_hit:                # tops and long pants; shorts have no mid checkpoint
+    r[first_hit(mid_checkpoint)] += 0.5
+if success:
+    r[success_frame]         += 1.0 - r.sum()   # top cumulative reward up to exactly 1.0
+else:
+    peak = argmax(cumsum(r))          # first frame at the reward peak
+    r[peak+1:] -= r.sum() / max(T - peak - 1, 1)   # withdrawal: sum(r) -&gt; 0
+R_acc = cumsum(r) - r                 # reward banked strictly before step t
+V_hat = alpha * (p_succ_pred - R_acc) # Secs. 11.4-11.5
+A_hat = gae(r, V_hat, gamma=0.999, lam=0.99)  # Ch. 3</pre>
+
+<h2>11.3 Potential-based shaping done right</h2>
+
+<h3>11.3.1 What we want, and the trap</h3>
+
+<p>Checkpoints gave you two payouts in 600 steps. You want more. The tempting move is a dense bonus \(F(s, a, s')\) on every transition, nudging the policy toward states that look like progress. When is that safe?</p>
+
+<p>The trap is Section 11.2.2's, in general form: any bonus that pays for <em>being closer</em> to something can be pumped by moving toward it and away again. Ng, Harada, and Russell's canonical example is a bicycle agent rewarded for reducing distance to a goal &mdash; it rode small circles near the start, harvesting the inbound arc of every loop, and never went anywhere (Ng et al., 1999). Your version is a gripper shuttling a cuff back and forth.</p>
+
+<h3>11.3.2 The theorem</h3>
+
+<p>They answered the safety question exactly: the shaped MDP has the same optimal policies as the original &mdash; for <em>any</em> dynamics and <em>any</em> underlying reward &mdash; if and only if \(F\) is <strong>potential-based</strong>:</p>
+
+<div class="key-eq">\[ F(s, a, s') = \gamma\,\Phi(s') - \Phi(s) \]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+\(F(s,a,s')\) is the bonus you hand out for a transition from state \(s\), taking action \(a\), landing in \(s'\). \(\Phi\) (read "phi") is a <strong>potential function</strong>: any function you invent that assigns one number to each state &mdash; "how promising does this state look." \(\gamma\) is the usual discount factor. The equation says the only safe bonus is the discounted difference between how promising the new state looks and how promising the old one looked. If \(\Phi\) went up you get paid; if it went down you pay. Crucially \(\Phi\) may depend on the state only &mdash; not the action, not the timestep, not anything remembered from earlier. The "if and only if" makes this a theorem, not a recipe: any bonus <em>not</em> of this form can change the optimal policy in some MDP.
+</div>
+
+<h3>11.3.3 Why it works, step by step</h3>
+
+<p>Take any trajectory \(s_0, s_1, \dots, s_T\) and add up the discounted shaping rewards along it, exactly as the return formula does:</p>
+
+\[ \sum_{t=0}^{T-1} \gamma^t \big[\gamma\,\Phi(s_{t+1}) - \Phi(s_t)\big] \;=\; \sum_{t=0}^{T-1} \big[\gamma^{t+1}\Phi(s_{t+1}) - \gamma^{t}\Phi(s_t)\big] \]
+
+<p>Write out the terms. The first bracket gives \(\gamma\Phi(s_1) - \Phi(s_0)\); the second gives \(\gamma^2\Phi(s_2) - \gamma\Phi(s_1)\), whose second half cancels the first bracket's first half. The same happens at every interior state: each \(\gamma^{t}\Phi(s_t)\) appears once positive and once negative. Everything in the middle collapses and only the ends survive, leaving \(\gamma^{T}\Phi(s_T) - \Phi(s_0)\).</p>
+
+<p>Read what that means. The total shaping any trajectory can collect depends <em>only</em> on where it started and where it ended &mdash; not on the route, the length, or how many times it wobbled. The undiscounted potential difference around a closed loop is zero, which is why the pump is impossible. With \(\gamma\) slightly below 1 it is better than zero, from your point of view: a loop that leaves \(s_0\) and comes back after \(n\) steps collects \(\gamma^{n}\Phi(s_0) - \Phi(s_0) = \Phi(s_0)(\gamma^{n} - 1)\), which is a small net <em>penalty</em> whenever \(\Phi(s_0)\) is positive. Circling either pays nothing or costs you. It never pays.</p>
+
+<p><em>An analogy from the physical world.</em> \(\Phi\) is elevation and the shaping reward is gravitational potential energy: walk any route across a landscape and the net energy gained depends only on your start and end altitudes. Hikers cannot invent energy by walking in circles. <em>Where it breaks down:</em> gravity is exactly conservative, whereas \(\gamma\) tilts the field, and the cancellation above assumes \(\Phi(s_T) = 0\) at terminal states or that \(\gamma^T\) is negligible. Here it is not: \(0.999^{600} \approx 0.55\). The rigorous argument does not need that assumption &mdash; it is the uniform value shift \(V'(s) = V(s) - \Phi(s)\), which lowers every state's value equally and leaves every \(\arg\max\) untouched &mdash; but set \(\Phi\) to zero on terminal states anyway.</p>
+
+<h3>11.3.4 Choosing a potential</h3>
+
+<p>The ideal choice is \(\Phi \approx V^*\), the optimal value function &mdash; but if you had \(V^*\) you would not need any of this, so \(\Phi\) is a rough proxy in practice. Here is the theorem's real gift: a <em>bad</em> potential wastes your shaping budget and can slow learning, but it can never corrupt what "optimal" means. The worst case is wasted time, not a broken task. Very few knobs in RL have that property.</p>
+
+<p>The practical \(\Phi\) in the LeHome solution is the <strong>completion head</strong> from Chapter 8: a linear probe on the policy's backbone, trained only on successful episodes to regress the elapsed fraction \(t/T\). Having seen nothing but successes, it encodes "what fraction of a <em>good</em> fold is done." Set \(\Phi(s) = \alpha_c \bar{C}(s)\) with \(\alpha_c = 0.5\), where \(\bar{C}\) is the smoothed head output.</p>
+
+<p>That word "smoothed" hides a snag, and it is worth naming rather than stepping over. \(\bar{C}\) is an exponential moving average of the head's per-frame predictions (Section 11.4.2), so it is formally a function of the frame's <em>history</em>, not of \(s\) alone &mdash; and the theorem you just proved was about a \(\Phi\) that reads the state and nothing else. Applied literally, the chapter's own test rejects the chapter's own potential. There are two honest ways to close the gap. The clean one is to fold the smoother's running value into the state definition: it is one more number your pipeline already carries per frame, and once it is part of \(s\) the potential is state-only again by construction. The practical one is to notice that at coefficient 0.2 the smoothed value trails the raw head by a fraction of a single step's change, which is tiny next to the shaping magnitude \(\alpha_c = 0.5\) &mdash; so the invariance holds to a good approximation, and the residue is far below the noise you are fighting. Either answer is fine. Silently ignoring the question is not.</p>
+
+<p>This channel earns its keep on <em>saturated</em> tasks. Once shorts fold at 93%, \(\hat{p}_{succ}\) is pinned near 1 and checkpoint rewards almost always pay, so the advantages of Sections 11.4 and 11.5 collapse toward zero and learning stalls. The completion potential still separates fast, clean progress from dawdling, so a gradient survives &mdash; and being potential-based, it runs at full strength in Section 11.6's blend.</p>
+
+<p>Be precise about what "full strength, no risk" buys you, because it is a narrower claim than it sounds. The theorem says the shaping cannot change <em>which policy is optimal</em> in the MDP. It does not say the machinery downstream of \(\hat{A}\) is unaffected. Chapter 4 feeds \(\hat{A}\) through \(\exp(\hat{A}_i/\beta)\) and Chapter 10 through a threshold, both nonlinear, and at any finite \(\beta\) adding a shaping term genuinely moves sampling priorities and conditioning labels around. That is the whole reason you added it. So read the guarantee as "no risk of redefining the task," not "no effect" &mdash; the shaping changes what your optimizer looks at first, which is exactly what you wanted, while leaving the definition of success untouched, which is what you were afraid of losing.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+A raw progress bonus &mdash; "+k whenever the cuff gets closer" &mdash; is <em>not</em> potential-based, because it depends on the transition rather than a fixed function of state, and it is exploitable exactly as the bicycle was. Section 11.2.2's running-min rule patches one instance; it is no general defense. The test: can you write your bonus as \(\gamma\Phi(s') - \Phi(s)\) for a \(\Phi\) that reads only the current state? If not, assume it changes the optimal policy.
+</div>
+
+<h2>11.4 The value function for free</h2>
+
+<h3>11.4.1 The obvious cost, and how to avoid it</h3>
+
+<p>GAE (Chapter 3) needs a value estimate \(V(s)\) at every frame. The standard answer is a critic network: a second head, a second loss, a second set of hyperparameters, and a real slice of your compute. On rl-rover that was free &mdash; the critic was a three-layer MLP. On a Gemma-2B backbone it is not.</p>
+
+<p>You do not have to pay it. Chapter 8 already put a <strong>success head</strong> on the model: a linear probe on the policy's backbone, trained with cross-entropy against the eventual outcome, outputting \(\hat{p}_{succ}(s)\), the predicted probability that this episode ends in success given the current frame. It is already a value function, up to one bookkeeping term.</p>
+
+<div class="key-eq">\[ V(s_t) \;=\; \hat{p}_{succ}(s_t) \;-\; R_{acc,t}, \qquad R_{acc,t} \;=\; \sum_{k \lt t} r_k \]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The left side is the value of the current state &mdash; the total reward you expect from here to the end. \(\hat{p}_{succ}(s_t)\) is the success head's output at this frame, between 0 and 1. \(R_{acc,t}\) is the <strong>accumulated reward</strong>: the sum of every reward already paid strictly before the current step, which under the checkpoint scheme is 0, or 0.5, or something in between. The \(t\) in the subscript is doing real work &mdash; this quantity changes as the episode runs, growing by \(r_t\) at every step, so it must be read at the same frame as \(V(s_t)\). This chapter keeps that subscript because the timestep is the point here; elsewhere in the book, where only one frame is under discussion, the same quantity is written \(R_{acc}\). So: your expected future reward is your probability of eventually succeeding, minus whatever the episode already paid you. The subtraction is there because the total is capped at 1 &mdash; if half the credit is banked, only half remains to collect.
+</div>
+
+<h3>11.4.2 Verify it yourself, by cases</h3>
+
+<p>Worth checking rather than believing. Set \(\gamma \approx 1\) and enumerate the two possible futures. <strong>If the episode succeeds</strong>, the scheme tops the cumulative total up to exactly 1.0 at the success frame; it has already paid \(R_{acc,t}\), so the rewards still to come sum to \(1 - R_{acc,t}\). <strong>If it fails</strong>, withdrawal claws back everything granted, so the episode total is 0 and what remains sums to \(-R_{acc,t}\). Those are the only outcomes, and the head gives their probabilities:</p>
+
+\[ \mathbb{E}[G_t \mid s_t] = \hat{p}_{succ}\,(1 - R_{acc,t}) + (1 - \hat{p}_{succ})\,(-R_{acc,t}) = \hat{p}_{succ} - \hat{p}_{succ}R_{acc,t} - R_{acc,t} + \hat{p}_{succ}R_{acc,t} = \hat{p}_{succ} - R_{acc,t} \]
+
+<p>The two \(\hat{p}_{succ}R_{acc,t}\) terms cancel and the claim falls out. Note what \(R_{acc,t}\) is <em>not</em>: not learned, not predicted, carrying no error. It is a running sum known exactly. All the uncertainty lives in \(\hat{p}_{succ}\), which is the honest place for it. From \(V\) you get \(\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)\) and then \(\hat{A}_t\) with Chapter 3's GAE machinery &mdash; LeHome uses \(\gamma = 0.999\), \(\lambda = 0.99\), computed offline over all stored rollouts before each iteration.</p>
+
+<p>Two practical touches appear in no equation. Smooth \(\hat{p}_{succ}\) with an exponential moving average (coefficient 0.2), because per-frame probe predictions jitter and jittery GAE differences are advantage noise. And interpolate the last thirty frames toward the known outcome: on a stored episode you already hold the answer, so do not let a noisy head disagree with it.</p>
+
+<h2>11.5 The damped baseline</h2>
+
+<h3>11.5.1 Chapter 2's promise, and its fine print</h3>
+
+<p>Chapter 2 taught that subtracting a baseline \(V(s)\) from the return leaves the policy gradient unbiased and reduces its variance. True. The fine print: <em>reduces</em> is guaranteed only for a <em>good</em> baseline. A wrong value estimate can add variance instead &mdash; and in the pipelines of Chapters 4 and 10, where \(\hat{A}\) passes through \(\exp(\hat{A}_i/\beta)\), clipping, and sampling priorities, it adds bias too, because those transformations are nonlinear in \(\hat{A}\). Your value head is a linear probe trained on a moving target. It is decent. It is not good.</p>
+
+<h3>11.5.2 The A/B testing view</h3>
+
+<p>The cleanest way to see what to do comes from online experimentation. In case you have never run an experiment platform: you want to know whether a new checkout page raises revenue per user, so you split users into two arms and compare mean revenue. Spending varies enormously &mdash; most users spend nothing, one spends four thousand dollars &mdash; so the effect is buried in noise. But you have a covariate: each user's spend <em>before</em> the experiment, which correlates with their spend during it and, fixed before randomization, cannot have been affected by the treatment. <strong>CUPED</strong> subtracts it (Deng et al., 2013). Instead of analyzing the outcome \(Y\) directly, you analyze \(Y - \theta(X - \bar{X})\), where \(X\) is the user's pre-experiment spend, \(\bar{X}\) is the average of \(X\) over everyone, and \(\theta\) is a fitted <em>coefficient</em>, not 1. Both details matter. The centering by \(\bar{X}\) is what keeps the adjusted quantity an unbiased estimate of \(\mathbb{E}[Y]\), since the subtracted term has mean zero. The fitted \(\theta\) is what makes the variance actually drop.</p>
+
+<p>A baseline is the same object: a <strong>control variate</strong>, a correlated quantity you subtract to cut variance without biasing the estimate you actually care about. Be careful about which estimate that is. In the A/B case it is the mean of \(Y\), which the centering protects. In the RL case it is the policy <em>gradient</em>, not the mean of the advantage &mdash; subtracting \(\alpha V\) does shift the average advantage by \(\alpha\mathbb{E}[V]\), and the gradient survives anyway, for a reason spelled out just below the equation. So subtract \(\alpha V\) rather than \(V\), with a <strong>damping coefficient</strong> \(\alpha\), and expand:</p>
+
+<div class="key-eq">\[ \operatorname{Var}(G - \alpha V) = \operatorname{Var}(G) - 2\alpha \operatorname{Cov}(G, V) + \alpha^2 \operatorname{Var}(V), \qquad \alpha^* = \frac{\operatorname{Cov}(G, V)}{\operatorname{Var}(V)} = \rho_{GV}\,\frac{\sigma_G}{\sigma_V} \]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+\(G\) is the return actually observed for a frame; \(V\) is what the value head predicted for it; \(\alpha\) is how much of that prediction you subtract. The left side is the variance of the resulting advantage estimate. On the right, \(\operatorname{Var}(G)\) is the noise you started with, \(\operatorname{Cov}(G,V)\) measures how much \(G\) and \(V\) move together, \(\operatorname{Var}(V)\) how much the prediction bounces. The middle term is the payoff, linear in \(\alpha\); the last is the cost, quadratic. That is an upward parabola with one minimum, found by setting the derivative to zero: \(\alpha^*\). Here \(\sigma_G, \sigma_V\) are the standard deviations of \(G\) and \(V\), and \(\rho_{GV}\) their correlation &mdash; unrelated to Chapter 3's ratio \(\rho_t(\theta)\), hence the subscript.
+</div>
+
+<p>Settle one worry before going further, because otherwise it will nag at you for the rest of the chapter. Section 11.5.1 opened by promising that subtracting a baseline leaves the policy gradient unbiased. Does scaling that baseline by \(\alpha = 0.5\) break the promise? No, and the reason is worth seeing once. The unbiasedness argument never needed the subtracted quantity to be the <em>right</em> value function. It only needed it to be a function of the state and not of the action, because then</p>
+
+\[ \mathbb{E}_{a \sim \pi_\theta}\big[\nabla_\theta \log \pi_\theta(a|s)\, b(s)\big] \;=\; b(s)\,\nabla_\theta \sum_a \pi_\theta(a|s) \;=\; b(s)\,\nabla_\theta 1 \;=\; 0 \]
+
+<p>for any such \(b\). And \(\alpha V(s)\) is a function of the state alone for every constant \(\alpha\) &mdash; scaling a state-only quantity leaves it state-only. So \(\alpha\) is a pure variance knob. It cannot tilt the gradient, whatever value you give it, including 0 and including 5. What it does change is the variance, which is the whole point, and the average size of \(\hat{A}\), which matters only where something nonlinear reads it. That is the one place bias does enter, and Section 11.5.1 already flagged it: \(\exp(\hat{A}_i/\beta)\) in Chapter 4 and the threshold in Chapter 10 respond to \(\hat{A}\) itself, not only to its expectation. The deliberate reward leak of Section 11.5.4 inherits exactly the same caveat &mdash; a variance-and-scale choice, not a broken gradient.</p>
+
+<p>Substituting \(\alpha^*\) back gives the minimum achievable variance, \(\operatorname{Var}(G)(1 - \rho_{GV}^2)\). Read the formulas against your situation. A perfect value function satisfies \(G = V + \text{noise}\), so \(\operatorname{Cov}(G,V) = \operatorname{Var}(V)\) and \(\alpha^* = 1\) &mdash; full subtraction, Chapter 2's textbook case. A noisy head inflates \(\sigma_V\) and shrinks \(\rho_{GV}\), and both push \(\alpha^*\) below 1. And whenever \(\sigma_V \gt 2\rho_{GV}\,\sigma_G\), full subtraction is worse than <em>no baseline at all</em>.</p>
+
+<h3>11.5.3 Worked example</h3>
+
+<p>Real numbers, and one sentence of setup so you know which frame we are standing on. Take a frame early in the episode, before any checkpoint has paid, so \(R_{acc,t} = 0\) and the return-to-go is exactly the binary outcome of Section 11.4: 1 if the episode eventually succeeds, 0 if it fails. Put the success probability at \(p = 0.5\), roughly where a mid-training garment sits. Then \(G\) is a coin flip and \(\operatorname{Var}(G) = p(1-p)\). Frames later in the episode, after a checkpoint has banked 0.5, have a return-to-go of \(1 - R_{acc,t}\) or \(-R_{acc,t}\) and a correspondingly smaller spread; the arithmetic below is the clean early-frame case, which is also the worst case for variance.</p>
+
+<p>One number in what follows deserves a raised eyebrow before you read past it: \(\sigma_V = 0.7\) is larger than \(\sigma_G = 0.5\). That says the value head's predictions bounce around more than the returns they are predicting. A well-calibrated predictor of a binary outcome cannot do that, because its output is a conditional mean and averaging never adds spread &mdash; calibration forces \(\sigma_V \le \sigma_G\). So \(\sigma_V \gt \sigma_G\) is not an incidental choice of numbers; it is itself the diagnostic that the head is miscalibrated or badly scaled. That is precisely the regime this section exists for, which is why the numbers stay as they are.</p>
+
+<pre class="code">Var(G) = p(1 - p) = 0.5 x 0.5              = 0.25
+sigma_G = sqrt(0.25)                       = 0.5
+
+Your value head is noisy:
+sigma_V = 0.7   -&gt;  Var(V) = 0.7 x 0.7     = 0.49
+rho_GV  = 0.6
+Cov(G,V) = rho_GV x sigma_G x sigma_V
+         = 0.6 x 0.5 x 0.7                 = 0.21
+
+Full subtraction, alpha = 1:
+  Var = 0.25 - 2(1)(0.21) + (1)(0.49)
+      = 0.25 - 0.42 + 0.49                 = 0.32
+  vs no baseline (0.25):  0.32 / 0.25      = 1.28   -&gt; +28% variance
+
+Optimal damping:
+  alpha* = Cov / Var(V) = 0.21 / 0.49      = 0.4286
+  check:  rho x sigma_G / sigma_V = 0.6 x 0.5 / 0.7 = 0.4286  (agrees)
+  Var = 0.25 - 2(0.4286)(0.21) + (0.4286)^2 (0.49)
+      = 0.25 - 0.18 + 0.09                 = 0.16
+  formula: Var(G)(1 - rho^2) = 0.25 x (1 - 0.36) = 0.16       (agrees)
+  vs no baseline:  0.16 / 0.25 = 0.64      -&gt; -36% variance</pre>
+
+<p>So the textbook move makes things 28% <em>worse</em> here, and the correctly scaled move 36% better. The gap is one coefficient. The "worse than nothing" condition is visible directly: \(\sigma_V = 0.7\) while \(2\rho_{GV}\sigma_G = 0.6\). Figure 11.2 plots the parabola.</p>
+
+<figure>
+<svg viewBox="0 0 680 280" width="680" xmlns="http://www.w3.org/2000/svg">
+  <line x1="70" y1="196.7" x2="650" y2="196.7" stroke="#eee"/>
+  <line x1="70" y1="163.3" x2="650" y2="163.3" stroke="#eee"/>
+  <line x1="70" y1="96.7" x2="650" y2="96.7" stroke="#eee"/>
+  <line x1="70" y1="63.3" x2="650" y2="63.3" stroke="#eee"/>
+  <line x1="70" y1="230" x2="650" y2="230" stroke="#666"/>
+  <polygon points="650,230 642,226 642,234" fill="#666"/>
+  <line x1="70" y1="230" x2="70" y2="32" stroke="#666"/>
+  <polygon points="70,24 66,32 74,32" fill="#666"/>
+  <text x="62" y="234" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">0.10</text>
+  <text x="62" y="167.3" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">0.20</text>
+  <text x="62" y="100.7" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="end">0.30</text>
+  <line x1="70" y1="230" x2="70" y2="234" stroke="#666"/>
+  <line x1="201.8" y1="230" x2="201.8" y2="234" stroke="#666"/>
+  <line x1="333.6" y1="230" x2="333.6" y2="234" stroke="#666"/>
+  <line x1="465.5" y1="230" x2="465.5" y2="234" stroke="#666"/>
+  <line x1="597.3" y1="230" x2="597.3" y2="234" stroke="#666"/>
+  <text x="70" y="246" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">0</text>
+  <text x="201.8" y="246" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">0.25</text>
+  <text x="333.6" y="246" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">0.5</text>
+  <text x="465.5" y="246" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">0.75</text>
+  <text x="597.3" y="246" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">1.0</text>
+  <text x="360" y="268" font-family="Noto Sans" font-size="12" fill="#333" text-anchor="middle">damping coefficient &alpha;</text>
+  <text x="78" y="20" font-family="Noto Sans" font-size="12" fill="#333">Var(G &minus; &alpha;V)</text>
+  <line x1="70" y1="130" x2="650" y2="130" stroke="#666" stroke-dasharray="5,4"/>
+  <text x="84" y="122" font-family="Noto Sans" font-size="11" fill="#666">no baseline: Var(G) = 0.25</text>
+  <line x1="70" y1="190" x2="296" y2="190" stroke="#4a8a5c" stroke-dasharray="4,3" opacity="0.8"/>
+  <text x="76" y="206" font-family="Noto Sans" font-size="11" fill="#4a8a5c">Var(G)(1 &minus; &rho;<tspan font-size="8" dy="2">GV</tspan><tspan dy="-2">&sup2;</tspan>) = 0.16</text>
+  <path d="M70,130 L122.7,154.7 L175.5,172.9 L228.2,184.6 L280.9,189.7 L296,190 L333.6,188.3 L386.4,180.4 L439.1,165.9 L491.8,144.9 L544.5,117.4 L597.3,83.3 L650,42.7" fill="none" stroke="#4878a8" stroke-width="2.5"/>
+  <line x1="296" y1="230" x2="296" y2="190" stroke="#4a8a5c" stroke-dasharray="3,3"/>
+  <circle cx="70" cy="130" r="4" fill="#666"/>
+  <circle cx="296" cy="190" r="5" fill="#4a8a5c"/>
+  <text x="306" y="224" font-family="Noto Sans" font-size="11" fill="#4a8a5c">&alpha;* &asymp; 0.43</text>
+  <circle cx="597.3" cy="83.3" r="5" fill="#b04a4a"/>
+  <text x="588" y="78" font-family="Noto Sans" font-size="11" fill="#b04a4a" text-anchor="end">&alpha; = 1: Var 0.32 (+28%)</text>
+</svg>
+<figcaption>Figure 11.2 &mdash; Variance of the advantage estimate versus the damping coefficient \(\alpha\), for the worked example. Notice that the curve at \(\alpha = 1\) sits <em>above</em> the dashed no-baseline line: full subtraction actively hurts. The parabola itself is perfectly symmetric about \(\alpha^*\) &mdash; missing by \(d\) in either direction costs the same \(\operatorname{Var}(V)\,d^2\) &mdash; so the reason to err low is not curvature but range: \(\alpha\) cannot go below zero, which caps the damage from under-damping at the no-baseline value \(\operatorname{Var}(G)\) marked by the dashed line, while over-damping has no such wall and climbs without limit to the right.</figcaption>
+</figure>
+
+<h3>11.5.4 The second, deliberate effect of damping</h3>
+
+<p>Damping does something else that is easy to miss, and it is intentional. With \(V(s_t) = \alpha(\hat{p}_{succ,t} - R_{acc,t})\), substitute into the TD residual:</p>
+
+\[ \delta_t = r_t + \gamma V(s_{t+1}) - V(s_t) \;\approx\; (1 - \alpha\gamma)\,r_t \;+\; \alpha\big(\gamma\,\hat{p}_{succ,t+1} - \hat{p}_{succ,t}\big) \]
+
+<p>The algebra is short: \(R_{acc,t+1} = R_{acc,t} + r_t\) by definition, so those terms almost cancel, leaving a residue \(\alpha R_{acc,t}(1-\gamma)\) negligible at \(\gamma = 0.999\) &mdash; hence "approximately." Now read the first term. An undamped, accurate baseline makes \((1 - \alpha\gamma) \approx 0\), cancelling checkpoint rewards almost entirely. That is technically correct &mdash; the head saw the checkpoint coming, so it was priced in &mdash; but it means the dense signal of Section 11.2 is subtracted away by the estimator meant to use it. Damping at \(\alpha = 0.5\) leaves \((1 - 0.5 \times 0.999) \approx 0.5\), so half of every checkpoint reward passes through as raw signal, deliberately left un-explained.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+Larchenko damped with \(\alpha_s = 0.5\) &mdash; his name for this section's \(\alpha\), subscripted for the success channel to keep it apart from the completion-shaping \(\alpha_c\) of Section 11.3.4 &mdash; chosen by instinct rather than derivation. The paper's v2 works out \(\alpha^* = \rho_{GV}\,\sigma_G/\sigma_V\) and measures it from logged rollouts: the true per-garment optimum ranged roughly 0.4 to 0.8, median near 0.5. He calls it "a mistake that worked" (Larchenko, 2026). You can do better than luck &mdash; both \(V\) and \(G\) already sit in your rollout logs. Estimate \(\rho_{GV}\), \(\sigma_G\), \(\sigma_V\) from a few thousand frames per garment type, and set \(\alpha\) from the formula.
+</div>
+
+<h2>11.6 Stale values and the group anchor</h2>
+
+<h3>11.6.1 A failure mode created by your own infrastructure</h3>
+
+<p>One more problem, born entirely of Chapter 14's asynchronous loop. Two details matter there. Value predictions \(\hat{p}_{succ}\) are recorded <em>at collection time</em> and never recomputed &mdash; re-running the backbone over millions of stored frames every iteration would cost more than training. And old rollout datasets are not deleted; their sampling share decays slowly, so they linger for many iterations. A large fraction of your training data therefore carries value estimates made by a policy several generations old.</p>
+
+<p>This is <strong>stale off-policy data</strong>, and staleness is worse than noise. Noise averages out over a batch; a stale head is <em>systematically</em> wrong in one direction, misjudging exactly the states where the policy has recently improved &mdash; the regime Section 11.5 warned about.</p>
+
+<p>Think of it as a cached computed column that nobody invalidates. The difference is that a database can detect staleness by comparing cache to source; here, checking a stored prediction means recomputing it, the expense you were avoiding. You cannot fix this by detecting it. You have to build an estimator that does not care.</p>
+
+<h3>11.6.2 An advantage with no value function in it</h3>
+
+<p><strong>GRPO</strong> &mdash; Group Relative Policy Optimization (Shao et al., 2024) &mdash; does exactly that for language models. For a given prompt it samples a <em>group</em> of responses from the same policy, scores them all, and sets each response's advantage to its own reward minus the group mean, divided by the group standard deviation. The group mean is the baseline. No critic is trained, and none can drift, because the baseline is recomputed from fresh samples every time.</p>
+
+<p>The robotics translation swaps "prompt" for "task instance." Group episodes by garment, the closest thing to the same prompt. Split each episode into two segments at the first checkpoint: everything strictly before the frame where the checkpoint paid, and that frame onward. A segment is then a coarse unit of behavior, and each segment is scored against its own baseline.</p>
+
+<p>The two baselines are different quantities, which is the part worth stating explicitly. Segment one is scored against the garment's empirical <em>checkpoint rate</em> &mdash; the fraction of recent episodes on that garment that reached the checkpoint at all. Reaching it scores \(1 - \text{rate}\); missing it scores \(-\text{rate}\). Segment two is scored against the empirical success rate <em>given</em> the checkpoint, \(P(\text{success} \mid \text{checkpoint})\), because once the checkpoint is banked that conditional is what "typical" means for the rest of the episode. An episode that never reaches the checkpoint has no second segment: it is one segment, the whole episode, scored against the checkpoint rate. All these rates are plain counts over recent rollouts, recomputed every iteration, then scaled to match GAE magnitudes so the channels can be added &mdash; the scale factor is the segment's mean discount weight, \((1 - \gamma^{n})/(n(1-\gamma))\) for a segment of \(n\) frames, which is what one unit of outcome would be worth after GAE had spread it over those frames. Nothing here is learned, so nothing goes stale. The price is resolution: one number per segment, no per-step credit.</p>
+
+<h3>11.6.3 Blending by freshness</h3>
+
+<p>Two channels with complementary weaknesses: GAE is fine-grained but leans on an aging value head; the group anchor is coarse but ageless. Blend them by data age, and add Section 11.3's shaping on top as a third channel. Give the shaping its own per-step reward \(F_t = \gamma\Phi(s_{t+1}) - \Phi(s_t)\) and run that through the same GAE recursion the reward channel uses, so all three terms arrive on the same footing and can simply be added:</p>
+
+<div class="key-eq">\[ \tilde{A}_t \;=\; \underbrace{w\,\hat{A}^{\mathrm{GAE}}_t}_{\substack{\text{per-step credit,}\\ \text{fades as data ages}}} \;+\; \underbrace{(1 - w)\,\hat{A}^{\mathrm{grp}}_t}_{\substack{\text{group outcome anchor,}\\ \text{stale-proof}}} \;+\; \underbrace{\hat{A}^{\Phi}_t}_{\substack{\text{potential shaping,}\\ \text{always full strength}}} \]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+\(\tilde{A}_t\) is the final advantage for frame \(t\), the number everything downstream consumes. The first term is Section 11.4's GAE estimate, which knows about individual timesteps but trusts the value head. The second is the group-relative estimate, which knows only "this segment did better or worse than typical for this garment" but trusts nothing that can age. The weight \(w\), between 0 and 1, decides which you lean on. It is tied to the dataset's <strong>sampling share</strong> &mdash; the fraction of each training batch drawn from that dataset, which decays as the dataset ages (Chapter 14). Fresh data gets \(w\) near 1 and uses fine-grained credit; decayed data gets \(w\) near 0 and degrades into outcome-only anchoring rather than trusting an obsolete prediction. This \(w\) is a data-freshness weight and has nothing to do with the AWR weight \(w_i = \exp(\hat{A}_i/\beta)\) of Chapter 4. \(\hat{A}^{\Phi}_t\) is the shaping channel just described: the per-step bonus \(F_t = \gamma\Phi(s_{t+1}) - \Phi(s_t)\) pushed through that same GAE recursion. It carries no weight of its own because, as Section 11.3.4 argued, it cannot change which policy is optimal &mdash; though it does move what the sampler looks at, which is why you added it.
+</div>
+
+<p>Finally, normalize \(\tilde{A}\) by a global standard deviation measured on <strong>unbiased rollouts</strong> &mdash; the episodes collected by plain random or curriculum selection, the ones that alone count toward your success statistics, as opposed to the replay and hard-mining rollouts that deliberately oversample particular states (Chapter 14) &mdash; and clip to \([-2, 2]\) before it feeds Chapter 4's AWR sampler and Chapter 10's conditioning token. LeHome adds a garnish: the tightest 20% of successes per garment, ranked by the worst per-condition margin at the final frame, get \(+0.3\) on every frame, nudging the policy from barely-passing folds toward comfortable ones. Figure 11.3 lays out the finished pipeline end to end.</p>
+
+<figure>
+<svg viewBox="0 0 700 320" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch11f3arr" markerWidth="9" markerHeight="8" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#666"/>
+    </marker>
+  </defs>
+  <text x="12" y="20" font-family="Noto Sans" font-size="12" font-weight="600" fill="#333">The advantage assembly line</text>
+
+  <rect x="12" y="34" width="152" height="48" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="88" y="54" font-family="Noto Sans" font-size="11" font-weight="600" fill="#333" text-anchor="middle">1. raw episode</text>
+  <text x="88" y="71" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">600 frames, one bit</text>
+
+  <rect x="187" y="34" width="152" height="48" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="263" y="54" font-family="Noto Sans" font-size="11" font-weight="600" fill="#333" text-anchor="middle">2. checkpoints</text>
+  <text x="263" y="71" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">11.2 + withdrawal</text>
+
+  <rect x="362" y="34" width="152" height="48" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="438" y="54" font-family="Noto Sans" font-size="11" font-weight="600" fill="#333" text-anchor="middle">3. success head</text>
+  <text x="438" y="71" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">11.4 &middot; p &minus; R_acc</text>
+
+  <rect x="536" y="34" width="152" height="48" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="612" y="54" font-family="Noto Sans" font-size="11" font-weight="600" fill="#333" text-anchor="middle">4. damped baseline</text>
+  <text x="612" y="71" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">11.5 &middot; multiply by &alpha;</text>
+
+  <line x1="164" y1="58" x2="183" y2="58" stroke="#666" marker-end="url(#ch11f3arr)"/>
+  <line x1="339" y1="58" x2="358" y2="58" stroke="#666" marker-end="url(#ch11f3arr)"/>
+  <line x1="514" y1="58" x2="532" y2="58" stroke="#666" marker-end="url(#ch11f3arr)"/>
+
+  <line x1="88" y1="86" x2="88" y2="118" stroke="#666" marker-end="url(#ch11f3arr)"/>
+  <line x1="263" y1="86" x2="263" y2="118" stroke="#666" marker-end="url(#ch11f3arr)"/>
+  <line x1="612" y1="86" x2="612" y2="118" stroke="#666" marker-end="url(#ch11f3arr)"/>
+
+  <rect x="12" y="122" width="152" height="48" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="88" y="142" font-family="Noto Sans" font-size="11" font-weight="600" fill="#333" text-anchor="middle">7. potential shaping</text>
+  <text x="88" y="159" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">11.3 &middot; completion head</text>
+
+  <rect x="187" y="122" width="152" height="48" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="263" y="142" font-family="Noto Sans" font-size="11" font-weight="600" fill="#333" text-anchor="middle">6. group anchor</text>
+  <text x="263" y="159" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">11.6 &middot; empirical rates</text>
+
+  <rect x="536" y="122" width="152" height="48" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="612" y="142" font-family="Noto Sans" font-size="11" font-weight="600" fill="#333" text-anchor="middle">5. GAE</text>
+  <text x="612" y="159" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">&gamma; = 0.999, &lambda; = 0.99</text>
+
+  <text x="366" y="146" font-family="Noto Sans" font-size="10" fill="#666">three parallel channels,</text>
+  <text x="366" y="161" font-family="Noto Sans" font-size="10" fill="#666">computed independently</text>
+
+  <polyline points="88,170 88,186 240,186 240,198" fill="none" stroke="#666" marker-end="url(#ch11f3arr)"/>
+  <polyline points="263,170 263,186 330,186 330,198" fill="none" stroke="#666" marker-end="url(#ch11f3arr)"/>
+  <polyline points="612,170 612,186 420,186 420,198" fill="none" stroke="#666" marker-end="url(#ch11f3arr)"/>
+
+  <rect x="196" y="202" width="272" height="48" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="332" y="222" font-family="Noto Sans" font-size="11" font-weight="600" fill="#333" text-anchor="middle">8. sum, normalize, clip</text>
+  <text x="332" y="239" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">w&middot;GAE + (1&minus;w)&middot;group + shaping</text>
+
+  <text x="478" y="210" font-family="Noto Sans" font-size="10" fill="#666">Steps 1&ndash;2 shape the reward.</text>
+  <text x="478" y="226" font-family="Noto Sans" font-size="10" fill="#666">Steps 3&ndash;5 turn it into per-step credit.</text>
+  <text x="478" y="242" font-family="Noto Sans" font-size="10" fill="#666">Steps 6&ndash;8 make that credit robust</text>
+  <text x="478" y="256" font-family="Noto Sans" font-size="10" fill="#666">and comparable.</text>
+
+  <line x1="332" y1="250" x2="332" y2="266" stroke="#666" marker-end="url(#ch11f3arr)"/>
+
+  <rect x="112" y="270" width="440" height="42" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <text x="332" y="288" font-family="Noto Sans" font-size="11" font-weight="600" fill="#333" text-anchor="middle">normalized advantage, clipped to [&minus;2, 2], feeds:</text>
+  <text x="332" y="304" font-family="Noto Sans" font-size="10" fill="#666" text-anchor="middle">AWR sampler (Ch. 4) &middot; advantage token (Ch. 10)</text>
+</svg>
+<figcaption>Figure 11.3 &mdash; The whole chapter as one pipeline. The top row is a genuine chain, read left to right: the raw episode gets checkpoint rewards, the success head turns those into a value estimate, damping scales it. The three boxes below are <em>not</em> a chain &mdash; they are three independent channels, computed from different inputs and combined only at step 8, so the numbering is reading order, not data flow. Only steps 3, 4, and 7 consume a learned prediction (the success head and the completion head); everything else is arithmetic on logged numbers, and both heads were evaluated once at collection time, which is why the pipeline is cheap enough to rerun over every stored rollout each iteration. Notice too that the fragile part, the value head, sits between a damping coefficient and a stale-proof anchor.</figcaption>
+</figure>
+
+<h3>11.6.4 Second worked example: one frame, all three terms</h3>
+
+<p>Take the checkpoint frame of a long-sleeved-top episode that eventually succeeded, so \(r_t = 0.5\), with \(\alpha = 0.5\), \(\gamma = 0.999\), smoothed heads \(\hat{p}_{succ,t} = 0.55\) and \(\hat{p}_{succ,t+1} = 0.62\), and \(R_{acc,t} = 0\) because nothing has paid out yet. Say the checkpoint lands at step 200 of a 600-step episode, so the second segment runs for the remaining \(n = 400\) frames &mdash; that number is needed for the group anchor's scale factor.</p>
+
+<pre class="code">V(s_t)   = 0.5 x (0.55 - 0.00)          = 0.275
+V(s_t+1) = 0.5 x (0.62 - 0.50)          = 0.060     # R_acc,t+1 is now 0.5
+delta_t  = 0.5 + 0.999 x 0.060 - 0.275  = 0.28494
+cross-check with 11.5.4's shortcut:
+  (1 - alpha x gamma) x r_t = 0.5005 x 0.5          = 0.25025
+  alpha x (gamma x p_t+1 - p_t) = 0.5 x 0.06938     = 0.03469
+  sum                                               = 0.28494  (agrees)
+
+Suppose GAE accumulates this and later residuals to A_GAE = 0.42.
+Group anchor: post-checkpoint segment succeeded -&gt; score 1
+  empirical P(success | checkpoint) for this garment = 0.62
+  raw = 1 - 0.62                                     = 0.38
+  scale = mean discount weight over the n = 400 frames of the segment
+        = (1 - 0.999^400) / (400 x 0.001) = 0.32982 / 0.4  = 0.8246
+  A_grp = 0.38 x 0.8246                              = 0.3133
+Shaping: completion head rose 0.31 -&gt; 0.44, so F_t = gamma x Phi' - Phi
+  A_phi = 0.5 x (0.999 x 0.44 - 0.31) = 0.5 x 0.12956 = 0.06478
+Freshness: data 25 iterations old, decay 0.98/iter
+  w = 0.98^25                                        = 0.60
+Blend = 0.60 x 0.42 + 0.40 x 0.3133 + 0.06478        = 0.4421
+Normalize by global std 0.35: 0.4421 / 0.35          = 1.26
+Tightest 20% of successes, so +0.3                   = 1.56 (inside clip)</pre>
+
+<p>Trace what each number did. Of the 0.285 residual, 0.250 is raw reward leaking through &mdash; exactly the \((1-\alpha\gamma)\) fraction. GAE then contributed the largest share of the blend, 0.252, because this data is only moderately aged; the group anchor contributed 0.125, and more if the data were older; shaping contributed 0.065, small but never zero, which keeps a gradient alive where the other two collapse. Normalization turned an unreadable 0.442 into a 1.26 that means something fixed: about 1.3 standard deviations better than average.</p>
+
+<p>Two lines in that block deserve a note, because both are places where a reader is entitled to ask "where did that come from." The scale factor 0.8246 is not a magic constant: it is the mean discount weight \((1-\gamma^{n})/(n(1-\gamma))\) over the segment, from Section 11.6.2, and it is the only quantity in the example that depends on how long the segment is. Recompute it for your own horizon rather than copying the number &mdash; at \(n = 600\) it would be 0.75, at \(n = 900\) it would be 0.66. And the shaping line shows this frame's own \(F_t\) rather than the full GAE of the shaping channel; running the recursion would fold in later frames as well, but the single step is the piece you can check by hand, and it is the piece that carries the \(\gamma\) most people quietly drop.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Advantage scale drift across task groups. \(\hat{A}\) enters \(\exp(\hat{A}/\beta)\) in Chapter 4 and a threshold in Chapter 10, so its <em>scale</em> silently acts as a temperature. A near-saturated garment may produce advantages of \(\pm 0.1\) while a struggling one swings \(\pm 0.8\). Blend those unnormalized and the struggling type dominates sampler and gradient alike &mdash; which sounds desirable until you notice it also dominates when its advantages are pure noise. Use one global normalizer plus clipping, and re-check per-group standard deviations whenever a group saturates.
+</div>
+
+<div class="box jargon"><div class="box-title">Words you will hear</div>
+<strong>Dense vs sparse reward</strong> &mdash; dense pays out most timesteps, sparse only at the end; "sparse-reward task" is shorthand for "hard exploration problem." <strong>Reward hacking</strong> &mdash; the policy scores well on your reward function while failing the task you meant. <strong>Potential function</strong> \(\Phi\) &mdash; a state-only score used to build provably safe shaping. <strong>Control variate</strong> &mdash; a correlated quantity subtracted to cut an estimator's variance without biasing the thing you actually want to estimate; a baseline is one. <strong>Stale off-policy data</strong> &mdash; samples, or predictions stored with them, produced by an older policy than the one being trained. <strong>Group-relative</strong> &mdash; advantage computed by comparing samples of the same task instance instead of against a learned critic.
+</div>
+
+<div class="box checkpoint"><div class="box-title">Checkpoint</div>
+<ul>
+<li>Explain why a 600-step task with one terminal bit yields a zero gradient, naming the sparsity and horizon-variance failures separately.</li>
+<li>Describe the two exploits checkpoint rewards invite &mdash; cyclic farming and bank-then-thrash &mdash; say which mechanism blocks each, and state precisely what reward withdrawal preserves and what it changes.</li>
+<li>State the potential-shaping theorem, sketch the telescoping argument, and explain why a bad \(\Phi\) wastes effort but cannot change the optimal policy.</li>
+<li>Derive \(V(s_t) = \hat{p}_{succ}(s_t) - R_{acc,t}\) by cases, and say why \(R_{acc,t}\) contributes no estimation error.</li>
+<li>Compute \(\alpha^*\) from \(\rho_{GV}\), \(\sigma_G\), \(\sigma_V\), show that \(\alpha = 1\) can be worse than no baseline, and explain why scaling the baseline is a variance choice that leaves the policy gradient unbiased.</li>
+<li>Explain why asynchronous training makes stored value predictions stale, and how a group anchor computed from empirical rates sidesteps that.</li>
+</ul>
+</div>
+
+<p><strong>Where to go deeper.</strong> Ng, Harada, and Russell (1999) is short and worth reading in full &mdash; the necessity direction, the claim that <em>only</em> potential-based shaping is safe, is the surprising half most papers skip. Deng et al. (2013) introduces CUPED, the fastest way to internalize control variates. Schulman et al. (2016) covers the GAE machinery this chapter reuses, and Shao et al. (2024) presents GRPO where the group structure is far more obvious than in robotics. Sections 5 and 6 of Larchenko (2026) show every idea here deployed together; Appendix A gives links and a reading order.</p>
+
+</section>

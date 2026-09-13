@@ -1,0 +1,396 @@
+<section class="chapter" id="ch07">
+<h1>Chapter 7 &mdash; Flow matching</h1>
+
+<p>Chapter 6 gave you a policy that can represent more than one right answer. It also gave you a pile of machinery: a noise schedule \(\beta_1 \dots \beta_{N_{diff}}\), tables of \(\alpha_k\) and \(\bar\alpha_k\), a sampling variance \(\sigma_k\), a linear-versus-cosine decision, and a second sampler (DDIM) bolted on because the first was too slow for a robot.</p>
+
+<p>This chapter is a reformulation that keeps every benefit and throws most of that machinery away. It is called <strong>flow matching</strong>: instead of a noisy, curved, many-step journey, you connect noise to data by a straight line and learn how fast to walk along it. It is what \(\pi_0\), \(\pi_{0.5}\), and \(\pi^*_{0.6}\) use, and by the end you will be able to write the training step and the sampler from memory, in about eight lines.</p>
+
+<p>The chapter also delivers the bad news this book has been walking toward since Chapter 2. For this model class, the quantity every policy-gradient algorithm is built on &mdash; \(\log \pi_\theta(a \mid s)\) &mdash; is not merely expensive. It is unavailable. Seeing exactly why, and exactly what survives, is the hinge that Chapters 9 through 12 turn on.</p>
+
+<h2>7.1 The same goal, a straighter road</h2>
+
+<p>Diffusion in three sentences. A fixed forward process destroys a clean action chunk by adding Gaussian noise in many small steps, until only noise remains. A network learns to predict the noise added at a given level, which is the same as learning one small step back toward the data. Generation starts at pure noise and runs that one-step-back network repeatedly until a clean chunk falls out.</p>
+
+<h3>7.1.1 What we actually want</h3>
+
+<p>What we want is narrow and practical: turn noise into a valid action chunk in as few <strong>network evaluations</strong> &mdash; forward passes through the model &mdash; as possible, because each costs wall-clock time and a robot has a control budget. Diffusion Policy reports 0.1 s of inference latency on an RTX 3080 using 10 DDIM steps (Chi et al., 2023). Ten evaluations fit a receding-horizon schedule. A hundred do not.</p>
+
+<h3>7.1.2 The obvious thing to try, and exactly how it fails</h3>
+
+<p>The obvious thing to try is to keep the trained DDPM and run fewer steps: 10 big ones instead of 1000 small ones. This fails, and it is worth being precise about why. The DDPM update is a step along a <em>curve</em> through action space. Its direction depends on the current noise level: at high noise the field pulls broadly toward the whole data distribution, at low noise sharply toward one specific mode, and in between the direction rotates continuously. Taking a step means approximating a curved arc by a straight chord. That error grows with the square of the step size, so a step 100 times bigger is roughly 10,000 times worse per step while saving only a factor of 100 in count. In Chapter 6's linear schedule \(\sqrt{\bar\alpha_k}\) moves from 0.9471 at \(k = 100\) to 0.2803 at \(k = 500\); one jump across that gap asks the network to be right about a trajectory it never traversed.</p>
+
+<p>Chapter 6's answer was DDIM (Song et al., 2020): a non-Markovian sampler sharing DDPM's training objective, so you can skip steps on an already-trained checkpoint, reported as 10&times; to 50&times; faster in wall clock. A real and widely used fix &mdash; but look at its shape. You trained one process and sample with a different one, on the strength of a non-obvious equivalence, and that is one more thing in the codebase that can be configured wrong.</p>
+
+<h3>7.1.3 The fix, and why it works</h3>
+
+<p>Flow matching asks a different question: instead of patching the sampler so it survives a curved path, why not make the path straight? Take a noise sample \(z\) and a data sample \(a\). Connect them with a straight segment, traverse it at constant speed, and train the network to predict that speed &mdash; that <em>velocity</em> &mdash; at every point along the line. There is no schedule, because there is nothing to schedule &mdash; Chapter 6's \(\beta_k\) and \(\alpha_k\) simply do not appear here, and with them goes the collision with Chapter 4's temperature \(\beta\) and Chapter 11's damping \(\alpha\). No noise is injected during sampling, because the path is deterministic; no second sampler is needed, because plain Euler integration is the right tool. Figure 7.1 shows the whole arrangement at once.</p>
+
+<figure><svg viewBox="0 0 700 252" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch07f1arrB" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4878a8"/></marker>
+<marker id="ch07f1arrO" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#b0703a"/></marker>
+<marker id="ch07f1arrN" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#666"/></marker>
+</defs>
+<line x1="105" y1="85" x2="590" y2="65" stroke="#999" stroke-width="1"/>
+<line x1="120" y1="100" x2="585" y2="78" stroke="#999" stroke-width="1"/>
+<line x1="112" y1="118" x2="614" y2="186" stroke="#999" stroke-width="1"/>
+<line x1="100" y1="150" x2="590" y2="165" stroke="#999" stroke-width="1"/>
+<line x1="82" y1="112" x2="612" y2="170" stroke="#999" stroke-width="1"/>
+<line x1="88" y1="130" x2="592" y2="86" stroke="#4878a8" stroke-width="2.5" marker-end="url(#ch07f1arrB)"/>
+<circle cx="95" cy="118" r="48" fill="none" stroke="#4878a8" stroke-width="1" stroke-dasharray="4 4"/>
+<circle cx="75" cy="95" r="4" fill="#eaf1f8" stroke="#4878a8"/><circle cx="105" cy="85" r="4" fill="#eaf1f8" stroke="#4878a8"/>
+<circle cx="88" cy="130" r="4" fill="#eaf1f8" stroke="#4878a8"/><circle cx="112" cy="118" r="4" fill="#eaf1f8" stroke="#4878a8"/>
+<circle cx="70" cy="140" r="4" fill="#eaf1f8" stroke="#4878a8"/><circle cx="100" cy="150" r="4" fill="#eaf1f8" stroke="#4878a8"/>
+<circle cx="120" cy="100" r="4" fill="#eaf1f8" stroke="#4878a8"/><circle cx="82" cy="112" r="4" fill="#eaf1f8" stroke="#4878a8"/>
+<text x="95" y="48" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4878a8">noise z ~ N(0, I)</text>
+<ellipse cx="600" cy="73" rx="42" ry="26" fill="none" stroke="#4a8a5c" stroke-width="1" stroke-dasharray="4 4"/>
+<circle cx="590" cy="65" r="4" fill="#ecf5ee" stroke="#4a8a5c"/><circle cx="610" cy="72" r="4" fill="#ecf5ee" stroke="#4a8a5c"/>
+<circle cx="598" cy="85" r="4" fill="#ecf5ee" stroke="#4a8a5c"/><circle cx="615" cy="60" r="4" fill="#ecf5ee" stroke="#4a8a5c"/>
+<circle cx="585" cy="78" r="4" fill="#ecf5ee" stroke="#4a8a5c"/>
+<text x="600" y="32" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4a8a5c">chunk mode A</text>
+<ellipse cx="600" cy="175" rx="42" ry="26" fill="none" stroke="#4a8a5c" stroke-width="1" stroke-dasharray="4 4"/>
+<circle cx="590" cy="165" r="4" fill="#ecf5ee" stroke="#4a8a5c"/><circle cx="612" cy="170" r="4" fill="#ecf5ee" stroke="#4a8a5c"/>
+<circle cx="600" cy="185" r="4" fill="#ecf5ee" stroke="#4a8a5c"/><circle cx="585" cy="180" r="4" fill="#ecf5ee" stroke="#4a8a5c"/>
+<circle cx="614" cy="186" r="4" fill="#ecf5ee" stroke="#4a8a5c"/>
+<text x="600" y="218" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4a8a5c">chunk mode B</text>
+<circle cx="241" cy="117" r="4" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="241" y="100" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b0703a">a&#7512; at u = 0.3</text>
+<circle cx="441" cy="99" r="4" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="441" y="83" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b0703a">u = 0.7</text>
+<line x1="255" y1="122" x2="330" y2="122" stroke="#b0703a" stroke-width="2" marker-end="url(#ch07f1arrO)"/>
+<text x="300" y="145" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b0703a">target v = a &minus; z</text>
+<line x1="150" y1="232" x2="540" y2="232" stroke="#666" stroke-width="1" marker-end="url(#ch07f1arrN)"/>
+<text x="95" y="236" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">u = 0</text>
+<text x="600" y="236" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">u = 1</text>
+<text x="345" y="224" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">flow time u (not the env timestep t)</text>
+</svg><figcaption>Figure 7.1 &mdash; Flow matching as transport. Each noise sample on the left joins one action chunk on the right by a straight segment, and different draws land in different modes &mdash; nothing is averaged in action space. The highlighted path marks the interpolant a&#7512; at u = 0.3 and u = 0.7; the target a &minus; z (derived in Section 7.3) is the same vector at both, because it is constant along the line. Watch the crossings near the left: that is where the learned field must average.</figcaption></figure>
+
+<p>Why does that help? Because a first-order integrator is <em>exact</em> on a straight line traversed at constant speed. If you sit at position \(p\) moving at constant velocity \(v\), then after time \(\Delta\) you are at \(p + \Delta v\) &mdash; not approximately, exactly, whether \(\Delta\) is one thousandth or the whole interval. All the step-size error that punished the coarse DDPM sampler came from curvature, and curvature is what we removed. Figure 7.2 draws this side by side.</p>
+
+<p><strong>An honest caveat, up front.</strong> The straightness is exact for each individual training pair \((z, a)\), and only approximate for the field the network actually learns, because that field averages over many pairs whose lines cross. Section 7.3 explains this, and it is why practitioners use \(K = 10\) steps rather than one.</p>
+
+<p><strong>An analogy, with its limit.</strong> Driving to a town 60 km away. On a straight highway you set the cruise control, glance at the map ten times, and arrive. On a mountain road of switchbacks you must steer continuously; glance ten times and you end in a ditch. Diffusion's probability path is the switchbacks; flow matching's is the highway. <em>Where it breaks down:</em> a real highway exists before you drive on it, so staying on it is a control problem. Here there is no road &mdash; the road is the learned field itself, and if the network is wrong, the straight path you imagined is not the path you travel.</p>
+
+<figure><svg viewBox="0 0 700 306" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch07f2arrB" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4878a8"/></marker>
+<marker id="ch07f2arrG" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4a8a5c"/></marker>
+<marker id="ch07f2arrR" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#b04a4a"/></marker>
+</defs>
+<text x="20" y="22" font-family="Noto Sans" font-size="12" fill="#4878a8">Diffusion: curved path, noise injected at every step</text>
+<path d="M 100 105 C 150 45, 190 165, 250 100 C 310 45, 350 160, 410 95 C 470 45, 505 150, 560 85 C 585 62, 600 68, 615 70" fill="none" stroke="#4878a8" stroke-width="2.5" marker-end="url(#ch07f2arrB)"/>
+<circle cx="175" cy="103" r="2.5" fill="#666"/><circle cx="250" cy="100" r="2.5" fill="#666"/>
+<circle cx="330" cy="102" r="2.5" fill="#666"/><circle cx="410" cy="95" r="2.5" fill="#666"/>
+<circle cx="490" cy="96" r="2.5" fill="#666"/><circle cx="560" cy="85" r="2.5" fill="#666"/>
+<circle cx="100" cy="105" r="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="100" y="132" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">z</text>
+<circle cx="615" cy="70" r="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+<text x="615" y="52" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4a8a5c">a</text>
+<polyline points="100,105 250,55 420,140 598,44" fill="none" stroke="#b04a4a" stroke-width="1.6" stroke-dasharray="6 4"/>
+<line x1="591" y1="37" x2="605" y2="51" stroke="#b04a4a" stroke-width="2"/>
+<line x1="605" y1="37" x2="591" y2="51" stroke="#b04a4a" stroke-width="2"/>
+<text x="430" y="163" font-family="Noto Sans" font-size="11" fill="#b04a4a">3 coarse steps cut the corners and miss</text>
+<text x="350" y="182" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">needs ~100 DDPM steps, or ~10 with a DDIM solver</text>
+<line x1="20" y1="196" x2="680" y2="196" stroke="#ccc" stroke-width="1" stroke-dasharray="4 4"/>
+<text x="20" y="220" font-family="Noto Sans" font-size="12" fill="#4a8a5c">Flow matching: straight path, no noise during sampling</text>
+<line x1="100" y1="262" x2="615" y2="227" stroke="#4a8a5c" stroke-width="2.5" marker-end="url(#ch07f2arrG)"/>
+<circle cx="100" cy="262" r="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="100" y="285" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">z (same draw)</text>
+<circle cx="272" cy="250" r="3.5" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<circle cx="443" cy="239" r="3.5" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<circle cx="615" cy="227" r="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+<text x="615" y="211" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#4a8a5c">a</text>
+<text x="360" y="298" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b04a4a">the same 3 chords lie on the path: no corner to cut</text>
+</svg><figcaption>Figure 7.2 &mdash; The same two endpoints, two paths between them. On top the diffusion trajectory bends, so the red dashed three-step approximation cuts corners and lands away from the target (the X). On the bottom the path is straight, so the same three chords sit exactly on it and arrive. This picture is the whole argument for flow matching.</figcaption></figure>
+
+<h2>7.2 Flow time, and why it is not the environment timestep</h2>
+
+<p>A warning before any equations: this is the most common confusion in the material, and everyone hits it. Flow matching introduces a new variable, the <strong>flow time</strong> \(u \in [0,1]\): a continuous progress coordinate measuring how far generation has gotten from noise toward data. At \(u = 0\) you are at pure noise; at \(u = 1\) at a data point. It has nothing whatsoever to do with the environment timestep \(t\).</p>
+
+<p>Papers write flow time as \(\tau\) (the \(\pi_0\) paper) or, disastrously, as \(t\) &mdash; in the generative-modeling literature there is no other "time" competing for the letter. In this book \(u\) is always the flow time and \(t\) is always the environment timestep, without exception.</p>
+
+<p>Hold the two apart like this. The environment timestep \(t\) indexes the MDP: at \(t\) the robot is in state \(s_t\), takes action \(a_t\), gets reward \(r_t\), advances. It is real, irreversible time. The flow time \(u\) indexes a computation that runs to completion <em>inside a single control decision</em>: to produce the chunk \(a_{t:t+H}\) at one timestep \(t\), you sweep \(u\) from 0 to 1, then throw \(u\) away and execute. The MDP never sees \(u\); the ODE never sees \(t\). Chapter 6's index \(k\) was the same kind of private axis, just discrete and running from high noise down to low.</p>
+
+<h3>7.2.1 The interpolant</h3>
+
+<p>Given a noise draw \(z \sim \mathcal{N}(0, I)\) shaped like the action chunk and a real chunk \(a\) from the demonstrations, the <strong>interpolant</strong> is the point you get by mixing them in proportion \(u\):</p>
+
+\[ a^u \;=\; (1-u)\,z \;+\; u\,a . \]
+
+<p>A weighted average whose weights sum to one. At \(u = 0\) it is exactly \(z\); at \(u = 1\) exactly \(a\); in between it slides linearly. Compare Chapter 6's closed-form noising, \(a_k = \sqrt{\bar\alpha_k}\,a_0 + \sqrt{1 - \bar\alpha_k}\,\varepsilon\), whose coefficients are square roots of schedule quantities and do <em>not</em> sum to one. Flow matching's are \(1-u\) and \(u\). There is nothing to look up.</p>
+
+<p>Make it concrete with a scalar. Suppose the demonstrated action is \(a = 0.8\) (one normalized joint command) and the drawn noise is \(z = -0.5\). Then:</p>
+
+\[ a^{0.0} = 1.0(-0.5) + 0.0(0.8) = -0.500 \]
+\[ a^{0.3} = 0.7(-0.5) + 0.3(0.8) = -0.350 + 0.240 = -0.110 \]
+\[ a^{0.5} = 0.5(-0.5) + 0.5(0.8) = -0.250 + 0.400 = \phantom{-}0.150 \]
+\[ a^{0.7} = 0.3(-0.5) + 0.7(0.8) = -0.150 + 0.560 = \phantom{-}0.410 \]
+\[ a^{1.0} = 0.0(-0.5) + 1.0(0.8) = \phantom{-}0.800 \]
+
+<p>Notice the spacing. From \(u = 0\) to \(u = 0.3\) the value moved by \(-0.110 - (-0.500) = 0.390\); from \(u = 0.3\) to \(u = 0.5\), a gap of 0.2, it moved by \(0.150 - (-0.110) = 0.260\). Both are the gap in \(u\) times \(1.3\). The speed along this line is constant and equals \(1.3\). Keep that number.</p>
+
+<h2>7.3 The velocity field and the CFM loss</h2>
+
+<p>The speed is not a coincidence. Differentiate the interpolant with respect to flow time:</p>
+
+\[ \frac{d\,a^u}{du} \;=\; \frac{d}{du}\Big[(1-u)z + u\,a\Big] \;=\; -z + a \;=\; a - z . \]
+
+<p>In the scalar example \(a - z = 0.8 - (-0.5) = 1.3\), exactly the speed we measured. Crucially, this derivative does not depend on \(u\): along one training pair's line the velocity is a <em>constant vector</em>. That is the whole design.</p>
+
+<p>So we train a network &mdash; the <strong>velocity field</strong> \(v_\theta(a^u, u, o)\), which takes the current point, the current flow time, and the observation, and returns a vector shaped like the action chunk &mdash; to output that constant. The loss is plain mean-squared error, called the <strong>conditional flow matching</strong> (CFM) loss because the target is conditioned on one specific data sample \(a\) rather than on the whole distribution:</p>
+
+<div class="key-eq">\[
+\mathcal{L}(\theta) \;=\; \mathbb{E}_{(o,a)\sim \mathcal{D},\; z \sim \mathcal{N}(0,I),\; u \sim \mathcal{U}[0,1]} \Big\lVert\, v_\theta\big(a^u, u, o\big) - (a - z) \,\Big\rVert^2 ,
+\qquad a^u = (1-u)\,z + u\,a .
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+Draw a real observation-and-chunk pair \((o, a)\) from your demonstration dataset \(\mathcal{D}\); draw a noise chunk \(z\) from a standard Gaussian, same shape as \(a\); draw a flow time \(u\) uniformly between 0 and 1. Mix noise and data in proportion \(u\) to get the point \(a^u\). Ask the network, given that mixed point, that flow time, and that observation, to output the vector \(a - z\) &mdash; the straight-line direction and speed from the noise you drew to the data you drew. The double bars are squared Euclidean distance summed over all \(H \times d\) numbers in the chunk; \(\mathbb{E}\) says average this over the whole random draw. That is it. There is no likelihood, no adversary, no schedule.</div>
+
+<h3>7.3.1 The objection you should be raising</h3>
+
+<p>A careful reader asks this immediately, and it is the right question. Many pairs \((z, a)\) pass through the same point at the same flow time, each demanding a different velocity, and the network can output only one vector per input. So what does it learn?</p>
+
+<p>Make the collision concrete. The pair \(z = -0.5,\ a = 0.8\) sits at \(a^{0.5} = 0.150\) and demands velocity \(1.3\). A different pair, \(z = 0.4,\ a = -0.1\), sits at \(0.5(0.4) + 0.5(-0.1) = 0.150\) &mdash; the same point &mdash; and demands \(-0.1 - 0.4 = -0.5\). Two examples, identical network input, targets \(1.3\) and \(-0.5\).</p>
+
+<p>Mean-squared error has a known answer here: its minimizer is the conditional average of the targets. If both pairs are equally likely, the network learns \((1.3 + (-0.5))/2 = 0.4\) at that input. In general,</p>
+
+\[ v_\theta^\ast(x, u, o) \;=\; \mathbb{E}\big[\, a - z \;\big|\; a^u = x,\; u,\; o \,\big] . \]
+
+<p>Your alarm should now be ringing, because <em>averaging</em> is precisely the disease Chapter 5 said generative models were supposed to cure. A Gaussian policy fails because it averages two valid grasps into a collision. Are we not doing the same thing?</p>
+
+<p>No. The Gaussian averages the <em>actions</em> and emits the average; flow matching averages the <em>velocities at intermediate points</em> and then integrates. At small \(u\) the sample is mostly noise, the bundles of paths heading toward different modes genuinely overlap, and the averaged velocity is a broad "head toward the data" push that is correct for all of them. As \(u\) grows, the paths heading to mode A and those heading to mode B separate in action space. The network's input now tells it which bundle it is in, so the conditional average there is no longer a compromise: it is the velocity of the one bundle that reaches that point. The commitment to a mode happens gradually, and by \(u = 1\) it is total. Look back at Figure 7.1: interpolants crowd and cross near the noise end, and separate into two clean mode-bundles near the data end.</p>
+
+<p>The theorem behind this &mdash; three lines of calculus in the source papers &mdash; says the averaged field is exactly the field that transports the standard Gaussian onto the data distribution (Lipman et al., 2023; Liu et al., 2023). Not approximately: with the exact conditional expectation, integrated exactly, samples would be distributed exactly as the data is. Every practical error comes from an imperfect network and a coarse integrator, not from the recipe.</p>
+
+<p>One consequence deserves naming, the honest footnote to Section 7.1: because the bundles cross, the <em>averaged</em> field is not perfectly straight even though every conditional path is. That is why \(K = 1\) fails in practice and \(K = 10\) works. The <strong>rectified flow</strong> line of work (Liu et al., 2023) attacks exactly this: re-pair each generated \(a\) with the \(z\) that produced it and retrain, which removes most crossings and lets you cut \(K\) further.</p>
+
+<h2>7.4 Sampling: an ODE and a for-loop</h2>
+
+<p>Training taught the network a velocity at every point and flow time. Sampling is: start at noise and follow it. That is an <strong>ordinary differential equation</strong> (ODE) &mdash; an equation giving a quantity's rate of change as a function of its current value, solved by stepping forward:</p>
+
+<div class="key-eq">\[
+\frac{d a}{du} = v_\theta\big(a, u, o\big),\quad a(0) = z \sim \mathcal{N}(0,I)
+\qquad\Longrightarrow\qquad
+a^{\,u + 1/K} \;=\; a^{\,u} \;+\; \frac{1}{K}\, v_\theta\big(a^u, u, o\big) .
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The left equation says: the rate at which the sample changes as flow time advances is whatever the network says the velocity is right there, starting from a fresh noise draw \(z\). The right equation is how you solve it on a computer &mdash; an <strong>Euler step</strong>: ask for the velocity where you are, multiply by the step size \(1/K\), add it to your current point, advance \(u\) by \(1/K\), repeat. \(K\) is the number of steps, so \(K\) network evaluations per chunk; the \(\pi\)-family uses \(K = 10\), which \(\pi_0\) writes as \(\delta = 0.1\). After \(K\) steps you stand at \(u = 1\), on the emitted chunk.
+</div>
+
+<pre class="code"># --- one training step (batch of 1, for clarity) ---
+o, a = batch                    # a: action chunk, shape (H, d)
+z = normal(0, 1, a.shape)       # noise, same shape as the chunk
+u = uniform(0, 1)               # FLOW time -- not the env timestep t
+a_u = (1 - u) * z + u * a       # straight-line interpolant
+target = a - z                  # constant along this pair's line
+loss = mse(v_theta(a_u, u, o), target)
+loss.backward(); opt.step()
+
+# --- sampling: K Euler steps of the ODE ---
+a = normal(0, 1, (H, d))        # start at u = 0: pure noise
+for k in range(K):              # K = 10 in the pi-family
+    a = a + (1 / K) * v_theta(a, k / K, o)   # one Euler step
+return a                        # the chunk a_{t:t+H}, ready to execute</pre>
+
+<p>Compare Chapter 6's sampler, which needed \(\alpha_k\), \(\bar\alpha_k\), \(\sigma_k\), and a fresh noise draw inside the loop. Here: one division, one addition, no noise in the loop.</p>
+
+<h3>7.4.1 Worked example, part one: a training step by hand</h3>
+
+<p>A scalar action, so you can check every number. The demonstration action is \(a = 0.8\); we draw noise \(z = -0.5\) and flow time \(u = 0.3\).</p>
+
+\[ a^u = (1 - 0.3)(-0.5) + (0.3)(0.8) = 0.7 \times (-0.5) + 0.3 \times 0.8 \]
+\[ = -0.350 + 0.240 = -0.110 \]
+\[ \text{target} = a - z = 0.8 - (-0.5) = 1.300 \]
+
+<p>Suppose the half-trained network outputs \(v_\theta(-0.11,\ 0.3,\ o) = 0.9\). The loss for this sample is</p>
+
+\[ \mathcal{L} = (0.9 - 1.3)^2 = (-0.4)^2 = 0.160 \]
+
+<p>and its gradient with respect to the network's output is</p>
+
+\[ \frac{\partial \mathcal{L}}{\partial v} = 2\,(0.9 - 1.3) = 2 \times (-0.4) = -0.8 , \]
+
+<p>a negative number, which backpropagation turns into an update pushing the output <em>up</em>, toward 1.3. Nothing here is special to flow matching &mdash; it is the regression loss you would write for any supervised problem, which is the entire point.</p>
+
+<h3>7.4.2 Worked example, part two: sampling in three Euler steps</h3>
+
+<p>Now generate. With observation \(o\), we draw a fresh noise value that happens to be \(z = -0.5\) again, and use \(K = 3\) so the arithmetic stays visible; the step size is \(1/3 = 0.3333\). The trained network returns these velocities, which differ slightly from step to step because the marginal field is only approximately straight:</p>
+
+<pre class="code">start:   u = 0.0000   a = -0.500        (this is z)
+
+step 1:  v_theta(-0.500, 0.0000, o) = 1.20
+         a &lt;- -0.500 + (1/3)(1.20) = -0.500 + 0.400 = -0.100
+         u &lt;- 0.3333
+
+step 2:  v_theta(-0.100, 0.3333, o) = 1.35
+         a &lt;- -0.100 + (1/3)(1.35) = -0.100 + 0.450 =  0.350
+         u &lt;- 0.6667
+
+step 3:  v_theta( 0.350, 0.6667, o) = 1.29
+         a &lt;-  0.350 + (1/3)(1.29) =  0.350 + 0.430 =  0.780
+         u &lt;- 1.0000
+
+emit:    a = 0.780     (the demonstrated action was 0.800)</pre>
+
+<p>Two things to notice. First, had the field been exactly constant at 1.3, the answer would have been \(-0.5 + 1.3 = 0.800\) in <em>any</em> number of steps, including one; the 0.02 discrepancy is entirely due to the velocity varying along the path. Second, one step alone would have given \(-0.5 + 1 \times 1.20 = 0.700\), an error of 0.08 rather than 0.02. A handful of steps buys a large accuracy gain with sharply diminishing returns after &mdash; which is why \(K = 10\) is standard and \(K = 100\) is not.</p>
+
+<h3>7.4.3 Determinism, and why it matters later</h3>
+
+<p>After the initial draw of \(z\) the sampling loop contains no randomness. Same \(o\), same \(z\), same chunk, bit for bit. All of the policy's stochasticity lives in that one draw &mdash; which is worth more than it looks. "Sample \(N\) candidate chunks" is precisely "draw \(N\) values of \(z\) and integrate each," with no hidden coupling between candidates &mdash; which is what makes best-of-\(N\) selection in Chapter 12 clean to implement. It also means you can deliberately <em>reuse</em> a \(z\) across consecutive control ticks to keep the motion coherent, instead of letting a fresh draw flip the policy to a different mode mid-reach. Chapter 12's real-time chunking and inpainting tricks lean on exactly this handle.</p>
+
+<p><strong>A second analogy, with its limit.</strong> If you have written a game or a physics simulation, this loop is familiar: <code>position += velocity * dt</code>, a fixed number of iterations. The velocity field is a pure function of position, progress, and context; the solver is a <code>for</code> loop with no state of its own. <em>Where it breaks down:</em> in a physics engine the velocity comes from real dynamics, and too large a <code>dt</code> makes the simulation explode. Nothing explodes here. Too large a step just lands you slightly off the data manifold: a slightly wrong chunk, not a catastrophe. The failure mode is quiet degradation, which is worse than a crash because it never shows up in a log file.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+LeRobot ships both families, so you can hold them side by side: the <code>diffusion</code> policy from Chapter 6 and the flow-matching <code>pi0</code> ports from this one. Train the diffusion policy on a handful of SO-101 teleop episodes, then read both configs and find the three knobs this chapter and the last one named: chunk length \(H\), integration/denoising steps \(K\), and how many actions execute before the policy is re-queried. A good evening's experiment: hold everything fixed and sweep the flow policy's \(K\) over 1, 2, 5, 10, 20 in open loop, and watch where the emitted trajectory stops changing. That number is your real inference budget.
+</div>
+
+<h2>7.5 Diffusion versus flow matching, honestly</h2>
+
+<p>You will meet both, often in the same repository. The comparison, dimension by dimension:</p>
+
+<p><strong>Training target.</strong> Diffusion regresses the <em>noise</em> \(\varepsilon\) added at a schedule-determined level (Ho et al., 2020); flow matching regresses a <em>velocity</em>, \(a - z\). Close relatives &mdash; both point, up to scaling, away from the data &mdash; but the flow-matching target is constant along its path while the diffusion target's meaning shifts with \(\bar\alpha_k\). Note that \(\pi_0\) writes its interpolant with the opposite orientation, \(A^\tau = \tau A + (1-\tau)\varepsilon\), so \(\tau = 1\) means data (Black et al., 2024). Conventions genuinely differ between papers; when you read code, find the interpolant line first and derive everything else from it.</p>
+
+<p><strong>Path shape.</strong> Diffusion's path is curved and variance-preserving, its shape dictated by the schedule. Flow matching's is a straight line at constant speed. This is the substantive difference; everything else follows from it.</p>
+
+<p><strong>Sampling cost.</strong> Plain DDPM ancestral sampling uses roughly 100 to 1000 network evaluations; DDIM cuts that by a reported 10&times; to 50&times; in wall-clock time (Song et al., 2020). Flow matching uses forward Euler at \(K = 10\), which \(\pi_0\) states as "10 integration steps." Both land near 10 evaluations &mdash; but flow matching gets there with its own sampler, and diffusion by switching samplers.</p>
+
+<p><strong>Implementation complexity.</strong> Flow matching wins clearly, which is not a small thing when you are debugging a policy at 2 a.m. No \(\beta\) schedule, no \(\alpha\)/\(\bar\alpha\) tables, no \(\sigma_k\), no separate DDIM path. Its one real tunable is the distribution you draw \(u\) from, and \(\pi_0\) does tune it: rather than uniform, a beta distribution emphasizing lower (noisier) flow times, \(\mathrm{Beta}\big(\tfrac{s-u}{s};\, 1.5,\, 1\big)\) with \(s = 0.999\).</p>
+
+<p><strong>Empirical quality.</strong> Roughly a wash in the regimes robotics cares about. Diffusion Policy reported an average 46.9% improvement over prior state of the art across 12 tasks and 4 benchmarks using DDPM/DDIM (Chi et al., 2023); the \(\pi\)-family reports comparable results with flow matching. Nobody has shown one family to be fundamentally more expressive, and there is a reason: in DDIM's deterministic setting, diffusion sampling <em>is</em> an ODE solve on the probability-flow ODE. They are cousins, not rivals; flow matching is the cleaner parameterization of the same idea.</p>
+
+<p><strong>Who uses what.</strong> Diffusion Policy and its descendants use DDPM/DDIM. Modern VLAs use flow matching: \(\pi_0\) is explicitly a "vision-language-action flow model" with \(H = 50\) at up to 50 Hz, chosen for precision and multimodal capability at high control rates (Black et al., 2024). \(\pi_{0.5}\) keeps the flow-matching action expert at 10 denoising steps per chunk (Physical Intelligence, 2025a); \(\pi^*_{0.6}\) enlarges it to 860M parameters (Physical Intelligence, 2025b). The honest reading: the VLA world adopted flow matching as much for implementation simplicity and few-step accuracy as for raw sample quality.</p>
+
+<div class="box jargon"><div class="box-title">Words you will hear</div>
+<strong>Continuous normalizing flow (CNF)</strong> &mdash; the model class this belongs to: a distribution defined by pushing noise through the solution of a learned ODE. Flow matching <em>trains</em> a CNF without ever computing its likelihood. <strong>Probability-flow ODE</strong> &mdash; the deterministic ODE whose solutions share a diffusion process's marginals; the bridge between the two families. <strong>NFE (number of function evaluations)</strong> &mdash; the standard sampler cost metric: forward passes per sample. \(K = 10\) means 10 NFEs. <strong>Rectified flow / reflow</strong> &mdash; retraining on model-generated \((z, a)\) pairs to straighten the marginal field. <strong>OT-CFM</strong> &mdash; pairing \(z\) with \(a\) inside a minibatch by optimal transport instead of at random, another way to reduce crossings. <strong>Hutchinson trace estimator</strong> &mdash; the cheap randomized approximation to the trace of a Jacobian.
+</div>
+
+<h2>7.6 Why log-probability dies here</h2>
+
+<p>Now the pivot. PPO (Schulman et al., 2017) needs the <strong>importance ratio</strong> \(\rho_t(\theta) = \pi_\theta(a_t|s_t)/\pi_{\theta_{old}}(a_t|s_t)\) for every sampled action, differentiably in \(\theta\), so it can clip at \(1 \pm \epsilon\); plain REINFORCE from Chapter 2 needs \(\nabla_\theta \log \pi_\theta(a_t|s_t)\). For a Gaussian that is a closed-form expression you evaluate in one line. So: what is \(\log \pi_\theta(a \mid o)\) for a flow policy?</p>
+
+<p>It exists &mdash; worth saying, because it is tempting to assume otherwise. The integration is, in the continuous limit, an invertible map from \(z\) to \(a\), and the change-of-variables formula for continuous flows (Chen et al., 2018) gives it explicitly:</p>
+
+<div class="key-eq">\[
+\log \pi_\theta(a \mid o) \;=\; \log \mathcal{N}(z; 0, I) \;-\; \int_0^1 \nabla \cdot v_\theta\big(a(u), u, o\big)\, du ,
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The left side is the log-probability that this policy assigns to the chunk \(a\) it just emitted, given observation \(o\). The first term on the right is the log-density of a standard Gaussian evaluated at \(z\) &mdash; the noise draw that produced \(a\), recovered by integrating the ODE <em>backward</em> from \(a\). That term is easy. The second term is the correction for how much the flow stretched or squashed volume along the way: \(\nabla \cdot v_\theta\), the <strong>divergence</strong> of the velocity field, is the sum of the partial derivative of each output component with respect to its own input component &mdash; positive where the field spreads samples apart, negative where it pulls them together. \(a(u)\) is the trajectory of the learned ODE with \(a(1) = a\) and \(z = a(0)\). The integral runs along that ODE path &mdash; not along the straight training interpolant \(a^u\), which is a different curve entirely.
+</div>
+
+<h3>7.6.1 Counting the cost, slowly</h3>
+
+<p>The formula is correct and unusable. Count why, one factor at a time, with LeHome's numbers: a bimanual SO-101 chunk with \(H = 30\) and \(d = 12\) is a point in \(30 \times 12 = 360\) dimensions. Figure 7.3 lays out the same accounting visually.</p>
+
+<p><em>First: the divergence is a trace.</em> \(\nabla \cdot v_\theta\) is the trace of the Jacobian of \(v_\theta\) with respect to its 360-dimensional input &mdash; a \(360 \times 360\) matrix, of which you need the 360 diagonal entries. Automatic differentiation gives one row per backward pass, so exact evaluation costs 360 backward passes, for one point on one path.</p>
+
+<p><em>Second: it is an integral, not a value.</em> You need the divergence at every point along the ODE path &mdash; in practice, at every integration step: \(360 \times 10 = 3{,}600\) passes for one log-probability.</p>
+
+<p><em>Third: PPO needs it repeatedly.</em> \(\log \pi_{\theta_{old}}\) is cacheable once at rollout time; \(\log \pi_\theta\) changes every gradient step. With PPO's standard 4 epochs, that is one cached evaluation plus four fresh ones: \(5 \times 3{,}600 = 18{,}000\) passes per chunk. For a minibatch of 256, \(18{,}000 \times 256 = 4{,}608{,}000\) &mdash; about 4.6 million network passes per update, against \(5 \times 256 = 1{,}280\) for a Gaussian policy. Roughly 3,600 times more compute for the same update.</p>
+
+<p><em>Fourth: it must be differentiable through \(\theta\).</em> PPO backpropagates through the ratio, so you are differentiating a quantity itself built from derivatives: second-order terms, and a graph spanning the entire integration.</p>
+
+<p><em>Fifth: the cheap version is noisy.</em> The standard escape is the Hutchinson trace estimator, a randomized estimate costing a handful of passes instead of 360. That makes the cost bearable &mdash; but consider what PPO does with the result. It forms a log-<em>ratio</em>, the difference of two such integrals, and clips at \(\epsilon \approx 0.2\), while the estimator's standard deviation is comfortably larger than 0.2. The clip &mdash; the entire trust-region mechanism, the reason PPO is stable at all &mdash; would be zeroing gradients on estimator noise rather than on any real policy change. Coarse \(K = 10\) integration then adds a bias that does not average away.</p>
+
+<figure><svg viewBox="0 0 700 300" width="700" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="ch07f3arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#666"/></marker>
+</defs>
+<rect x="15" y="20" width="145" height="62" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="87" y="40" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">one sampled</text>
+<text x="87" y="56" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">action chunk a</text>
+<text x="87" y="72" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">360 dimensions</text>
+<line x1="162" y1="51" x2="186" y2="51" stroke="#666" stroke-width="1.2" marker-end="url(#ch07f3arr)"/>
+<rect x="190" y="20" width="145" height="62" rx="6" fill="#eaf1f8" stroke="#4878a8" stroke-width="1.5"/>
+<text x="262" y="40" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">invert the ODE</text>
+<text x="262" y="56" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">back to z</text>
+<text x="262" y="72" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">K = 10 steps</text>
+<line x1="337" y1="51" x2="361" y2="51" stroke="#666" stroke-width="1.2" marker-end="url(#ch07f3arr)"/>
+<rect x="365" y="20" width="145" height="62" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="437" y="40" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">each step needs</text>
+<text x="437" y="56" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">the divergence:</text>
+<text x="437" y="72" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">trace of 360x360 J</text>
+<line x1="512" y1="51" x2="536" y2="51" stroke="#666" stroke-width="1.2" marker-end="url(#ch07f3arr)"/>
+<rect x="540" y="20" width="145" height="62" rx="6" fill="#f8efe8" stroke="#b0703a" stroke-width="1.5"/>
+<text x="612" y="40" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">exact trace =</text>
+<text x="612" y="56" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">one backward pass</text>
+<text x="612" y="72" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">per dimension</text>
+<text x="350" y="100" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">multiply it out:</text>
+<rect x="15" y="108" width="204" height="56" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+<text x="117" y="128" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">360 dims x 10 steps</text>
+<text x="117" y="146" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">= 3,600 passes for</text>
+<text x="117" y="160" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">one log-probability</text>
+<line x1="221" y1="136" x2="245" y2="136" stroke="#666" stroke-width="1.2" marker-end="url(#ch07f3arr)"/>
+<rect x="248" y="108" width="204" height="56" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+<text x="350" y="128" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">x5 (old policy once,</text>
+<text x="350" y="146" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">new policy x4 epochs)</text>
+<text x="350" y="160" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">= 18,000 per sample</text>
+<line x1="454" y1="136" x2="478" y2="136" stroke="#666" stroke-width="1.2" marker-end="url(#ch07f3arr)"/>
+<rect x="481" y="108" width="204" height="56" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="1.5"/>
+<text x="583" y="128" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">x 256-chunk batch</text>
+<text x="583" y="146" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">= 4.6 M passes</text>
+<text x="583" y="160" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">per PPO update</text>
+<text x="350" y="182" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">and three things that make it worse:</text>
+<rect x="15" y="190" width="210" height="44" rx="6" fill="#fff" stroke="#b04a4a" stroke-width="1.2"/>
+<text x="120" y="208" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b04a4a">must differentiate</text>
+<text x="120" y="224" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b04a4a">through theta</text>
+<rect x="245" y="190" width="210" height="44" rx="6" fill="#fff" stroke="#b04a4a" stroke-width="1.2"/>
+<text x="350" y="208" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b04a4a">log-ratio must be</text>
+<text x="350" y="224" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b04a4a">accurate near 0.2</text>
+<rect x="475" y="190" width="210" height="44" rx="6" fill="#fff" stroke="#b04a4a" stroke-width="1.2"/>
+<text x="580" y="208" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b04a4a">Hutchinson trace:</text>
+<text x="580" y="224" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#b04a4a">cheap, but noisy</text>
+<rect x="15" y="252" width="670" height="34" rx="6" fill="#f8efe8" stroke="#b04a4a" stroke-width="1.5"/>
+<text x="350" y="273" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#b04a4a">and the per-step ratio for one env step inside the chunk is not expensive &mdash; it is undefined</text>
+</svg><figcaption>Figure 7.3 &mdash; The anatomy of one log-probability, for a LeHome-sized chunk. Read the top row left to right for where the work comes from, then the green row for the multiplication: roughly 4.6 million network passes per PPO update against about 1,280 for a Gaussian policy. The red boxes say why paying that bill still would not give you a usable clip; the banner says why no amount of compute helps.</figcaption></figure>
+
+<h3>7.6.2 The factor that ends the discussion</h3>
+
+<p>Suppose you accepted all five costs. A sixth problem remains that no amount of compute fixes. PPO's surrogate is written in <em>per-timestep</em> ratios \(\rho_t\): one state, one action, one ratio, one advantage. But the policy emits a chunk covering \(H\) environment steps as one indivisible sample. There is no \(\pi_\theta(a_t \mid s_t)\) for the seventh action inside a chunk, because the model never defined a distribution over that action alone &mdash; only over the whole 360-dimensional object. The per-step ratios are not expensive. They are undefined.</p>
+
+<p><strong>One more analogy, with its limit.</strong> For a Gaussian policy the log-probability is like reading a field off a struct. For a flow policy it is like being handed the output of a long ETL pipeline and asked for the exact probability of the input record: run the pipeline backward, instrumenting every stage for how much it compressed or expanded the data. <em>Where it breaks down:</em> an ETL pipeline is discrete and finite, so its reverse pass is in principle exact. Here the forward map is invertible only in the continuous limit, so even the "exact" answer approximates something your 10-step sampler never computes.</p>
+
+<p>The conclusion, stated plainly: log-probability-based RL on flow policies is a dead end. It is why the LeHome solution contains no PPO at all, and it is the observation Chapter 9 builds its entire side-by-side comparison on.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Two classics, both of which cost people weeks. <strong>First</strong>, conflating flow time \(u\) with the environment timestep \(t\). The ODE integration is an inner loop that runs to completion <em>inside one</em> control decision; \(u\) never appears in the MDP, is never discounted, and has no reward attached. If you find yourself writing \(\gamma^u\), stop. <strong>Second</strong>, hoping to get log-probs "approximately" &mdash; a Hutchinson estimate, an ELBO surrogate, a per-step Gaussian proxy &mdash; and feed them to PPO anyway. Each individual estimate will look plausible in a debugger. The estimator noise is far larger than the \(\epsilon\)-sized signal the clip needs, so the update direction is garbage even when nothing looks broken.
+</div>
+
+<h2>7.7 What survives</h2>
+
+<p>Here is the asymmetry that saves the enterprise, as a slogan: <em>densities are gone, but the loss is still a regression, and regressions can be weighted and conditioned.</em></p>
+
+<p>The CFM loss is an expectation of a per-sample squared error. Nothing in it evaluates a density, and nothing couples samples. So take Chapter 4's advantage-weighted regression weight \(w_i = \exp(\hat A_i / \beta)\), attach it to sample \(i\), and multiply:</p>
+
+<div class="key-eq">\[
+\mathcal{L} \;=\; \mathbb{E}\Big[\; w_i \,\big\lVert v_\theta\big(a_i^{u_i}, u_i, o_i\big) - (a_i - z_i)\big\rVert^2 \;\Big]
+\]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The index \(i\) runs over samples in the batch; each carries its own observation \(o_i\), recorded chunk \(a_i\), noise draw \(z_i\), and flow time \(u_i\). The squared-norm term is exactly the CFM loss of Section 7.3, unchanged. The new factor \(w_i = \exp(\hat A_i / \beta)\) is one positive number computed from that sample's estimated advantage \(\hat A_i\), with temperature \(\beta\) setting how sharply good samples are favored. A chunk that beat the baseline gets \(w_i \gt 1\) and pulls the velocity field harder toward itself; one that underperformed gets \(w_i \lt 1\) and barely moves it. Weighted behavior cloning, where "cloning" means learning to denoise.
+</div>
+
+<p>That is a full reinforcement-learning algorithm running on a generative policy, with no density in it. The second route is conditioning rather than weighting: append extra input to the model &mdash; in \(\pi^*_{0.6}\), a literal text token reading "Advantage: positive" or "Advantage: negative" &mdash; train on all the data with its true label, and at inference ask for the positive one. That is RECAP, and Chapter 10 is devoted to it.</p>
+
+<p>Notice the pattern, because it holds for the rest of the book: every technique from here on touches the regression loss or the sampler, never the density. Advantage engineering in Chapter 11 changes what \(\hat A_i\) is; guidance and best-of-\(N\) in Chapter 12 change how you integrate the ODE and which \(z\) you keep; human interventions in Chapter 13 change which samples enter the batch and with what weight. Density evaluation: intractable. Weighted or conditioned regression: trivial.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+LeHome's policy is a \(\pi_{0.5}\) fine-tune for bimanual SO-101 shirt folding, and its action expert is exactly the flow-matching model of this chapter: \(K = 10\) Euler steps producing \(H = 30\) chunks at 30 Hz in simulation, 20 Hz in the real round (Larchenko, 2026). Chunks are 360-dimensional, which is the number Section 7.6's cost accounting used. PPO was ruled out for precisely the reasons above, and improvement runs entirely through the two survivors: AWR-style weighting of the CFM loss (Chapter 4) and RECAP-style advantage conditioning (Chapter 10). Nothing in the LeHome pipeline ever evaluates a log-probability.
+</div>
+
+<div class="box checkpoint"><div class="box-title">Checkpoint</div>
+<ul>
+<li>Explain why a coarse Euler solve fails on a curved path but is nearly exact on a straight one, and why that motivates the straight-line interpolant.</li>
+<li>Write the interpolant \(a^u = (1-u)z + ua\) and the CFM loss from memory, derive the target \(a - z\), and name every symbol &mdash; including what \(u\) is and is not.</li>
+<li>Answer the crossing-paths objection: what the MSE minimizer converges to, and why averaging velocities is not the failure a Gaussian commits by averaging grasps.</li>
+<li>Implement the sampler, and explain why generation is deterministic given \(z\) and why Chapter 12 cares.</li>
+<li>Compare diffusion and flow matching on target, path shape, NFEs, and implementation complexity, and say which the \(\pi\)-family uses and why.</li>
+<li>Walk someone through the log-probability cost accounting, and finish with the argument that per-step ratios inside a chunk are undefined, not merely expensive.</li>
+</ul>
+</div>
+
+<p><strong>Where to go deeper.</strong> Lipman et al. (2023) is the flow-matching paper and is unusually readable; go there for the conditional-versus-marginal argument Section 7.3 summarized in prose. Liu et al. (2023) gives the rectified-flow view and the reflow procedure. Chen et al. (2018) is the source of the divergence-integral formula, and skimming it makes Section 7.6's cost concrete rather than asserted. Black et al. (2024) shows flow matching wired into a VLA action expert, which is where Chapter 8 picks up. Appendix A sequences Lipman et al. and Black et al. with reading notes; the rectified-flow and neural-ODE papers are optional context beyond the guide.</p>
+
+</section>

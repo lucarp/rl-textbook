@@ -1,0 +1,411 @@
+<section class="chapter" id="ch15">
+<h1>Chapter 15 &mdash; Capstone: replicating LeHome</h1>
+
+<p>You now hold every piece of the machine: policy gradients and advantage estimation (Chapters 2 and 3), why they do not transfer to flow-matching policies (Chapter 9), generative action models and the VLA that wraps one (Chapters 5 through 8), the two ways such a system consumes an advantage (Chapters 4 and 10), reward and advantage engineering (Chapter 11), inference-time optimization (Chapter 12), the human in the loop (Chapter 13), and the asynchronous simulation flywheel (Chapter 14).</p>
+
+<p>This chapter contains almost no new theory. It contains a plan: how to assemble all of that into one project you can finish on hardware you own, ending in a portfolio artifact a hiring manager can verify. The project is to replicate Ilia Larchenko's prizewinning LeHome solution. Each stage has a goal, a deliverable, and a numeric gate. You advance on numbers, not on the feeling that things are going well.</p>
+
+<h2>15.1 What you are replicating, and how you will know</h2>
+
+<h3>15.1.1 The challenge and the two rounds</h3>
+
+<p>The LeHome Challenge 2026, held at ICRA, asked teams to fold garments &mdash; long-sleeved tops, short-sleeved tops, long pants, shorts &mdash; on a bimanual SO-ARM101 rig: two six-degree-of-freedom arms, a twelve-dimensional joint action space, three RGB cameras. Success is binary and geometric. Each garment carries labeled keypoints, and an episode succeeds when a conjunction of pairwise keypoint-distance conditions holds: certain pairs must come within a threshold, certain others must stay apart. Five conditions for tops, four for pants (the official checker; Larchenko expanded long pants to seven for his own reward &mdash; Chapter 8). The garment category is not given at evaluation time; the policy must infer what it is looking at.</p>
+
+<p>There were two rounds. The online round ran inside an NVIDIA Isaac Lab simulation released by the organizers, ranked by overall success rate with no partial credit; sixty-two teams submitted, and Larchenko won it at 79.63% overall, with per-type rates of 74.5, 70.0, 80.5, and 93.5 percent. The real-world final at ICRA in Vienna took the top eight teams under different rules &mdash; partial credit, jury-scored quality, a bonus on unseen garments &mdash; and he placed second (Larchenko, 2026). His solution is the subject of most of this book: a \(\pi_{0.5}\)-derived VLA (Physical Intelligence, 2025a) with auxiliary value heads, sampler-side AWR, RECAP-style advantage conditioning from \(\pi^*_{0.6}\) (Physical Intelligence, 2025b), and an asynchronous flywheel on the Hugging Face Hub.</p>
+
+<h3>15.1.2 Why this is replicable at all</h3>
+
+<p>Most impressive results are not reproducible by one person with one GPU. This one nearly is, because four things are public at once: the tech report, the Apache-2.0 solution repo, the organizers' environment and success checker, and both sim and real checkpoints on the Hub. Open code plus open weights plus an open evaluator turns replication into an engineering task rather than an admiration exercise. The software-engineering analogy: a bug report saying "it crashes sometimes" is useless, while one with a minimal reproduction script and exact dependency versions is something you can act on in an afternoon. LeHome is the second kind. <em>Where the analogy breaks down:</em> a reproduction script is deterministic &mdash; you run it, it crashes or it does not. A policy evaluation is a noisy estimate: run the identical checkpoint on the identical environment twice and you get different numbers, and that difference is not a bug. Which brings us to the part of this chapter that matters most.</p>
+
+<h3>15.1.3 The measurement problem, felt before it is solved</h3>
+
+<p>What you want is simple: a way to tell whether a change helped. The obvious way to get it is equally simple. Run your policy, count successes, write down the rate. Change something. Run it again, count again, compare. If the second number is bigger, the change helped.</p>
+
+<p>Now watch that fail with real numbers. Suppose the change you are about to make does nothing at all: the true success rate is 50% before and 50% after. On Monday you evaluate 20 episodes with the old settings and get 10 successes. You flip the hyperparameter, retrain, evaluate 20 more on Tuesday, and get 13. That is 65% versus 50%, a 15-point gain, and you are pleased. But a fair coin flipped 20 times gives between 6 and 14 heads about 95% of the time. Both days are ordinary outcomes for a coin that never changed. You have measured nothing &mdash; and you will now build three weeks of work on a hyperparameter that did nothing.</p>
+
+<p>The fix is to attach an uncertainty to every number. The unit of everything in this chapter is a success rate \(\hat{p}_{succ}\) over \(n\) scored episodes, and the resolution of that estimate is set by the binomial standard error:</p>
+
+<div class="key-eq">
+\[ \mathrm{SE}(\hat{p}_{succ}) = \sqrt{\frac{\hat{p}_{succ}\,(1-\hat{p}_{succ})}{n}} \]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The left side is the typical amount by which your measured success rate misses the true one, purely from luck of the draw. \(\hat{p}_{succ}\) is the fraction of episodes that succeeded; the hat means "estimated from data" rather than "the true value." \(n\) is how many episodes you scored. The product \(\hat{p}_{succ}(1-\hat{p}_{succ})\) is the variance of a single coin flip with that success probability: largest at \(\hat{p}_{succ}=0.5\), shrinking toward zero as the rate approaches 0 or 1. Dividing by \(n\) is averaging &mdash; more episodes, less noise. The square root converts a variance back into the units of the rate itself, so the answer is in success-rate points.
+</div>
+
+<p>Two consequences shape this chapter. Your error bar shrinks like \(1/\sqrt{n}\), not like \(1/n\): to halve it you need four times the episodes, not twice as many. And near a 50% success rate &mdash; where robot policies live during the interesting phase of a project &mdash; you sit at the worst point on the curve. A 95% confidence interval is roughly \(\hat{p}_{succ} \pm 1.96\,\mathrm{SE}\).</p>
+
+<h3>15.1.4 Worked example: is a +8 point improvement real?</h3>
+
+<p>This is the calculation you run before every gate below, so do it once slowly. Stage B, your behavior-cloning baseline, lands at \(\hat{p}_{succ} = 0.42\) over \(n = 200\) episodes. Stage C, after all the RL machinery, lands at \(0.50\) over another 200. Is the 8-point gain real?</p>
+
+<p>Step 1, the standard error of the baseline. \(0.42 \times 0.58 = 0.2436\). Divide by 200: \(0.2436 / 200 = 0.001218\). Square root: \(\sqrt{0.001218} = 0.0349\).</p>
+
+<p>Step 2, the standard error of the new number. \(0.50 \times 0.50 = 0.25\). Divide by 200: \(0.00125\). Square root: \(\sqrt{0.00125} = 0.0354\).</p>
+
+<p>Step 3, the standard error of the <em>difference</em>. Independent measurements have their variances add, not their standard errors, so add the squares and take one square root: \(0.001218 + 0.00125 = 0.002468\), and \(\sqrt{0.002468} = 0.0497\). That is about \(\sqrt{2}\) times either individual error: comparing two conditions costs precision.</p>
+
+<p>Step 4, the interval. \(1.96 \times 0.0497 = 0.097\), so the 95% interval on the difference runs from \(-1.7\) points to \(+17.7\) points. The interval contains zero. Your improvement is not resolved: it might be real, it might be nothing, and 200 episodes per condition cannot tell you which.</p>
+
+<p>Step 5, how many episodes would have told you. Invert the arithmetic: the half-width \(1.96\,\mathrm{SE}_{\text{diff}}\) should be no larger than the difference \(\Delta\) you want to detect.</p>
+
+<div class="key-eq">
+\[ n \;\approx\; \frac{2\,z^{2}\,\hat{p}_{succ}(1-\hat{p}_{succ})}{\Delta^{2}}, \qquad z = 1.96 \]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+\(n\) is the number of episodes you need <em>in each of the two conditions</em>, not in total. \(\Delta\) is the difference you care about, in the same units as the rate &mdash; here \(0.08\) for eight percentage points. \(z = 1.96\) turns a standard error into a two-sided 95% interval. \(\hat{p}_{succ}(1-\hat{p}_{succ})\) is the same per-episode variance as before, evaluated near where you expect both conditions to sit. The factor of 2 is the price of comparing two noisy numbers instead of measuring one. The \(\Delta^{2}\) in the denominator is the harsh part: halving the effect you want to detect quadruples the episodes you need.
+</div>
+
+<p>Plug in \(\hat{p}_{succ} = 0.46\) (midway between the conditions) and \(\Delta = 0.08\). First \(z^2 = 1.96^2 = 3.8416\), so \(2z^2 = 7.6832\). Then \(0.46 \times 0.54 = 0.2484\), and \(7.6832 \times 0.2484 = 1.9085\). Then \(\Delta^2 = 0.08^2 = 0.0064\). Finally \(1.9085 / 0.0064 = 298.2\). Round up: about 300 episodes per condition, 600 total.</p>
+
+<p>Now price it. A LeHome episode takes roughly 30 seconds in Isaac Sim, so \(600 \times 30 = 18{,}000\) seconds, or 5 hours on one simulator instance. That is the real cost of one honest claim; budget it like training time.</p>
+
+<p>One honest footnote to that 300. It is the point at which a difference of exactly 8 points would just barely clear zero &mdash; so if the true gain really is 8 points, an experiment at \(n = 300\) resolves it roughly half the time, because your measured difference lands above or below 8 with equal ease. To be confident of catching a real 8-point gain, roughly double it: swap \(z^{2} = 3.84\) for \((1.96 + 0.84)^{2} = 7.84\) and the same formula gives \(2 \times 7.84 \times 0.2484 / 0.0064 = 608.6\), about 600 per condition, ten hours of sim. Budget 300 when exploring, 600 when making a claim you will publish.</p>
+
+<p><strong>A second, smaller example.</strong> Stage A asks you to reproduce his per-type numbers on the 12 garments per type you can see, each run 10 times, so \(n = 120\). At his long-sleeve number of \(0.745\): \(0.745 \times 0.255 = 0.1900\), divided by 120 is \(0.001583\), square root \(0.0398\), times 1.96 gives \(\pm 7.8\) points. Your reproduction can land anywhere from 67% to 82% and still be consistent with 74.5%. That is why the Stage A gate says "within a few points" &mdash; and why you should not celebrate at 78%.</p>
+
+<p>One caveat on that \(\pm 7.8\), and it makes things worse rather than better. Those 120 episodes are 12 garments run 10 times each, not 120 independent draws. If the policy simply cannot fold one particular long-sleeved top, that garment contributes ten correlated failures rather than ten unlucky coin flips, and the binomial formula does not know that. The honest quick fix is to treat the garment as the unit: compute a per-garment rate over its 10 runs, then take the standard error across the 12 garment means. Expect an interval wider than \(\pm 7.8\), not narrower. The same caveat applies to the 300-per-condition figure in Step 5.</p>
+
+<pre class="code">
+from math import sqrt
+Z = 1.96                                   # two-sided 95% normal quantile
+
+def delta_ci(p1, n1, p2, n2):              # 95% interval on (p2 - p1)
+    var = p1*(1-p1)/n1 + p2*(1-p2)/n2      # variances add, standard errors do not
+    half = Z * sqrt(var)
+    return (p2 - p1 - half, p2 - p1 + half)
+
+def n_needed(p, delta, z=Z):               # episodes PER condition, not total
+    return 2 * z**2 * p * (1 - p) / delta**2
+
+print(delta_ci(0.42, 200, 0.50, 200))      # (-0.017, 0.177) -> contains 0: not resolved
+print(n_needed(0.46, 0.08))                # 298.2 -> 300 per condition, 5 h of sim
+print(n_needed(0.46, 0.08, z=2.80))        # 608.6 -> 600 if you also want the power
+</pre>
+
+<div class="box jargon"><div class="box-title">Words you will hear</div>
+<strong>Checkpoint</strong> &mdash; two things: a saved snapshot of model weights, and a mid-episode reward milestone (Chapter 11). Context disambiguates; papers rarely bother. <strong>Eval harness</strong> &mdash; the code that runs a policy for \(n\) episodes, scores them, and reports rates; infrastructure, not an experiment. <strong>LoRA</strong> &mdash; low-rank adaptation: freeze the base weights, train small added matrices, ship those. <strong>VRAM</strong> &mdash; memory on the GPU board itself; the constraint deciding whether you fine-tune fully or with adapters. <strong>Confidence interval</strong> &mdash; the range that would cover the true value in 95 of 100 repeated experiments. <strong>Ablation</strong> &mdash; removing one component to measure what it contributed.
+</div>
+
+<p>Put these in your harness on day one and make every table print intervals automatically. If a number cannot print an interval, it does not go in the table. Figure 15.1 shows the pipeline those intervals guard.</p>
+
+<figure>
+<svg viewBox="0 0 700 200" width="700" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ch15f1arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#666"/>
+    </marker>
+  </defs>
+  <rect x="10" y="28" width="120" height="66" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="70" y="50" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333" font-weight="bold">Stage A</text>
+  <text x="70" y="66" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">run his stack</text>
+  <text x="70" y="82" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">1&#8211;2 wk &#183; ~35 h</text>
+  <rect x="152" y="28" width="120" height="66" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="212" y="50" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333" font-weight="bold">Stage B</text>
+  <text x="212" y="66" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">BC baseline</text>
+  <text x="212" y="82" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">2&#8211;3 wk &#183; ~50 h</text>
+  <rect x="294" y="28" width="120" height="66" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <text x="354" y="50" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333" font-weight="bold">Stage C</text>
+  <text x="354" y="66" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">RL loop</text>
+  <text x="354" y="82" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">4&#8211;6 wk &#183; ~105 h</text>
+  <rect x="436" y="28" width="120" height="66" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="496" y="50" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333" font-weight="bold">Stage D</text>
+  <text x="496" y="66" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">inference opts</text>
+  <text x="496" y="82" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">1 wk &#183; ~18 h</text>
+  <rect x="578" y="28" width="112" height="66" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="634" y="50" text-anchor="middle" font-family="Noto Sans" font-size="12" fill="#333" font-weight="bold">Stage E</text>
+  <text x="634" y="66" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#333">real robot</text>
+  <text x="634" y="82" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">6&#8211;8 wk &#183; ~140 h</text>
+  <line x1="130" y1="61" x2="150" y2="61" stroke="#666" stroke-width="1.5" marker-end="url(#ch15f1arr)"/>
+  <line x1="272" y1="61" x2="292" y2="61" stroke="#666" stroke-width="1.5" marker-end="url(#ch15f1arr)"/>
+  <line x1="414" y1="61" x2="434" y2="61" stroke="#666" stroke-width="1.5" marker-end="url(#ch15f1arr)"/>
+  <line x1="556" y1="61" x2="576" y2="61" stroke="#666" stroke-width="1.5" marker-end="url(#ch15f1arr)"/>
+  <text x="70" y="120" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">gate: his checkpoint</text>
+  <text x="70" y="134" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">scores as published</text>
+  <text x="212" y="120" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">gate: BC success</text>
+  <text x="212" y="134" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">per garment, with CI</text>
+  <text x="354" y="120" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">gate: delta over B</text>
+  <text x="354" y="134" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">outside the CI</text>
+  <text x="496" y="120" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">gate: each knob's</text>
+  <text x="496" y="134" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">delta measured</text>
+  <text x="634" y="120" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">gate: real SR over</text>
+  <text x="634" y="134" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#b04a4a">50+ episodes</text>
+  <line x1="10" y1="152" x2="690" y2="152" stroke="#ddd" stroke-width="1"/>
+  <text x="350" y="176" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">durations assume ~15&#8211;20 h/week; do not start a stage before the previous gate passes</text>
+</svg>
+<figcaption>Figure 15.1 &mdash; The staged replication pipeline. Notice that every arrow is guarded by a red gate written in units you can measure, and that most gates mention an interval or a sample size rather than a bare number. A stage that has not passed its gate is not a foundation; it is a liability you pay for two stages later, when you can no longer tell which layer broke.</figcaption>
+</figure>
+
+<h2>15.2 Stage A &mdash; run before you build (1&ndash;2 weeks)</h2>
+
+<p><strong>The goal, in one sentence:</strong> prove his published result runs on your machine and scores what he says, before you change a line.</p>
+
+<p><strong>What you actually do.</strong> Clone the organizers' challenge repository and get Isaac Lab rendering on your GPU &mdash; one consumer card runs one simulation instance comfortably. Clone the solution repository. Provision disk: the repo asks for 500 GB or more. Download his sim checkpoint from the Hub. Run the official evaluation with <em>his</em> weights on the garments you can see &mdash; 10 seen plus 2 public unseen per type, 10 runs each &mdash; and record the four per-type rates with intervals.</p>
+
+<p><strong>The deliverable</strong> is two things, and the second matters as much as the first. One: a table of your reproduced per-type success rates. Two: a one-page map of the codebase, in your own words. Where does the model live? Where does each auxiliary head attach? Where are reward and advantages computed, in which process? How does the sampler apply AWR priorities? You are about to modify this system; Stage A is where you earn the right to.</p>
+
+<p><strong>The gate:</strong> your per-type numbers land within a few points of his published 74.5 / 70.0 / 80.5 / 93.5. You will not reproduce 79.63% exactly, because eight garments per type were private and are not in your evaluation set.</p>
+
+<p><strong>How it most likely goes wrong.</strong> Not the science &mdash; the plumbing. Installing Isaac Lab against your driver and CUDA version is the largest time sink, and the worst failure mode is silent: everything runs, no error appears, and your numbers come out fifteen points low because an image-resize path differs. If your reproduction is far off, resist the urge to "improve" anything; diff your config against his first.</p>
+
+<h2>15.3 Stage B &mdash; the behavior-cloning baseline (2&ndash;3 weeks)</h2>
+
+<p><strong>The goal, in one sentence:</strong> train your own policy on the same data with none of the RL machinery, so every later claim has something honest to be compared against.</p>
+
+<p>Be explicit about why this stage exists, because it is the one people skip. You want to know what the RL machinery buys, and the obvious approach is to build the full system and compare against his published number. That fails subtly: his number reflects his compute budget, his pool of roughly 12,500 rollout episodes, and three months of iteration. If your system scores 55%, you have learned nothing about whether your advantage computation is correct &mdash; only that you have less compute. A baseline you trained yourself is the only comparison that isolates what you are testing. In software terms: you would never accept a performance optimization without benchmarking the unoptimized build on the same machine.</p>
+
+<p><strong>What you actually do.</strong> Fine-tune the base policy on the organizers' scripted-demonstration dataset with plain flow-matching behavior cloning, exactly as Chapter 7 described it: sample a flow time \(u\), form the interpolant, regress the velocity field. No advantage signal, no reward pipeline, no conditioning. If you start from his checkpoint rather than a clean \(\pi_{0.5}\) base, keep its advantage token masked to neutral throughout &mdash; otherwise the policy is quietly conditioning on a signal you are not computing, and your "baseline" is not one. A clean \(\pi_{0.5}\) base has no advantage token and needs no such care.</p>
+
+<p>Stage B also forces you through his training code at your scale: the multi-dataset sampler, the smooth per-timestep action normalization, the frozen SigLIP encoder (a contrastively pretrained vision encoder that stays fixed while the rest trains). Downscale deliberately &mdash; LoRA adapters (low-rank adapters: freeze the original weights, train small added matrices instead) or a reduced batch with gradient accumulation.</p>
+
+<p>LoRA deserves an analogy, since it is everywhere in this literature. A LoRA adapter is the patch file, not the fork: instead of shipping a modified copy of a 2.7-billion-parameter model, you ship a small diff applied at load time, and you can keep several diffs against one base. <em>Where the analogy breaks down:</em> a patch file can express any change, given enough lines. A low-rank adapter cannot &mdash; restricted to updates of limited rank, it genuinely has less capacity than full fine-tuning. Usually fine, sometimes even helpful in limiting drift, but a real constraint and not just a storage trick.</p>
+
+<p><strong>The deliverable:</strong> per-type success rates with intervals at the sample sizes from Section 15.1, plus training throughput &mdash; steps per second, VRAM used (the memory on the GPU card itself, the binding constraint here), wall-clock hours per 10,000 steps. Record it even though it feels like bookkeeping; Stage C's feasibility is a function of that number.</p>
+
+<p><strong>The gate:</strong> a per-type BC success rate with a confidence interval, written down and committed. Every later stage must beat it or explain itself.</p>
+
+<p><strong>How it most likely goes wrong.</strong> Data pipeline mismatches that show up as mediocre-but-plausible scores: wrong action normalization, a camera in the wrong slot, a chunk horizon disagreeing with the dataset's. And the human failure: declaring the baseline done at \(n = 40\) because training was slow and you were impatient.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Skipping Stages A and B to "start with the interesting part" means debugging reinforcement learning on top of an unverified stack. When success rates stall, you face three unknowns at once: the advantage math might be wrong, the evaluation harness might be wrong, or the policy might never have trained correctly. Each is a week to rule out, and they interact. A reproduced checkpoint score and a measured BC baseline collapse three unknowns into one. That is the whole argument for staging.
+</div>
+
+<h2>15.4 Stage C &mdash; the RL loop (4&ndash;6 weeks)</h2>
+
+<p><strong>The goal, in one sentence:</strong> add the learning loop in dependency order, so when something breaks you know which layer broke it.</p>
+
+<p>Dependency order is not a preference: each piece consumes the output of the previous one, and a bug in an early piece looks exactly like a bug in a later one.</p>
+
+<h3>15.4.1 Layer one: the auxiliary heads</h3>
+
+<p>Four of the five heads (Chapter 8) are linear probes: one matrix multiply from a representation the network has already computed to the quantity you want. That makes them nearly free, and it makes them informative &mdash; if a linear map can read the answer off the representation, the representation already contained it.</p>
+
+<p>All four hang off the shared query token, the single vector the backbone hands to the action expert. The success head predicts the probability that this episode ends in success. The garment-type head predicts which of the four categories the policy is looking at, which matters because the category is withheld at evaluation time. The completion head predicts how far through the fold the episode is, as a fraction. The keypoint-distance head predicts the pairwise distances the success checker will eventually measure.</p>
+
+<p>The fifth head is different in kind. It sits at the tail of the action expert rather than on the query token, and it reads the sampled action chunk, which makes it action-conditional: it answers "if I execute <em>this</em> chunk, what happens?" rather than "from this state, what tends to happen?" That is the distinction between \(Q^\pi(s,a)\) and \(V^\pi(s)\) from Chapter 3, which is why the report calls it Q-like. It predicts future keypoint distances and a success residual &mdash; how much this particular chunk moves the episode's success probability.</p>
+
+<p>The keypoint targets need sim-privileged state, meaning ground truth the simulator knows and your cameras do not; that is why this layer belongs to Stage C and could not have been built in Stage B. Verify each head alone before anything consumes it. Garment type should reach very high accuracy within a few thousand steps; if it does not, suspect your data pipeline before your head. And write down the success head's correlation with actual outcomes on held-out episodes, because a weak correlation there is your earliest warning that layer three will produce noise.</p>
+
+<h3>15.4.2 Layer two: reward</h3>
+
+<p>The reward is derived from the success checker rather than invented alongside it (Chapter 11). Any reward you write by hand is a second specification of the task, and the moment it disagrees with the checker your policy optimizes the wrong one. Three mechanisms sit on top of it.</p>
+
+<p><strong>Checkpoint densification</strong> pays partial credit at one intermediate milestone, exactly as Chapter 11 §11.2 specifies. Tops and long pants get a mid checkpoint worth 0.5 &mdash; for a long-sleeved top, "sleeves folded onto the body" &mdash; with the remaining 0.5 paid at full success, so cumulative reward tops out at 1.0 on precisely the episodes the official checker accepts. Shorts get no mid checkpoint: one fold has no halfway point. For tops that first 0.5 is not a lump but is granted gradually, in proportion to the reduction of the primary proximity distance, under the running-min rule that stops a policy farming it by sliding the sleeve back and forth. Implement Chapter 11's version verbatim; a policy that half-folds and then thrashes must end the episode at zero, which is what reward withdrawal is for.</p>
+
+<p><strong>Gradual proximity credit</strong> softens that further for tops, where the conditions are hardest. Instead of paying only when a distance crosses its threshold, you pay on the running minimum: track the smallest value that pair has reached in this episode, and pay whenever that minimum improves. Running minimum rather than current value, for two reasons &mdash; a policy is not punished when a later motion disturbs a pair it already brought together, and it cannot farm reward by oscillating across a threshold.</p>
+
+<p><strong>Failure withdrawal</strong> takes it all back. If the episode ends in failure, every partial payment made during it is subtracted, so the episode's return is exactly zero or exactly the success value. Densification is allowed to change <em>where inside an episode</em> credit lands; it must not change <em>what an episode is worth</em>. If it does, a long failure that collected four partial payments outranks a short clean success, and your advantages will faithfully teach the policy to fail slowly.</p>
+
+<h3>15.4.3 Layer three: advantages</h3>
+
+<p>Four decisions go into the advantage, and they are easier to hold separately than together. First, the value estimate comes from the success head rather than from a separately trained critic &mdash; you trained that head in layer one, and it already predicts what a value function predicts. Second, that prediction becomes a value by subtracting the reward already collected and then damping the result. Third, per-step credit comes from GAE (Chapter 3) with \(\gamma = 0.999\) and \(\lambda = 0.99\): a long horizon and a long trace, because a fold runs for hundreds of frames and the credit for a good grasp is genuinely spread across all of them. Fourth, because rollouts stay in the pool while the policy moves on, that per-step term is blended toward a GRPO-style anchor comparing a segment against the empirical average for its garment type, with the blend shifting toward the anchor as the data ages. Potential-based completion shaping is added on top.</p>
+
+<div class="key-eq">
+\[ \hat{V}_t = \alpha\,\big(\hat{p}_{succ}(s_t) - R_{acc,t}\big), \qquad \tilde{A}_t = w\,\hat{A}^{\mathrm{GAE}}_t + (1-w)\,\hat{A}^{\mathrm{grp}}_t + \hat{A}^{\Phi}_t \]
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+Careful &mdash; \(\hat{p}_{succ}\) means something narrower here than it did in Section 15.1. There it was the fraction of episodes that succeeded, measured after the fact over a whole condition. Here \(\hat{p}_{succ}(s_t)\) is the success head's prediction at one frame: the model's own guess, made while the episode is still running, that this episode will end in success. Same underlying quantity &mdash; a probability of success &mdash; but one is measured over many episodes and the other is predicted at a single frame, which is why this one carries \(s_t\). Both terms on the right are read at that same frame: the head's prediction at \(t\), and \(R_{acc,t}\), the reward already paid out in the frames before \(t\). Their difference is the reward still available to collect. The damping coefficient \(\alpha = 0.5\) shrinks that estimate deliberately, because a noisy baseline subtracted at full strength adds more variance than it removes.
+</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The second equation is the final advantage for frame \(t\), a weighted sum of three estimates of one thing. \(\hat{A}^{\mathrm{GAE}}_t\) is per-step credit from Chapter 3: accurate, but it leans on value predictions that go stale as the policy moves away from the one that collected the rollout. \(\hat{A}^{\mathrm{grp}}_t\) compares a segment against the empirical average for that garment type &mdash; coarser, but an outcome stays an outcome however old the policy is. \(w\) is the blend weight between them, tied to how heavily that dataset is still sampled; it is unrelated to the AWR weight \(w_i\) below, despite the letter. \(\hat{A}^{\Phi}_t\) is potential-based shaping from the completion head, added at full strength because potential-based shaping (Chapter 11) provably leaves the optimal policy unchanged, so turning it up cannot quietly bend the objective.
+</div>
+
+<p>Use \(\alpha = 0.5\), with \(w\) tied to the dataset's decaying sampling share &mdash; Chapter 11's formula verbatim, the \(\hat{A}^{\mathrm{grp}}\) anchor computed per garment-type segment.</p>
+
+<h3>15.4.4 Layer four: spending the advantage twice</h3>
+
+<p>The same \(\tilde{A}_t\) is spent twice, in the two ways Chapters 4 and 10 describe. One step the formula below hides: before clipping, divide the advantages by a single global standard deviation computed over the current pool of rollouts. Without it the clip range \([-2, 2]\) means something different every iteration, because raw advantage magnitudes drift as the policy improves. Normalize, then clip.</p>
+
+<p>The first consumer is AWR through the sampler: \(P(i) \propto e^{\mathrm{clip}(\tilde{A}_i,\, -2,\, 2)}\), where \(P(i)\) is the probability that training sample \(i\) is drawn into a batch &mdash; not a weight in the loss, a probability in the sampler. That is Chapter 4's AWR weight \(w_i = \exp(\hat{A}_i/\beta)\) with temperature \(\beta = 1\), moved out of the loss and into the sampler, where it costs nothing because you were going to draw a batch anyway. The clip at \(\pm 2\) caps the ratio between the most and least favored sample at about \(e^{4} \approx 55\), so one freak episode cannot take over training.</p>
+
+<p>The second consumer is the RECAP advantage token from Chapter 10: the advantage is quantized and fed back to the model as an input, so the policy learns what a high-advantage action looks like rather than merely being pushed toward one. Mask that token stochastically during training so the model also learns the unconditional distribution &mdash; that is what makes classifier-free guidance available in Stage D. Without the masking there is no unconditional mode to guide away from.</p>
+
+<h3>15.4.5 Layer five: the flywheel, and the case you will actually build</h3>
+
+<p>Conceptually the flywheel (Chapter 14) is three processes that never wait for each other. A <em>trainer</em> reads rollout datasets and writes checkpoints. <em>Rollout workers</em> read the newest checkpoint and write scored episodes. A <em>DAgger station</em> lets a human take over failing episodes and writes corrections. All three talk only through the Hub, and what the absence of synchronization barriers buys is concrete: a slow simulator never leaves the GPU idle, and a long training step never leaves the simulators idle.</p>
+
+<p>On one workstation you cannot buy that, because your single GPU can only do one of those jobs at a time. So build the flywheel's degenerate case: the same three roles, the same interfaces, run sequentially in one process &mdash; collect, compute, train, repeat. The pseudocode below is exactly that case, which is why it looks strictly sequential. Keep the roles separate anyway and going asynchronous later is a scheduling change, not a rewrite. When Section 15.8 tells you to cut the flywheel, it is confirming this choice rather than reversing it.</p>
+
+<pre class="code">
+# one Stage C iteration on a single workstation (pseudocode)
+roll = collect(policy=ckpt, n_episodes=300, garments=["top_long"])   # ~2.5 h of sim
+rew  = densify(success_checker, roll)          # checkpoints + failure withdrawal
+val  = 0.5 * (roll.p_succ_at_collection - roll.R_acc)   # damped baseline, alpha=0.5
+adv  = (w * gae(rew, val, gamma=0.999, lam=0.99)        # predictions are NOT re-run
+        + (1 - w) * group_anchor(roll)                  # stale-proof outcome term
+        + potential(roll.completion))                   # shaping, full strength
+adv  = clip(adv / global_std, -2, 2)
+prob = softmax(adv)                            # AWR lives in the sampler, not the loss
+ckpt = train(ckpt, sample_by=prob, adv_token=adv, steps=1000)   # ~6 h at LoRA scale
+</pre>
+
+<p><strong>Scoping this to one workstation, honestly.</strong> Full fine-tuning of the roughly 2.7-billion-parameter backbone-plus-expert with AdamW wants 40&ndash;50 GB of VRAM; LoRA with the frozen encoder fits in 24 GB. Run one or two Isaac instances alternating with training, and restrict the curriculum to one or two garment types. Expect one full iteration &mdash; collect rollouts, recompute advantages, a thousand steps, push a checkpoint &mdash; to take a day, not the forty-minute cadence his H200 sustained.</p>
+
+<p><strong>The deliverable</strong> is three artifacts. The trained checkpoint. A per-head validation report &mdash; garment-type accuracy, the success head's correlation with outcomes, keypoint-distance error, each on held-out episodes and each plotted over training. And unit tests for the advantage pipeline, the part you will want to skip and the part that costs a month when it is wrong: a fabricated episode with constant return must give zero advantage everywhere, a shaping-only episode must leave the episode's total return unchanged, and a stale-data episode must use the predictions recorded at collection time rather than fresh ones.</p>
+
+<p><strong>The gate:</strong> a statistically resolved improvement over Stage B on at least one garment type, at the sample sizes from Section 15.1. One type, one resolved delta. That is a real result.</p>
+
+<p><strong>How it most likely goes wrong.</strong> Turning on all five layers in one weekend. Forgetting that predictions must be recorded at collection time and never re-predicted, which silently corrupts advantages. And a subtler trap about which episodes are allowed to count.</p>
+
+<p>Only rollouts started from the ordinary initial-state distribution count toward success statistics. Three strategies qualify: <em>random</em>, which draws a random initial garment pose; <em>full</em>, which runs a whole episode from the standard reset; and <em>curriculum</em>, which biases which garments appear but not where an episode begins. Two others deliberately start somewhere else. <em>Success replay</em> restarts from a saved physics snapshot of an earlier success and re-runs it under heavier augmentation. <em>Hard mining</em> restarts from snapshots of states where the value prediction collapsed. Both make excellent training data and neither makes a measurement, because their starting states were chosen by looking at outcomes; mix them into a gate and you manufacture improvements that do not exist.</p>
+
+<p>The codebase calls the first three the <em>unbiased</em> strategies, and that word is worth flagging before it misleads you. It has nothing to do with the estimators in Section 15.1: here "unbiased" means "not selection-biased in which state the episode starts from." An episode from an unbiased strategy still gives you a noisy rate with all the same error bars.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+Training ran on a single H200: batch 192, bf16, frozen SigLIP, about 300k steps, pushing a new checkpoint roughly every 40 minutes. Separate RTX PRO 6000 machines each ran 3&ndash;5 Isaac Sim instances behind one shared stateless policy server, and scaling up meant starting another machine; the repo asks for 500+ GB of disk. The final pool was about 12,500 rollout episodes over roughly 140 sessions. Your single-GPU loop iterates perhaps ten times slower; scope Stage C to match. One garment type and one resolved improvement beats four types and no measurements.
+</div>
+
+<h2>15.5 Stage D &mdash; inference-time optimization (1 week)</h2>
+
+<p><strong>The goal, in one sentence:</strong> with the policy frozen, harvest Chapter 12's cheap wins one at a time, each with an attributable delta.</p>
+
+<p><strong>What you actually do,</strong> in this order. First, sweep the classifier-free guidance scale \(g\) &mdash; the knob that controls how hard the sampler is pushed toward the high-advantage mode and away from the unconditional one it also learned (Chapter 12). Sweep it wide. His bandit pinned values of 7 to 9 after he had initially searched only 0 to 2, so sweep at least 0 to 12; the setting that worked was outside the range he first thought reasonable.</p>
+
+<p>Second, add best-of-\(N\): sample \(N\) candidate action chunks instead of one, score each with the action-conditional success-residual head you built in Stage C, and execute the winner. \(N = 2\) or \(3\) helped consistently and larger did not. The cost is linear &mdash; three candidates means three passes through the action expert per chunk &mdash; while the benefit saturates as soon as the scoring head runs out of discrimination.</p>
+
+<p>Only then let the bandit loose. A factorized Thompson-sampling bandit is an online tuner: it keeps a probability distribution over where each knob's best value lies, samples a setting from it, runs episodes, and updates. "Factorized" means it treats the knobs as independent rather than searching their joint space, which is the only reason seven of them are tractable. It tunes the seven per-garment-type knobs &mdash; four sets of seven, one set per garment type, not one per garment &mdash; updating only on episodes started from the ordinary initial-state distribution, for the reason Section 15.4 gave. The seven, with what each physically does:</p>
+
+<ul>
+<li><strong>Execution length</strong> &mdash; how many actions of each predicted chunk you actually execute before replanning. Shorter means more reactive and more compute.</li>
+<li><strong>Playback stretch</strong> &mdash; a time-scaling factor on the chunk as it is executed; stretching plays the same motion more slowly.</li>
+<li><strong>Anchor length</strong> &mdash; how many actions from the end of the previous chunk are handed to the sampler as context, so consecutive chunks join smoothly.</li>
+<li><strong>Inpainting onset</strong> &mdash; the flow time \(u\) below which the previous chunk's tail is held fixed while the rest of the new chunk is generated around it.</li>
+<li><strong>Guidance scale \(g\)</strong> &mdash; as above.</li>
+<li><strong>Noise temperature</strong> &mdash; how much of the initial noise \(z\) survives into the sample; lower makes the sampler more deterministic and its chunks more alike.</li>
+<li><strong>\(N\)</strong> &mdash; the best-of-\(N\) width.</li>
+</ul>
+
+<p>The ordering is the lesson: sweeps first, bandit second. A bandit finds a good joint setting but tells you nothing about why. Start there and you end the stage with a config file and no understanding, unable to answer "which of those mattered?" Attribution first, optimization second.</p>
+
+<p><strong>The deliverable and gate</strong> are the same object: a table with one measured delta per accepted knob, each with its interval. Section 15.1's arithmetic applies here &mdash; a 2-point guidance gain needs far more episodes than an 8-point one, and some knobs will not be resolvable on your budget. "Not resolved at \(n=300\)" is a legitimate entry, more honest than a number without an interval.</p>
+
+<p><strong>How it most likely goes wrong.</strong> You sweep a knob at \(n = 60\) per setting, see a 2-point win, and keep it. Run Section 15.1's arithmetic before you do. Near \(\hat{p}_{succ} = 0.5\) the standard error of the difference is \(\sqrt{2 \times 0.25 / 60} = 0.091\), so the interval on your 2-point win runs \(+2 \pm 17.9\) points. You have measured nothing, and you have now frozen a knob on it. This is Section 15.1's lesson in a new costume, and it bites hardest here precisely because the stage is cheap: a sweep is a config change and an hour of sim, so you can freeze twenty knobs on noise in a week. The same arithmetic explains the ordering above &mdash; sweeping all seven at honest sample sizes is more simulation than Stage C used, so you buy attribution for two and let the bandit have the rest.</p>
+
+<h2>15.6 Stage E &mdash; to the real robot (6&ndash;8 weeks)</h2>
+
+<p><strong>The goal, in one sentence:</strong> get a policy running on physical hardware, measured, with the protocol written down before the first episode. Here is the honest fork: LeHome is bimanual, and you own one SO-101 leader/follower pair.</p>
+
+<p><strong>Path (a): replicate properly.</strong> A second leader/follower pair costs roughly $250&ndash;450 in kit form, plus two wrist cameras. Then follow his sim-to-real recipe. It is five separate mechanisms, and each one removes a specific mismatch between the simulator your policy grew up in and the room it now has to work in.</p>
+
+<p><em>Mount the arms 46 cm apart,</em> matching the simulation. This sounds too trivial to write down and it is not: the policy learned a workspace geometry along with everything else, and arms 5 cm too far apart shift every reachable point by an amount no reasonable quantity of fine-tuning data will politely absorb.</p>
+
+<p><em>Make takeover jump-free.</em> During DAgger the leader arms track the followers continuously, so at the moment you grab a leader it is already at the follower's pose. Without that, takeover is a discontinuity &mdash; the robot snaps from where it was to wherever your hands were resting &mdash; and every snap is recorded as a demonstrated action that the policy will faithfully learn. He arms and releases takeover with a three-pedal foot switch, which keeps both hands on the leaders; the pedal is not the point, the hands-free arming is.</p>
+
+<p><em>Build the camera-overlay alignment tool.</em> It drives the robot to the joint state recorded in a chosen dataset frame, then overlays the live camera image on the recorded one so you can nudge each camera until the two coincide. Camera placement is the mismatch you are least likely to notice and most likely to be destroyed by, because a policy trained on one viewpoint does not see a shifted viewpoint as the same scene from slightly elsewhere. It sees a different state.</p>
+
+<p><em>Apply per-source speed factors.</em> Demonstrations from different sources &mdash; your teleoperation, his, scripted trajectories &mdash; move at systematically different speeds, and a policy trained on the mixture learns a blurred average pace that matches nobody. A per-source scaling factor normalizes motion intensity, so the mixture teaches what to do rather than how fast whoever recorded it happened to move.</p>
+
+<p><em>Strip the model,</em> and here the reason comes first because everything follows from it. On a real robot there is no success checker; no checker means no reward, and no reward means no advantage. Everything in your architecture that consumes an advantage therefore has nothing to consume: the advantage token has no value to be set to, classifier-free guidance has no high-advantage mode to steer toward, and best-of-\(N\) has no way to rank candidates, because the success-residual head scores against a signal you can no longer produce. Take all three out. What remains is the action objective plus the garment-type and completion heads, both predictable from images alone and both unaffected.</p>
+
+<p><strong>Path (b): adapt.</strong> A single-arm garment task &mdash; a towel fold with one arm plus a fixture, a clamp or weighted edge standing in for the second gripper &mdash; reusing the same machinery: teleoperated demonstrations on your rig, a sim scene aligned to your cameras, DAgger corrections with intervention weighting (Chapter 13), then a real fine-tune under heavy augmentation. This is your hil-serl workflow with a VLA policy in place of SAC.</p>
+
+<p>Either path exercises every skill a robotics-RL interview probes; path (b) costs less and demands more judgment, which is not a downside. <strong>The gate:</strong> a real-robot success rate over at least 50 scored episodes, with the protocol &mdash; garment set, reset procedure, what counts as success, who scores it &mdash; written down <em>before</em> you run it.</p>
+
+<p><strong>How it most likely goes wrong.</strong> Not the policy &mdash; the protocol. Three specific failures manufacture success rate on real hardware, and all three feel like diligence while you are committing them. <em>Protocol drift:</em> the way you set up an episode in week two is not quite the way you set it up in week one, because by week two you have learned what the policy likes; it happens one small accommodation at a time and turns a fixed measurement into a moving one. <em>Asymmetric resets:</em> after a failure you smooth the garment out carefully and after a success you leave it as it fell, or the reverse, and the two outcomes are no longer drawn from the same distribution of starting states. <em>Scoring your own episodes:</em> you know which condition is the new one, folds near the threshold are genuinely ambiguous, and they drift the way you are hoping.</p>
+
+<p>The countermeasures are dull and they work. Write the protocol before the first episode. Photograph the reset state and match the photograph every time. Randomize the order conditions are run in. Have someone who does not know which condition is which score the videos &mdash; or, failing that, score them yourself from video, shuffled and unlabeled, days later.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+You have already run the hardest part of path (b) once. Your hil-serl setup is actor and learner as separate processes, Xbox-pad interventions on a physical SO-101, and a working run at a 98% intervention rate &mdash; the human doing the task, the policy almost nothing. That is the correct starting point, not a failure: Chapter 13's argument is that intervention rate is your progress metric, and watching it fall toward 30% is Section 15.1's discipline in a different unit. Swap SAC for the VLA, keep the topology and keep the pad &mdash; whatever your hand is already trained on for takeover is the right takeover device.
+</div>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+Letting simulation work expand forever. Larchenko spent roughly three months in sim and one week on sim-to-real &mdash; and zero-shot transfer still failed, because the latest checkpoints had overfit the simulator down to the image-resize pipeline: 640&rarr;224 and 640&rarr;320&rarr;224 were distinguishable by the auxiliary heads, and the difference cost real success rate. Timebox Stages C and D, start transfer from a late-but-not-latest checkpoint, and accept the trade: touching the real arm two weeks earlier beats one more point in sim.
+</div>
+
+<h2>15.7 What to publish</h2>
+
+<p>The portfolio artifact is the point of the capstone, so plan it from week one rather than assembling it from memory at the end. Publish a repository with four things in it. Each one answers a question a reviewer is already asking, whether or not he says so out loud.</p>
+
+<p><strong>One: the per-stage evaluation table.</strong> One row per stage and garment type, five columns &mdash; condition, \(n\), success rate, 95% interval, and which rollout strategies produced the episodes. Two rows are enough to show the shape:</p>
+
+<pre class="code">
+condition                     n    rate   95% CI           rollouts
+B: BC baseline, top_short    300   0.41   [0.354, 0.466]   random+full
+C: +AWR +advantage token     300   0.51   [0.453, 0.567]   random+full
+</pre>
+
+<p>The columns are the argument. The \(n\) column says you knew sample size was a decision rather than an accident. The interval column says you know the rate is an estimate. The rollout column says you knew which episodes were allowed to count, and it is the one that most sharply separates someone who has run this system from someone who has read about it. A table like this takes ten minutes to produce if your harness printed intervals from day one, and two weeks to reconstruct if it did not.</p>
+
+<p><strong>Two: a two-page technical note</strong>, in the style of his report. Section by section: what you set out to reproduce and what the published numbers were; what your reproduction actually measured, with intervals; what you changed, in what order, and what each change bought; one small figure per claim, each showing a rate with an interval rather than a training curve; a paragraph on what your setup could not test and why &mdash; one GPU, one garment type, no access to the private garments; and a short list of what you would do next given more compute. Two pages, not ten. A reviewer reads it in four minutes and decides from it whether to open your code.</p>
+
+<p><strong>Three: rollout videos with reward, value, and advantage overlays</strong> &mdash; the debug views his pipeline saved at collection time. Thirty seconds of that shows a reviewer things no table can. He watches the value trace fall seconds before the failure is visible, which tells him your success head learned something real rather than an average. He watches the advantage change sign at the frame where the grasp slips, which tells him your credit assignment lands on the right frames. And he sees that the overlay exists at all, which tells him you instrumented the system instead of running it. A number can be copied off a leaderboard; an overlay video can only come from a system you built and can still run today.</p>
+
+<p><strong>Four: the negative results</strong>, written as results rather than apologies. "Best-of-\(N\) at \(N = 4\) measured \(-1.2 \pm 8.0\) points against \(N = 2\) at \(n = 300\) per condition: not resolved" is a stronger sentence than most success rates you could report, and it is worth saying why outright. To write it you had to fix a protocol in advance, hold everything else constant, run two conditions at an honest sample size, and then report a number you were hoping would come out differently. That is a controlled experiment. Reporting only wins is fully compatible with having run someone else's repository until something looked good, and a reviewer knows it. The interval is the proof, and it is the single thing that separates an engineer from an operator of other people's code.</p>
+
+<p>This mirrors how Larchenko's own open-sourcing built credibility. His report is an engineering case study with almost no ablations &mdash; by academic standards a weakness &mdash; yet it became a calling card, because every claim ships with runnable code, checkpoints, and an evaluator anyone can rerun. Verifiability substituted for ablations. For a job search, copy that model &mdash; and after this book you can.</p>
+
+<h2>15.8 If you only have three months</h2>
+
+<p>Figure 15.2 lays the five stages out on a calendar: at 15&ndash;20 hours a week they occupy 22 weeks and about 380 hours in total, roughly five months. If your job search does not have five months in it, you need triage, and deliberate triage beats panic triage in week 11.</p>
+
+<figure>
+<svg viewBox="0 0 700 300" width="700" xmlns="http://www.w3.org/2000/svg">
+  <line x1="216" y1="46" x2="216" y2="242" stroke="#e5e5e5" stroke-width="1"/>
+  <line x1="312" y1="46" x2="312" y2="242" stroke="#e5e5e5" stroke-width="1"/>
+  <line x1="504" y1="46" x2="504" y2="242" stroke="#e5e5e5" stroke-width="1"/>
+  <line x1="600" y1="46" x2="600" y2="242" stroke="#e5e5e5" stroke-width="1"/>
+  <line x1="407" y1="46" x2="407" y2="242" stroke="#b04a4a" stroke-width="1.5" stroke-dasharray="5,4"/>
+  <text x="132" y="38" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">wk 1</text>
+  <text x="228" y="38" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">wk 5</text>
+  <text x="324" y="38" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">wk 9</text>
+  <text x="420" y="38" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">wk 13</text>
+  <text x="516" y="38" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">wk 17</text>
+  <text x="612" y="38" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">wk 21</text>
+  <text x="112" y="66" text-anchor="end" font-family="Noto Sans" font-size="11" fill="#333">A &#8212; reproduce</text>
+  <rect x="120" y="50" width="48" height="24" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="656" y="66" font-family="Noto Sans" font-size="10" fill="#666">~35 h</text>
+  <text x="112" y="98" text-anchor="end" font-family="Noto Sans" font-size="11" fill="#333">B &#8212; BC baseline</text>
+  <rect x="168" y="82" width="72" height="24" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="656" y="98" font-family="Noto Sans" font-size="10" fill="#666">~50 h</text>
+  <text x="112" y="130" text-anchor="end" font-family="Noto Sans" font-size="11" fill="#333">C &#8212; RL loop</text>
+  <rect x="240" y="114" width="144" height="24" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <text x="312" y="130" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">heads &#8594; reward &#8594; AWR</text>
+  <text x="656" y="130" font-family="Noto Sans" font-size="10" fill="#666">~105 h</text>
+  <text x="112" y="162" text-anchor="end" font-family="Noto Sans" font-size="11" fill="#333">D &#8212; inference</text>
+  <rect x="384" y="146" width="24" height="24" rx="6" fill="#eaf1f8" stroke="#4878a8"/>
+  <text x="656" y="162" font-family="Noto Sans" font-size="10" fill="#666">~18 h</text>
+  <text x="112" y="194" text-anchor="end" font-family="Noto Sans" font-size="11" fill="#333">E &#8212; real robot</text>
+  <rect x="408" y="178" width="192" height="24" rx="6" fill="#ecf5ee" stroke="#4a8a5c"/>
+  <text x="504" y="194" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#333">teleop &#8594; DAgger &#8594; fine-tune</text>
+  <text x="656" y="194" font-family="Noto Sans" font-size="10" fill="#666">~140 h</text>
+  <text x="112" y="226" text-anchor="end" font-family="Noto Sans" font-size="11" fill="#333">write-up</text>
+  <rect x="120" y="210" width="240" height="24" rx="6" fill="none" stroke="#666" stroke-dasharray="4,3"/>
+  <text x="240" y="226" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">log + eval table from day one</text>
+  <rect x="360" y="210" width="48" height="24" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <rect x="408" y="210" width="192" height="24" rx="6" fill="none" stroke="#666" stroke-dasharray="4,3"/>
+  <text x="504" y="226" text-anchor="middle" font-family="Noto Sans" font-size="10" fill="#666">keep logging</text>
+  <rect x="600" y="210" width="48" height="24" rx="6" fill="#f8efe8" stroke="#b0703a"/>
+  <text x="656" y="226" font-family="Noto Sans" font-size="10" fill="#666">~35 h</text>
+  <line x1="384" y1="234" x2="384" y2="243" stroke="#b0703a" stroke-width="1"/>
+  <text x="402" y="252" text-anchor="end" font-family="Noto Sans" font-size="10" fill="#b0703a">compressed write-up if you stop here</text>
+  <text x="414" y="252" font-family="Noto Sans" font-size="10" fill="#b04a4a">week 13 &#183; the three-month line</text>
+  <text x="350" y="276" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">at 15&#8211;20 h/week this is about 380 hours in total</text>
+  <text x="350" y="292" text-anchor="middle" font-family="Noto Sans" font-size="11" fill="#666">if you must stop at the red line, cut from C and E &#8212; never from A, B, or the write-up</text>
+</svg>
+<figcaption>Figure 15.2 &mdash; The same five stages on a calendar at 15&ndash;20 hours per week. Notice how little of it is the part that sounds exciting: Stage C, the actual reinforcement learning, is six weeks out of twenty-two, and everything before it exists to make its result interpretable. The red line marks three months; Section 15.8 explains what survives to its left. Notice also that the write-up row has two solid blocks, not one &mdash; the small block at weeks 11&ndash;12 is there because a write-up is on the never-cut list, so a plan that stops at the red line has to budget one before the line, not after it.</figcaption>
+</figure>
+
+<p><strong>What to cut.</strong> Cut Stage C's full asynchronous flywheel, which is a confirmation of Section 15.4.5 rather than a reversal of it: build only the degenerate case described there, the single-process loop that collects, stops, recomputes advantages offline, trains, and repeats. On one workstation you have nothing to be asynchronous <em>with</em>, so the asynchronous version is engineering you would be doing for its own sake. Cut multi-garment coverage: pick one type and stay there. Cut Stage D's bandit, keeping the two sweeps. Cut Stage E path (a) &mdash; do not buy a second arm pair under time pressure &mdash; and run a reduced path (b) with one task and one fixture.</p>
+
+<p><strong>What never to cut.</strong> Stage A's reproduction, because without it nothing you report is anchored. Stage B's baseline, because without it your improvement has no denominator. One measured improvement with a real interval, the only part that shows you can do research rather than follow instructions. And the write-up, because unpublished work does not exist for a hiring manager.</p>
+
+<p><strong>The minimum coherent story,</strong> and it is a good one: "I reproduced the winning LeHome sim checkpoint on my own hardware and matched the published per-type rates to within measurement error. I trained my own behavior-cloning baseline from the organizers' data and measured it at 41% \(\pm\) 5.6 over 300 episodes on short-sleeved tops. I added advantage-conditioned sampler-side AWR with a densified checkpoint reward and measured 51% \(\pm\) 5.7 over another 300; the 95% interval on the difference is \(+10 \pm 7.9\) points, excluding zero. Here is the code, the protocol I fixed in advance, the rollout videos with value overlays, and two things that did not work." That is worth more than four garment types with no error bars, and it fits in three months.</p>
+
+<div class="box checkpoint"><div class="box-title">Checkpoint</div>
+<ul>
+<li>Compute the binomial standard error of a success rate, turn it into a 95% interval, and combine two into an interval on a difference &mdash; without looking anything up.</li>
+<li>Decide before an experiment how many episodes per condition resolve a given difference, and price that in hours of simulation.</li>
+<li>Explain why Stages A and B exist, in terms of the three unknowns they collapse into one.</li>
+<li>State Stage C's dependency order &mdash; heads, reward, advantages, AWR and conditioning, flywheel &mdash; and what breaks if you reorder it.</li>
+<li>Scope the project to one workstation: what fits in 24 GB with LoRA, what needs 40&ndash;50 GB, how many simulator instances run alongside training.</li>
+<li>Choose between the two Stage E paths for your hardware and budget, and write the evaluation protocol before collecting a real episode.</li>
+</ul>
+</div>
+
+<p><strong>Where to go deeper.</strong> Read Larchenko (2026) end to end now that you have the vocabulary for all of it; it will read as a checklist rather than a wall. Read it alongside \(\pi_{0.5}\) (Physical Intelligence, 2025a) and \(\pi^*_{0.6}\) (Physical Intelligence, 2025b), with his BEHAVIOR-1K report (Larchenko et al., 2025) for the machinery he carried over rather than invented. Appendix A gives the reading order; Appendix B's experiment ladder scales this discipline down to the rover and the arm you already own.</p>
+
+</section>

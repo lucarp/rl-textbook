@@ -1,0 +1,116 @@
+<section class="chapter" id="ch02">
+<h1>Chapter 2 &mdash; Policy gradients</h1>
+
+<p>Chapter 1 left us with an optimization problem: find parameters \(\theta\) of a policy \(\pi_\theta\) that maximize expected return. This chapter develops the most direct attack: write expected return as a function \(J(\theta)\), estimate its gradient from sampled trajectories, and ascend. Everything descended from this idea &mdash; REINFORCE, actor-critic, and the PPO of Chapter 3 &mdash; shares one load-bearing assumption, which we expose at the end, because it is precisely the assumption that fails for the generative policies of Chapter 5.</p>
+
+<h2>2.1 The objective and the score-function trick</h2>
+
+<p>The quantity to maximize is the expected return:</p>
+\[ J(\theta) \;=\; \mathbb{E}_{\tau \sim \pi_\theta}\!\left[\, \sum_{t=0}^{T} \gamma^{t} r_t \right], \]
+<p>where the expectation is over trajectories \(\tau = (s_0, a_0, r_0, s_1, \dots)\) produced by running \(\pi_\theta\) in the environment. Why can't we just backprop through this, as in supervised learning? Because the rewards are produced by the <em>environment</em>: cloth settling on a table, a motor controller saturating, a human pressing the success button on your SO-101 rig. No gradient flows from \(r_t\) back to \(\theta\), and even in a differentiable simulator, gradients through contact dynamics are notoriously ill-behaved. The parameters influence \(J\) only through <em>which trajectories get sampled</em>. So we differentiate the sampling distribution instead of the reward.</p>
+
+<p>That is the <strong>score-function trick</strong> (also called the log-derivative trick; the <strong>score</strong> is the gradient of the log-probability, \(\nabla_\theta \log p_\theta\)), and it is short enough to be worth doing once. Write \(R(\tau)\) for the total return of a trajectory and \(p_\theta(\tau)\) for its probability under the policy. Using the identity \(\nabla_\theta p_\theta = p_\theta \nabla_\theta \log p_\theta\):</p>
+\[ \nabla_\theta J \;=\; \nabla_\theta \!\int\! p_\theta(\tau)\, R(\tau)\, d\tau \;=\; \int\! p_\theta(\tau)\, \nabla_\theta \log p_\theta(\tau)\, R(\tau)\, d\tau \;=\; \mathbb{E}_{\tau \sim \pi_\theta}\!\big[ R(\tau)\, \nabla_\theta \log p_\theta(\tau) \big]. \]
+<p>The gradient of an expectation became an expectation we can estimate by sampling. Now expand \(\log p_\theta(\tau) = \log p(s_0) + \sum_t \log \pi_\theta(a_t \mid s_t) + \sum_t \log p(s_{t+1} \mid s_t, a_t)\). The initial-state and dynamics terms do not depend on \(\theta\), so they vanish under \(\nabla_\theta\) &mdash; we never needed to know the dynamics at all, which is what makes this <strong>model-free</strong>. One refinement remains: an action at time \(t\) cannot influence rewards earned before \(t\), so dropping those past-reward terms is exact and leaves each action weighted by \(\gamma^t G_t\), where \(G_t = \sum_k \gamma^k r_{t+k}\) is the reward-to-go. Implementations then make one further, mildly biased simplification: they drop the leading \(\gamma^t\), which for \(\gamma \lt 1\) does change the expectation &mdash; it amounts to weighting states by undiscounted visitation, exactly the factor the policy gradient theorem's \(d^\pi\) (Section 2.2) makes explicit. The standard estimator everyone uses is therefore:</p>
+
+<div class="key-eq">
+\[ \nabla_\theta J(\theta) \;\approx\; \mathbb{E}_{\tau \sim \pi_\theta}\!\Big[ \sum_t \nabla_\theta \log \pi_\theta(a_t \mid s_t)\; G_t \Big] \]
+</div>
+
+<p>Averaging this over \(N\) sampled trajectories is the <strong>REINFORCE</strong> estimator (Williams, 1992). Read it as an instruction: <em>increase the log-probability of each action you took, in proportion to the return that followed it</em>. Figure 2.1 shows the picture to keep: trajectories that scored well get more probability mass; trajectories that scored poorly get less. Note what the estimator does <em>not</em> require: a differentiable reward, a known transition model, or a dense signal. It requires only the ability to sample from \(\pi_\theta\) and to compute \(\nabla_\theta \log \pi_\theta(a \mid s)\). Hold that last requirement in mind &mdash; Section 2.4 returns to it.</p>
+
+<p>The trick is more general than RL: the same estimator appears in variational inference and anywhere else you must differentiate through sampling. Its generality is also its weakness. Because the reward enters only as a scalar multiplier, the estimator learns nothing from a trajectory's <em>structure</em> &mdash; it cannot tell which of the two hundred actions in a failed fold attempt was the fatal one. All credit assignment is left to averaging over samples, and that is where the variance problem of the next section comes from.</p>
+
+<figure>
+<svg viewBox="0 0 680 262" width="680" xmlns="http://www.w3.org/2000/svg" font-family="Noto Sans">
+  <defs>
+    <marker id="ch02f1up" markerWidth="9" markerHeight="9" refX="4.5" refY="4.5" orient="auto">
+      <path d="M0,1 L8,4.5 L0,8 z" fill="#4a8a5c"/>
+    </marker>
+    <marker id="ch02f1dn" markerWidth="9" markerHeight="9" refX="4.5" refY="4.5" orient="auto">
+      <path d="M0,1 L8,4.5 L0,8 z" fill="#b04a4a"/>
+    </marker>
+  </defs>
+  <!-- start state -->
+  <circle cx="70" cy="130" r="11" fill="#eaf1f8" stroke="#4878a8" stroke-width="2"/>
+  <text x="70" y="160" font-size="12" fill="#333" text-anchor="middle">start</text>
+  <!-- goal region -->
+  <rect x="558" y="42" width="104" height="76" rx="6" fill="#ecf5ee" stroke="#4a8a5c" stroke-width="2"/>
+  <text x="610" y="85" font-size="12" fill="#333" text-anchor="middle">success</text>
+  <!-- trajectory A: high return -->
+  <path d="M 80 122 C 190 55, 340 38, 556 66" fill="none" stroke="#4a8a5c" stroke-width="2.5"/>
+  <circle cx="556" cy="66" r="4" fill="#4a8a5c"/>
+  <text x="252" y="38" font-size="12" fill="#333" text-anchor="middle">G = 9.2</text>
+  <line x1="310" y1="82" x2="310" y2="52" stroke="#4a8a5c" stroke-width="2" marker-end="url(#ch02f1up)"/>
+  <!-- trajectory B: medium return -->
+  <path d="M 80 132 C 200 122, 390 132, 556 98" fill="none" stroke="#4a8a5c" stroke-width="1.8" stroke-dasharray="7 4"/>
+  <circle cx="556" cy="98" r="4" fill="#4a8a5c"/>
+  <text x="278" y="114" font-size="12" fill="#333" text-anchor="middle">G = 7.5</text>
+  <line x1="340" y1="158" x2="340" y2="136" stroke="#4a8a5c" stroke-width="2" marker-end="url(#ch02f1up)"/>
+  <!-- trajectory C: failure -->
+  <path d="M 80 138 C 200 196, 360 236, 528 220" fill="none" stroke="#b04a4a" stroke-width="2"/>
+  <circle cx="528" cy="220" r="4" fill="#b04a4a"/>
+  <text x="258" y="200" font-size="12" fill="#333" text-anchor="middle">G = 0.4</text>
+  <line x1="330" y1="196" x2="330" y2="222" stroke="#b04a4a" stroke-width="2" marker-end="url(#ch02f1dn)"/>
+  <!-- annotations -->
+  <text x="425" y="34" font-size="11" fill="#666">log-probability pushed up</text>
+  <text x="400" y="248" font-size="11" fill="#666">pushed down (after baseline)</text>
+</svg>
+<figcaption>Figure 2.1 &mdash; The policy gradient in one picture: sample trajectories, score each by its return \(G\), and shift probability mass toward the ones that scored high. With a baseline (Section 2.2), below-average trajectories are actively pushed down rather than merely pushed up less.</figcaption>
+</figure>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+REINFORCE does not need a differentiable reward &mdash; a common misreading. You never backprop through \(r_t\) or the simulator; the gradient flows only through \(\log \pi_\theta\). Second misreading: with all-positive returns, every sampled action is pushed up, and improvement comes only from actions being pushed up by <em>different</em> amounts while probabilities renormalize. That is correct in expectation but has dreadful variance &mdash; which is exactly what Section 2.2 fixes.
+</div>
+
+<h2>2.2 Variance and baselines</h2>
+
+<p>The naive estimator is unbiased but almost unusably noisy. A mini-example makes the problem concrete. Suppose your rover samples two trajectories with returns 100 and 101. REINFORCE weights their score vectors by 100 and 101: both are pushed up, nearly equally hard. The actual signal &mdash; trajectory two was slightly better &mdash; contributes about half a percent of the update's magnitude; the other 99.5% is a shared offset that says nothing about which actions to prefer and must be averaged away over many samples. The variance of the estimator scales roughly with the square of typical returns, and typical returns are large whenever rewards do not happen to be centered at zero. Robot tasks make this worse, not better: with the sparse, binary success rewards typical of manipulation (Chapter 7), most trajectories return exactly zero and contribute nothing but noise to the average.</p>
+
+<p>The fix is a <strong>baseline</strong>: subtract some \(b(s_t)\) from \(G_t\) before weighting. With \(b = 100.5\) the weights above become \(-0.5\) and \(+0.5\): each pair of samples now expresses a <em>preference</em>. Crucially, any baseline that does not depend on the action leaves the gradient unbiased. The proof is one line: for fixed \(s\),</p>
+\[ \mathbb{E}_{a \sim \pi_\theta}\!\big[\, b(s)\, \nabla_\theta \log \pi_\theta(a \mid s) \big] \;=\; b(s)\, \nabla_\theta \sum_a \pi_\theta(a \mid s) \;=\; b(s)\, \nabla_\theta 1 \;=\; 0, \]
+<p>(replace the sum with an integral for continuous actions). Subtracting \(b\) changes the variance, not the expectation. The most useful choice is the state value \(b(s_t) = V^\pi(s_t)\), which turns the weight into \(G_t - V(s_t)\) &mdash; a sample estimate of the <strong>advantage</strong> \(A^\pi(s,a) = Q^\pi(s,a) - V^\pi(s)\): how much better this action turned out than the policy's average behavior from that state. Better-than-average actions get pushed up, worse-than-average actions get pushed down, regardless of whether the raw returns are all positive.</p>
+
+<p>The <strong>policy gradient theorem</strong> (Sutton et al., 1999) states the general form and is the license for everything that follows:</p>
+<div class="key-eq">
+\[ \nabla_\theta J(\theta) \;\propto\; \mathbb{E}_{s \sim d^{\pi},\, a \sim \pi_\theta}\!\big[ \nabla_\theta \log \pi_\theta(a \mid s)\; Q^{\pi}(s,a) \big], \]
+</div>
+<p>where \(d^\pi\) is the discounted state-visitation distribution of \(\pi\). By the baseline argument, \(Q^\pi\) may be replaced by \(A^\pi\). The theorem says the exact gradient depends only on value quantities we can <em>learn to estimate</em> &mdash; the door to actor-critic. One caveat to plant for Chapter 7: when the value estimate is imperfect, subtracting all of it can inject error; a damped baseline \(\alpha V\) with \(\alpha \lt 1\) is sometimes the better control variate.</p>
+
+<h3>One REINFORCE update by hand</h3>
+
+<p>Take a single-state bandit with two actions and a softmax policy: logits \(\theta = (\theta_1, \theta_2) = (0, 0)\), so \(\pi_\theta(a^1) = \pi_\theta(a^2) = 0.5\). Action \(a^1\) pays \(r = 1\), action \(a^2\) pays \(r = 0\); episodes are one step, so \(G_0 = r\). Suppose we sample \(a^1\). For a softmax, \(\nabla_\theta \log \pi_\theta(a^1) = (1 - 0.5,\, -0.5) = (0.5, -0.5)\). With learning rate 1 and no baseline, the update is \(\theta \leftarrow \theta + 1 \cdot G_0 \cdot (0.5, -0.5) = (0.5, -0.5)\), and the new probability is \(\pi(a^1) = e^{0.5}/(e^{0.5} + e^{-0.5}) = 1/(1 + e^{-1}) \approx 0.731\). One good sample moved the policy from 50% to 73%. Now add the baseline \(b = 0.5\) (the policy's expected reward). Sampling \(a^1\) gives weight \(+0.5\) and the gentler \(\pi(a^1) \approx 0.622\). But sample the <em>bad</em> action \(a^2\): without a baseline the weight is \(G_0 = 0\) and nothing happens; with it the weight is \(-0.5\), the update is \(-0.5 \cdot (-0.5, 0.5) = (0.25, -0.25)\), and \(\pi(a^1)\) still rises to 0.622. The baseline extracts signal from failures, not just successes.</p>
+
+<h2>2.3 Actor-critic in one page</h2>
+
+<p>An <strong>actor-critic</strong> method makes the value baseline learnable. The <strong>critic</strong> \(V_\phi(s)\) is a network (often a head on the policy's trunk) trained by plain regression: fit observed returns \(G_t\), or bootstrap toward \(r_t + \gamma V_\phi(s_{t+1})\). The <strong>actor</strong> is \(\pi_\theta\), updated with the policy gradient using an estimated advantage \(\hat{A}_t\) in place of \(G_t\). The two classic estimators bracket a spectrum: \(\hat{A}_t = G_t - V(s_t)\) is unbiased but noisy (Monte Carlo), while the TD residual \(\hat{A}_t = \delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)\) is low-variance but biased by however wrong the critic is. GAE, in Chapter 3, interpolates between them with the parameter \(\lambda\). Two habits from practice are worth naming. Advantages are usually normalized per batch (zero mean, unit standard deviation), which is technically another baseline plus a rescaling and mostly serves to stabilize step sizes. And an <strong>entropy bonus</strong> &mdash; a small term rewarding the policy for staying stochastic &mdash; is commonly added to the actor loss (SB3's <code>ent_coef</code>) to keep exploration from collapsing early. The skeleton of one iteration:</p>
+
+<pre class="code"># one actor-critic iteration (on-policy)
+batch   = collect_rollouts(pi_theta, n_steps)        # fresh data, current policy
+returns = discounted_returns(batch.rewards, gamma)   # G_t
+adv     = returns - V_phi(batch.states)              # or TD / GAE (Chapter 3)
+adv     = (adv - adv.mean()) / (adv.std() + 1e-8)    # per-batch normalization
+logp    = log_prob(pi_theta, batch.states, batch.actions)
+actor_loss  = -(logp * adv.detach()).mean()
+critic_loss = ((V_phi(batch.states) - returns)**2).mean()
+(actor_loss + 0.5 * critic_loss).backward(); opt.step()</pre>
+
+<p>Note the phrase <em>fresh data</em>. The policy gradient theorem's expectation is under the <em>current</em> policy's own trajectory distribution. The moment you take one gradient step, previously collected rollouts were generated by a different policy \(\pi_{\theta_{old}}\), and reusing them naively biases the gradient. The principled correction is the importance ratio \(\rho_t(\theta) = \pi_\theta(a_t \mid s_t)/\pi_{\theta_{old}}(a_t \mid s_t)\); Chapter 3 builds PPO around keeping that ratio near 1 so a small amount of reuse stays safe. This <strong>on-policy</strong> nature is why the whole family is sample-hungry: cheap in an Isaac Sim farm running thousands of parallel environments, brutal on one physical arm. Chapter 4 shows the off-policy escape route.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+SB3's PPO on rl-rover is this chapter's actor-critic plus Chapter 3's clip. <code>ActorCriticPolicy</code> is one policy object holding an actor network (diagonal Gaussian over wheel commands) and a critic network (scalar value) &mdash; separate MLPs by default, a shared trunk only if you set <code>net_arch</code> that way. This chapter's log-probs live in <code>common/policies.py</code>: <code>evaluate_actions()</code> calls <code>distribution.log_prob(actions)</code>, and <code>ppo.py</code> forms <code>ratio = th.exp(log_prob - old_log_prob)</code>. Put a breakpoint there and you are watching \(\nabla_\theta \log \pi_\theta\) get built.
+</div>
+
+<h2>2.4 The hidden requirement</h2>
+
+<p>Every estimator in this chapter contains the same factor: \(\nabla_\theta \log \pi_\theta(a \mid s)\). Using it means you can evaluate the exact log-density of a sampled action and differentiate it. For the policies of classical deep RL this is trivial: a softmax over discrete actions is an explicit probability vector, and a diagonal Gaussian &mdash; SB3's default for the rover's continuous wheel commands &mdash; has a closed-form log-density. The requirement is so cheaply met that it becomes invisible.</p>
+
+<p>It stops being met in Chapter 5. Modern robot policies emit action <em>chunks</em> \(a_{t:t+H}\) by iteratively transforming noise &mdash; where the network learns a denoiser (diffusion) or a velocity field (flow matching) rather than a density. The log-likelihood of a generated chunk is buried inside the integration path and has no tractable form, so \(\nabla_\theta \log \pi_\theta\) cannot be computed. REINFORCE, actor-critic, and PPO all stall at the same wall. What survives the crash is this chapter's central <em>quantity</em>, the advantage: you can weight training data by it (Chapter 4), condition the policy on it (Chapter 6), engineer better estimates of it (Chapter 7), and rank candidate action chunks by it at inference time (Chapter 8). The estimator is disposable; the advantage is not.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+None of this chapter's estimators run on Larchenko's policy: Pi0.5 generates action chunks by flow matching, so \(\log \pi_\theta(a_{t:t+H} \mid o)\) &mdash; the term every equation here differentiates &mdash; is intractable (Chapter 5), and PPO is out from the start. The chapter's central quantity survives, though: his solution estimates advantages with a success-probability value head, GAE, and a damped \(\alpha V\) baseline (Chapter 7), then consumes them through AWR weighting (Chapter 4) and RECAP conditioning (Chapter 6).
+</div>
+
+<p><strong>Where to go deeper.</strong> The original REINFORCE paper is Williams (1992); the policy gradient theorem with function approximation is Sutton et al. (1999); and Chapter 13 of Sutton and Barto (2018) covers both with full derivations. Schulman et al. (2016), the GAE paper, is the sharpest treatment of the bias-variance spectrum that Section 2.3 only sketched and is the natural bridge into Chapter 3. Appendix A places each paper in the reading order.</p>
+
+</section>

@@ -1,0 +1,112 @@
+<!-- Cover -->
+<section class="cover">
+  <div class="cover-inner">
+    <svg viewBox="0 0 640 170" width="640" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <defs>
+        <marker id="covarr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4878a8"/></marker>
+      </defs>
+      <g fill="#b0703a" opacity="0.85">
+        <circle cx="40" cy="30" r="4"/><circle cx="70" cy="75" r="4"/><circle cx="35" cy="120" r="4"/>
+        <circle cx="90" cy="45" r="4"/><circle cx="60" cy="145" r="4"/><circle cx="100" cy="110" r="4"/>
+      </g>
+      <g stroke="#9db8d2" stroke-width="1.6" fill="none" opacity="0.9">
+        <path d="M50 35 C 220 10, 380 40, 520 62"/>
+        <path d="M80 78 C 240 60, 390 70, 520 80"/>
+        <path d="M45 118 C 220 130, 380 115, 520 98"/>
+        <path d="M70 143 C 250 160, 400 135, 520 112" marker-end="url(#covarr)"/>
+      </g>
+      <g>
+        <rect x="530" y="55" width="72" height="62" rx="5" fill="#eaf1f8" stroke="#4878a8" stroke-width="2"/>
+        <line x1="530" y1="76" x2="602" y2="76" stroke="#4878a8" stroke-width="1.4"/>
+        <line x1="530" y1="96" x2="602" y2="96" stroke="#4878a8" stroke-width="1.4"/>
+      </g>
+      <text x="52" y="14" font-family="Noto Sans" font-size="11" fill="#888">noise</text>
+      <text x="527" y="44" font-family="Noto Sans" font-size="11" fill="#888">folded</text>
+    </svg>
+    <h1 class="cover-title">Reinforcement Learning<br>for Real Robots</h1>
+    <p class="cover-subtitle">From PPO to diffusion, flow matching, and vision-language-action models &mdash; the theory behind the LeHome Challenge, and a path to replicating it</p>
+    <p class="cover-byline">Second edition &middot; compiled for Lucas &middot; August 2026</p>
+    <p class="cover-credit">Built around the open-sourced LeHome Challenge (ICRA 2026) solution and video series by Ilia Larchenko, and the papers it stands on.</p>
+  </div>
+</section>
+
+<!-- Table of contents -->
+<section class="toc-page">
+  <h1 class="toc-title">Contents</h1>
+  <ol class="toc">
+    <li class="toc-part">Part I &middot; Foundations</li>
+    <li><a href="#ch01"><span class="toc-num">1</span> The reinforcement learning problem</a></li>
+    <li><a href="#ch02"><span class="toc-num">2</span> Policy gradients</a></li>
+    <li><a href="#ch03"><span class="toc-num">3</span> Trust regions, PPO, and advantage estimation</a></li>
+    <li class="toc-part">Part II &middot; Learning from data you already have</li>
+    <li><a href="#ch04"><span class="toc-num">4</span> RL as weighted behavior cloning</a></li>
+    <li class="toc-part">Part III &middot; Generative policies: the new world</li>
+    <li><a href="#ch05"><span class="toc-num">5</span> Why one Gaussian is not a policy</a></li>
+    <li><a href="#ch06"><span class="toc-num">6</span> Diffusion policies from zero</a></li>
+    <li><a href="#ch07"><span class="toc-num">7</span> Flow matching</a></li>
+    <li><a href="#ch08"><span class="toc-num">8</span> Vision-language-action models</a></li>
+    <li><a href="#ch09"><span class="toc-num">9</span> PPO versus VLA-RL: the two worlds side by side</a></li>
+    <li><a href="#ch10"><span class="toc-num">10</span> Learning by conditioning: RECAP</a></li>
+    <li class="toc-part">Part IV &middot; Making it work</li>
+    <li><a href="#ch11"><span class="toc-num">11</span> Reward and advantage engineering</a></li>
+    <li><a href="#ch12"><span class="toc-num">12</span> Inference-time optimization</a></li>
+    <li><a href="#ch13"><span class="toc-num">13</span> Imitation and the human in the loop</a></li>
+    <li><a href="#ch14"><span class="toc-num">14</span> Simulation, sim-to-real, and the asynchronous RL loop</a></li>
+    <li class="toc-part">Part V &middot; Doing it</li>
+    <li><a href="#ch15"><span class="toc-num">15</span> Capstone: replicating LeHome</a></li>
+    <li class="toc-part">Appendices</li>
+    <li><a href="#appA"><span class="toc-num">A</span> Paper-by-paper reading guide</a></li>
+    <li><a href="#appB"><span class="toc-num">B</span> The experiment ladder</a></li>
+  </ol>
+</section>
+
+<!-- Preface -->
+<section class="chapter" id="preface">
+  <h1 class="unnumbered">Preface</h1>
+  <p>This book answers one question: <strong>what do you need to understand, and in what order, to train a modern learned policy on a real robot</strong> &mdash; concretely, to replicate the winning solution of the LeHome Challenge (ICRA 2026), in which a bimanual SO-ARM101 robot learned to fold garments, first in simulation and then in the real world.</p>
+  <p>The LeHome solution is the running example because it is unusually complete and unusually open: code, tech report, checkpoints, and a three-part video series explaining every choice. One project touches nearly everything that matters in robot learning today &mdash; policy gradients and their limits, offline RL as weighted behavior cloning, diffusion and flow-matching action policies, vision-language-action models, reward and advantage engineering, inference-time optimization, human-in-the-loop data collection, and sim-to-real transfer. Follow the thread of this one problem and you cover the field.</p>
+
+  <h2 class="unnumbered">About this second edition</h2>
+  <p>The first edition was correct but compressed: it stated results where it should have built them. This edition roughly triples the explanation while keeping every equation. Three things changed in particular.</p>
+  <p><strong>Nothing is asserted before you feel the problem.</strong> Each idea now arrives in the order it was actually discovered: here is what we want; here is the obvious thing to try; here is precisely how it fails; here is the fix, and why it works. The fix alone is a fact to memorize. The sequence is understanding.</p>
+  <p><strong>Generative policies get a real on-ramp.</strong> The first edition compressed multimodality, flow matching, VLAs, and auxiliary heads into a single chapter. They are now five: Chapter 5 explains what a generative model even is and why a Gaussian stopped being enough; Chapter 6 teaches diffusion from zero; Chapter 7 does flow matching; Chapter 8 covers vision-language-action models; and Chapter 9 puts PPO and VLA-RL side by side, component by component, so you always know which world you are standing in.</p>
+  <p><strong>Every equation is unpacked in prose.</strong> Mathematics is the compressed form of an idea, not the idea itself. Each important equation is followed by a plain-words box that names every symbol and says what the formula does. You should never have to decode notation alone.</p>
+
+  <h2 class="unnumbered">How to read it</h2>
+  <p>Chapters build strictly on one another; read them in order. Parts I and II take you from the MDP to the single most important update rule in the book. Part III is the conceptual pivot and the longest stretch &mdash; go slowly there, especially if diffusion and transformers are new to you. Part IV is engineering, Part V is your project.</p>
+  <p>Six kinds of box recur, and each has a job:</p>
+  <ul>
+    <li><strong>In plain words</strong> &mdash; the preceding equation, restated in English, every symbol named.</li>
+    <li><strong>Words you will hear</strong> &mdash; vocabulary you will meet in papers and codebases around this topic, including terms this book does not otherwise use.</li>
+    <li><strong>In the LeHome solution</strong> &mdash; where the idea appears in the running example, with the real numbers.</li>
+    <li><strong>On your rig</strong> &mdash; how it connects to your own rover, HIL-SERL, and SO-101 work.</li>
+    <li><strong>Pitfalls</strong> &mdash; the mistakes that cost people weeks, including ones you have already hit.</li>
+    <li><strong>Checkpoint</strong> &mdash; at each chapter's end, what you should now be able to explain. If a bullet does not feel true, that section is worth a second pass before moving on.</li>
+  </ul>
+  <p>Long derivations are sketched and referenced out to the original papers. <strong>Appendix A</strong> tells you which papers to read deeply, which to read once, and which to skim. <strong>Appendix B</strong> pairs every chapter with one concrete experiment on hardware you already own &mdash; reading a chapter without running its rung is half the lesson.</p>
+
+  <h2 class="unnumbered">What this book assumes</h2>
+  <p>Engineer-level probability and calculus: you can read an expectation, a gradient, and a Gaussian without looking anything up, and you are not expecting measure theory. Working Python. Some hands-on RL: you have trained an agent before and watched its learning curves. Everything past that &mdash; and all of Part III in particular &mdash; is built here from the ground up. No prior exposure to diffusion models, transformers, or vision-language models is assumed anywhere.</p>
+  <p>This book is one half of a pair. The other half is the roadmap (<span class="mono">ROADMAP.md</span>) that schedules these chapters against five months of building. The book tells you how things work; the roadmap tells you when to care.</p>
+
+  <h2 class="unnumbered">Notation</h2>
+  <p>One table, used everywhere. The only notational trap in the book is the difference between the environment's timestep \(t\) and the generative model's internal time \(u\) (or step index \(k\)); Chapters 6 and 7 warn about it again where it bites.</p>
+  <table class="tbl notation">
+    <thead><tr><th>Symbol</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>\(s,\ o,\ a\)</td><td>state, observation, action</td></tr>
+      <tr><td>\(t\); \(a_{t:t+H}\)</td><td>environment timestep; action chunk with horizon \(H\)</td></tr>
+      <tr><td>\(\pi_\theta,\ \pi_\beta,\ \pi_{\theta_{old}}\)</td><td>learned policy, behavior/demonstrator policy, pre-update policy</td></tr>
+      <tr><td>\(\tau,\ r_t,\ \gamma,\ G_t\)</td><td>trajectory, reward, discount, return \(G_t=\sum_k \gamma^k r_{t+k}\)</td></tr>
+      <tr><td>\(V^\pi,\ Q^\pi,\ A^\pi,\ \hat{A}_t\)</td><td>value, action-value, advantage \(Q^\pi{-}V^\pi\), advantage estimate</td></tr>
+      <tr><td>\(\delta_t,\ \lambda\)</td><td>TD residual \(r_t+\gamma V(s_{t+1})-V(s_t)\); GAE parameter</td></tr>
+      <tr><td>\(J(\theta),\ \rho_t(\theta),\ \epsilon\)</td><td>RL objective, importance ratio \(\pi_\theta/\pi_{\theta_{old}}\), PPO clip parameter</td></tr>
+      <tr><td>\(w_i=\exp(\hat{A}_i/\beta)\)</td><td>AWR weight with temperature \(\beta\)</td></tr>
+      <tr><td>\(\pi^*,\ \delta,\ Z(s)\)</td><td>solution of the KL-constrained problem (Chapter 4), its leash radius, its normalizer; the star is unrelated to \(\pi^*_{0.6}\)</td></tr>
+      <tr><td>\(k,\ \bar\alpha_k\)</td><td>diffusion noise-level index and cumulative signal coefficient (Chapter 6)</td></tr>
+      <tr><td>\(u,\ z,\ a^u,\ v_\theta,\ K\)</td><td>flow time \(u\in[0,1]\), noise \(z\sim\mathcal{N}(0,I)\), interpolant, velocity field, integration steps</td></tr>
+      <tr><td>\(c,\ \epsilon_A,\ g\)</td><td>advantage condition, its threshold, classifier-free guidance scale</td></tr>
+      <tr><td>\(\hat{p}_{succ},\ R_{acc},\ \alpha,\ \rho_{GV}\)</td><td>predicted success probability, accumulated reward, baseline damping, return&ndash;value correlation</td></tr>
+    </tbody>
+  </table>
+</section>

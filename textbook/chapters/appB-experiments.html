@@ -1,0 +1,242 @@
+<section class="chapter" id="appB">
+<h1>Appendix B &mdash; The experiment ladder</h1>
+
+<p>Reading this book produces vocabulary. Only experiments produce skill. You can finish every chapter and still freeze the first time a run does something the book did not describe, because reading builds recognition and only running builds reflex.</p>
+
+<p>So this appendix turns most chapters into one concrete experiment on hardware and code you already own: the <span class="mono">rl-boarding</span> gridworld, the <span class="mono">rl-rover</span> PPO stack, the LeRobot checkout and the SO-101 arm in <span class="mono">hil-serl</span>, and finally the LeHome stack itself.</p>
+
+<p>Two chapters get no rung of their own, and that is deliberate rather than an oversight. Chapter 5's multimodality is not a separate experiment; it is the thing E5 measures, so running E5 <em>is</em> running Chapter 5. Chapter 9's missing log-probability is not something you can run at all &mdash; it is the gate on E5 and E6, the question you answer once both are done. Chapter 8 does get a task, but it lives inside E6 as part (b), because one forward pass through a released checkpoint is an afternoon's work rather than a rung of its own.</p>
+
+<p>The rungs are ordered, and a rung's failure mode is only legible when the rung below it is solid. Times assume your 15&ndash;20 hours per week. Each rung also maps onto a phase of the companion roadmap &mdash; <span class="mono">ROADMAP.md</span>, the five-month schedule described in the front matter, whose phases are numbered 0 through 5 &mdash; and Section B.7 lines that up in one table. There are twelve rungs, E1 through E12. Two of them, E5 and E6, cover the generative chapters, which is where most of your new ground is.</p>
+
+<h2>B.1 Three rules that bind every rung</h2>
+
+<p><strong>Rule one: one question per experiment.</strong> Write the question down before you touch the keyboard, as one sentence ending in a question mark, then design the smallest run that answers it. This sounds like bureaucracy and is not: it prevents the common failure where you change three things, get a better number, and cannot say which change caused it.</p>
+
+<p><strong>Rule two: measure, don't watch.</strong> Every rung ends in a number or a plot, never an impression. "It looked smoother" is not a result. Where runs are cheap &mdash; E2 and E3 especially &mdash; use 3&ndash;5 seeds, because a single-seed RL result is noise wearing the costume of a finding: two seeds of one configuration can differ by more than two genuinely different configurations do.</p>
+
+<p><strong>Rule three: log like you already do.</strong> One dated note per rung, in the <span class="mono">NEXT.md</span> style you use in your own repos: question, setup, result, surprise. The surprise line is the valuable one, because what surprised you is what your mental model got wrong. Those notes become the tech notes of roadmap Phase 5 almost verbatim, so writing them is not overhead.</p>
+
+<p><strong>An analogy, with its limit.</strong> The ladder is a test suite for your own understanding. E1&ndash;E3 are unit tests: fast, cheap, run five times, assert something narrow. E10 and E12 are integration tests: slow, expensive, failing for reasons the unit tests cannot localize. Where it breaks down: a unit test is deterministic and asserts one value, whereas every rung here returns a <em>distribution</em>. A red unit test means a bug; a "red" rung might just mean an unlucky seed, which is why "run it once" is never a gate.</p>
+
+<div class="box jargon"><div class="box-title">Words you will hear</div>
+<strong>Ablation.</strong> Removing one component and re-measuring, to attribute a result to it &mdash; papers say "we ablate the value baseline". <strong>Sweep.</strong> Running one setup across a grid of a hyperparameter's values; a <em>seed sweep</em> varies only the random seed. <strong>Open-loop rollout.</strong> Running the policy's output without feeding consequences back &mdash; you sample chunks and inspect them, the robot never moves. Closed-loop means the world answers. <strong>Wilson interval.</strong> A confidence interval for a success rate that stays sane near 0% and 100%.</div>
+
+<h2>B.2 Foundations rungs (Chapters 1&ndash;3)</h2>
+
+<h3>E1 &middot; Values by hand</h3>
+
+<p>Chapter 1; <span class="mono">rl-boarding</span>; ~3 h. <em>Question:</em> do empirical returns really converge to a value function obeying the Bellman recursion? Run the gridworld under a fixed random policy for a few thousand episodes. Pick two cells, and for each average the discounted returns observed from it to estimate \(V(s)\). Then check the recursion using the empirical successor frequencies you logged:</p>
+
+<div class="key-eq">\[ V(s) \;\approx\; \mathbb{E}\big[\, r + \gamma\, V(s') \,\big] \]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+The left side, \(V(s)\), is the number you just estimated by averaging returns out of cell \(s\). The right side says: take one step from \(s\), collect the immediate reward \(r\), look up the value of wherever you landed, \(V(s')\), shrink it by the discount \(\gamma\), and add. \(\mathbb{E}[\cdot]\) means average that over all the steps you took out of \(s\), weighted by how often each successor came up. If the two sides agree, the long-horizon average and the one-step-plus-lookup agree &mdash; which is the whole content of the Bellman equation.</div>
+
+<p>Repeat at \(\gamma = 0.9\) and \(\gamma = 0.99\). <em>You understood it if</em> you can predict, before rerunning, which cells' values move most when \(\gamma\) changes &mdash; and say why cells far from the goal feel the discount hardest.</p>
+
+<h3>E2 &middot; REINFORCE from scratch, and the variance cure</h3>
+
+<p>Chapter 2; CartPole, already in the rover venv via <span class="mono">gymnasium[classic-control]</span>; ~5 h. Write REINFORCE in about sixty lines: a softmax policy and the estimator of Section 2.3, no library. Train 5 seeds with no baseline, then 5 with a learned value baseline. Plot all ten curves on one axis, and separately the per-batch standard deviation of the gradient estimate. <em>You understood it if</em> the baseline curves are visibly tighter, you can point at the line where \(G_t\) became \(G_t - b(s_t)\), and you can explain why that subtraction cannot change the gradient's expectation.</p>
+
+<h3>E3 &middot; PPO forensics on the rover</h3>
+
+<p>Chapter 3; <span class="mono">rl-rover</span>; ~5 h. Your <span class="mono">train_rover.py</span> runs are the corpus, so this rung is mostly reading. Read a healthy run's TensorBoard against Section 3.6: <span class="mono">approx_kl</span>, <span class="mono">clip_fraction</span>, <span class="mono">entropy_loss</span>, <span class="mono">value_loss</span>. Then break it twice on 300k-step runs: <span class="mono">clip_range=10</span>, and watch for the collapse Section 3.1 predicts; then <span class="mono">gae_lambda=0.0</span>, and watch early learning starve while the critic is still bad. Finally dump one episode's rewards and <span class="mono">policy.predict_values()</span> outputs and recompute \(\hat{A}_t\) by hand at \(\lambda \in \{0, 0.95\}\), reproducing Section 3.5's arithmetic on your own data. <em>You understood it if</em> you can diagnose, from curves alone, which knob a stranger's broken PPO run needs.</p>
+
+<h2>B.3 The pivot rungs (Chapters 4, 6, 7&ndash;8, 10)</h2>
+
+<h3>E4 &middot; AWR on your own logged data</h3>
+
+<p>Chapter 4; <span class="mono">rl-rover</span>; ~7 h. Build an offline dataset first: roll out a deliberately <em>mediocre</em> checkpoint &mdash; an early <span class="mono">ppo_rover_v0*.zip</span> &mdash; for about 500 episodes, storing observations, actions, and returns. Then train two fresh policies by supervised regression onto those actions: one unweighted, which is plain behavior cloning, and one weighting each sample:</p>
+
+<div class="key-eq">\[ w_i \;=\; \exp\!\left(\frac{\hat{A}_i}{\beta}\right), \qquad \hat{A}_i \;=\; G_i - V(s_i) \]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+\(w_i\) is how much sample \(i\) counts in the regression loss; 1 is neutral, 5 means it counts five times. \(\hat{A}_i\) is that sample's advantage: the return \(G_i\) that actually followed it, minus what the old checkpoint's critic predicted for that state, \(V(s_i)\) &mdash; positive when the sample went better than expected. \(\beta\) is a temperature setting how sharply you care: large \(\beta\) flattens every weight toward 1 and you are back at behavior cloning, small \(\beta\) makes the exponential explode and only a few lucky samples survive. This is ordinary supervised learning with one multiplier bolted on.</div>
+
+<p>Normalize the advantages before exponentiating, and clip the weights at 20. Evaluate both policies over 100 episodes each &mdash; and write the uncertainty down beside the number, because 100 episodes is not many. For a mean return, the 95% interval is about \(1.96\,\sigma/\sqrt{100} = 0.196\,\sigma\), a fifth of one episode's standard deviation, so compute \(\sigma\) over those episodes before you decide the gap is real. If you score success rather than return, the right tool is a Wilson interval instead, and near a 50% success rate 100 episodes buy you roughly plus or minus 10 points. <em>You understood it if</em> weighted beats unweighted, and you can show the weight histogram and say what \(\beta\) does to its shape &mdash; then push \(\beta\) toward zero and watch Chapter 4's dead-data failure appear in front of you.</p>
+
+<h3>E5 &middot; Diffusion, multimodality, and the latency bill</h3>
+
+<p>Chapter 6; LeRobot in <span class="mono">hil-serl</span>, GPU; ~8 h. Train LeRobot's <span class="mono">diffusion</span> policy on an existing SO-101 dataset &mdash; your 24-episode cube set is enough. This is the first rung whose policy has no density you can write down. E2's softmax and E3's Gaussian both hand you \(\log \pi_\theta(a|s)\) on request; this one only hands you samples. Everything awkward in Chapters 9 through 12 follows from that one sentence, and the point of this rung is to meet it on your own hardware rather than take it from Chapter 5.</p>
+
+<p>Two measurements. The first needs more care than it looks like it needs.</p>
+
+<p><em>First, multimodality.</em> Freeze one observation, draw 50 action chunks from it, and plot a <strong>histogram</strong> of the first action dimension. Look at the shape, not at the standard deviation. Spread and modality are not the same thing: one broad unimodal sampler scatters exactly as much as two tight modes do, and a single number like <span class="mono">.std()</span> cannot tell them apart. Separated clusters are the evidence you want. A single hump, however wide, is not.</p>
+
+<p>Choose the observation deliberately as well, because your fixture can decide the answer before your model does. Pick a frame where <em>your own demonstrations diverge</em> &mdash; the moment before the grasp, where you sometimes came in from the left and sometimes from the right. If all 24 of your episodes did the same thing at that frame, then one tight cluster is the <em>correct</em> result: it means your dataset is unimodal there, not that training failed. Multimodality is a property of the data first and the model second, and a rung that cannot tell those apart is not measuring anything. If no frame in your 24 episodes qualifies, the cheapest fix is to record six more episodes approaching the cube from the other side, so the rung has a mode to find.</p>
+
+<p><em>Second, the trade-off</em> of Chapter 6's last section: sweep the denoising step count \(K\) and measure both action quality and per-query latency against a 30 Hz budget. "Action quality" has to be an actual number or the sweep means nothing, so fix one now and reuse it in E6. Hold out four episodes. For each of 200 held-out observations, sample 10 chunks and record the distance from the demonstrated chunk to its <em>nearest</em> sample; report the mean of those 200 distances. Nearest, not mean-of-samples &mdash; a policy that correctly covers both modes must not be penalized for the mode it did not take, which is precisely the scoring mistake that would make a mode-averaging policy look good.</p>
+
+<p>That open-loop metric is a proxy, and you should say so in your notes. The honest measurement is closed-loop: 30 scored rollouts per value of \(K\) on the arm, which costs an afternoon and is worth paying once. Chapter 6's rig box already asks you for the small version of it &mdash; train at 100 denoising steps, sample at 10, confirm the success rate holds.</p>
+
+<pre class="code"># NOT select_action(): it pops one action from an internal queue and only runs
+# the denoiser when that queue empties, so 50 calls would time ~7 generations.
+obs = dataset[0]                                 # one frozen frame, reused everywhere
+batch = {k: v[None].to(device) for k, v in obs.items()
+         if k.startswith("observation.")}        # real keys: observation.state,
+                                                 # observation.images.CAM -- batched
+for K in [2, 4, 10, 50, 100]:
+    policy.diffusion.num_inference_steps = K     # set it where the SAMPLER reads it;
+    policy.config.num_inference_steps = K        # the model copies this field at build
+                                                 # time, so config alone may do nothing
+    samples, t0 = [], time.perf_counter()
+    for _ in range(50):
+        policy.reset()                           # clear any queued actions per draw
+        with torch.no_grad():
+            chunk = policy.predict_action_chunk(batch)   # one full denoiser run
+        samples.append(chunk[0, 0, 0].item())    # first action of the chunk, dim 0
+    dt = (time.perf_counter() - t0) / 50         # true seconds per generation
+    print(K, dt)
+    plt.hist(samples, bins=30)                   # the SHAPE, not the std
+</pre>
+
+<p>Three things in that block are the rung rather than boilerplate, and none of them raises an exception when you get them wrong. That is why they are named out loud here instead of left in a comment.</p>
+
+<p><em>One: <span class="mono">select_action</span> is the wrong entry point.</em> It serves one action at a time out of an internal queue, and it only runs the denoiser when that queue is empty &mdash; every <span class="mono">n_action_steps</span> calls, so every eighth call at the default. Fifty calls therefore trigger about seven real generations, not fifty. Both of the rung's measurements break as a result. The reported latency comes out roughly eight times too low, so a genuine 100 ms query prints as 13 ms and \(K = 100\) looks affordable. And the values you collect mix variation across timesteps <em>inside</em> one chunk with variation across seven samples, which is not sample diversity at all. Use <span class="mono">predict_action_chunk</span>, which runs the denoiser once per call and hands back the chunk. (LeRobot's diffusion implementation slices that chunk to <span class="mono">n_action_steps</span> rows before returning it, which is harmless here since you only read row 0.)</p>
+
+<p><em>Two: the step-count field may not be connected.</em> It is read into the sampler when the model is constructed, so assigning to <span class="mono">policy.config</span> after the fact can silently change nothing at all, and your whole sweep quietly becomes five repetitions of one setting. Grep for where the field is actually read in your checkout. Then sanity-check it: print the latency at \(K = 2\) and at \(K = 100\) before you trust a single row of output, and if the two are the same number, the knob is not connected.</p>
+
+<p><em>Three: those are not the observation keys.</em> LeRobot's are <span class="mono">observation.state</span> and <span class="mono">observation.images.&lt;your_camera&gt;</span>, batched and moved to the device; there is no key called simply <span class="mono">observation</span>. That one at least fails loudly. The first two do not, and both are exactly the kind of silent measurement bug Rule Two exists to prevent.</p>
+
+<p><strong>Worked example: does K = 10 fit?</strong> Suppose the loop reports 100 ms per query at \(K = 10\), matching the 0.1 s Chi et al. (2023) report on an RTX 3080. Split it in two. The observation encoder runs once per query; call it 12 ms. The remaining \(100 - 12 = 88\) ms is the denoising loop, so one denoiser pass costs \(88 / 10 = 8.8\) ms. Now predict any \(K\) instead of measuring it:</p>
+
+<pre class="code">K = 4    ->  12 + 4  x 8.8 =  12 +  35.2 =  47.2 ms
+K = 10   ->  12 + 10 x 8.8 =  12 +  88.0 = 100.0 ms
+K = 100  ->  12 + 100x 8.8 =  12 + 880.0 = 892.0 ms
+</pre>
+
+<p>The budget is not one control period. It is the wall-clock length of the segment you execute between queries. At 30 Hz one period is \(1/30 = 33.3\) ms, and with <span class="mono">horizon</span> = 16 and <span class="mono">n_action_steps</span> = 8 you execute \(8 \times 33.3 = 266.7\) ms of motion per query. So \(K = 10\) costs 100 ms of 266.7 ms, a <strong>duty cycle</strong> &mdash; the fraction of each execution window spent computing rather than moving &mdash; of \(100 / 266.7 = 0.375\), meaning the GPU is busy 37% of the window and idle for the rest, which is comfortable. Low is good here: the idle fraction is your margin for a slow frame. \(K = 100\) costs 892 ms, needing \(892 / 33.3 = 26.8\), so 27 executed steps; but <span class="mono">n_action_steps</span> cannot exceed <span class="mono">horizon</span> = 16, so \(K = 100\) is not merely slow here, it is impossible.</p>
+
+<p>Now the other half, which is why you cannot just take the cheapest \(K\). Say the 50 samples at \(K = 10\) form two clusters at \(-0.31\) and \(+0.42\) rad, holding 45% and 55% of the draws. Their mixture mean is \(0.45 \times (-0.31) + 0.55 \times (0.42) = -0.1395 + 0.2310 = 0.0915\). At \(K = 4\) the samples collapse into one cluster at \(+0.09\) rad &mdash; within 0.002 of that mixture mean, which is the uncomfortable part. That is the between-modes average Chapter 6 warns about: the policy has not become slightly worse, it has started emitting an action no demonstrator ever performed. Cheap \(K\) bought 53 ms and cost the property you adopted diffusion for.</p>
+
+<h3>E6 &middot; Flow matching head-to-head, and Chapter 8's VLA shape trace</h3>
+
+<p>Chapters 7 and 8; same data, GPU; ~8 h. Two parts, both comparisons rather than new training runs. Loading a released checkpoint is the intended path: fine-tuning a \(\pi_0\)-family model on 24 episodes is a weekend, not an evening, and it is not what this rung is measuring.</p>
+
+<p><em>Part (a), flow versus diffusion.</em> Load a \(\pi_0\)-family flow-matching policy, point it at the same cube dataset, and run E5's two measurements on it: sample diversity from a frozen observation, and the quality-versus-\(K\) curve, using the same nearest-sample distance you fixed in E5 so the two rungs are comparable.</p>
+
+<p>Now the part that will mislead you if nobody warns you. Do <em>not</em> compare the two policies on wall-clock milliseconds per query and call the winner a win for the formalism. LeRobot's diffusion policy is a U-Net of roughly 100M parameters; a \(\pi_0\)-family policy is a 3B backbone plus a 300M action expert. Those differ by more than an order of magnitude, so the flow policy will be dramatically <em>slower</em> per query on your GPU even when its \(K\) is equal or lower. That is a parameter-count fact and has nothing to do with flow matching. Chapter 7's actual claim is about network <em>evaluations</em> per sample &mdash; about straight-line paths tolerating few steps &mdash; not about wall clock across different-sized networks.</p>
+
+<p>So split the measurement in two and label which is which. Measure (i) <em>steps to reach a given quality</em>: the smallest \(K\) at which each policy's nearest-sample distance stops improving. This is Chapter 7's claim, and flow should win or tie. Measure (ii) <em>milliseconds per network evaluation</em>, and record it as a size fact about your two checkpoints, not as a verdict. A fair latency comparison of the two formalisms would need matched-size networks, which you are not going to train. What you can honestly compare is step count at equal quality, and the absence of schedule tables in the config.</p>
+
+<p>Confirm too where the three knobs live, because the naming is inconsistent across the two families and everyone loses an hour to it once. The chunk horizon \(H\) is <span class="mono">chunk_size</span> in the \(\pi_0\) family and <span class="mono">horizon</span> in diffusion. The step count \(K\) is <span class="mono">num_steps</span> in the \(\pi_0\)-family config and <span class="mono">num_inference_steps</span> in the diffusion config &mdash; the same split naming as \(H\), in the same two files. The execution length is <span class="mono">n_action_steps</span> in both, the one mercy. Field names drift between LeRobot releases, so open the two config dataclasses in your own checkout and read the names off them rather than trusting this paragraph; locating them is part of the rung.</p>
+
+<p><em>Part (b), the shape trace.</em> Load a <span class="mono">pi0</span> or <span class="mono">pi05</span> checkpoint in your LeRobot checkout, run one inference call, and print tensor shapes at each stage of Chapter 8's worked example: patches per camera, total prefix tokens, the suffix of noisy action tokens, the emitted chunk.</p>
+
+<p>Expect three deliberate mismatches against the book's 783-token prefix, and do not spend an evening concluding you loaded the wrong model. First, there is no advantage token and no garment-type token: those are LeHome's own additions &mdash; the advantage token from Chapter 10, the garment-type token from Section 8.7's walkthrough &mdash; not part of the released architecture. Second, a stock \(\pi_0\) carries robot state as a single projected token in the <em>suffix</em>, whereas LeHome bins each of its 12 joints into its own token in the <em>prefix</em>. Third, \(\pi_0\) tokenizes a language prompt, and LeHome uses no language at all. What must line up is the image accounting &mdash; 256 tokens per 224&times;224 camera, so 768 for three &mdash; and the suffix shape: \(H\) noisy action tokens plus one flow-matching query token. <em>You understood it if</em> you can say which tensors are computed once per decision and which are recomputed \(K\) times; that gate survives all three mismatches, which is why it is the gate.</p>
+
+<p><em>You understood E5 and E6 if</em> you can explain why neither policy has a usable <span class="mono">log_prob</span> method while E2's sixty-liner did &mdash; and why that missing method is what Chapter 9 is about.</p>
+
+<div class="box rig"><div class="box-title">On your rig</div>
+You own one SO-101 leader/follower pair and one GPU, enough for every rung here but forcing serialization: you cannot train E5's policy while E10 holds the arm, so batch the GPU rungs into evenings and the arm rungs into weekends. Keep the 24-episode cube dataset frozen and versioned &mdash; it is the shared fixture that makes E5, E6, and E7 comparable. Re-record it midway and every earlier number becomes uncomparable.</div>
+
+<h3>E7 &middot; Minimal RECAP: one conditioning bit</h3>
+
+<p>Chapter 10; <span class="mono">hil-serl</span> data, GPU; ~8 h. Conditioning needs failures, and your cube dataset is 24 successes out of 24 &mdash; so mix in failures from your HIL-SERL run buffers, or record about ten deliberate near-misses. Label every episode's chunks \(c \in \{+,-\}\) by outcome and append the bit as an extra policy input.</p>
+
+<p>Then train with roughly 30% <strong>condition dropout</strong>, and be exact about what that means, because getting it wrong here costs a retraining rather than a tuning pass. On about a third of the samples you replace the label with a <em>third, neutral value</em> &mdash; a null token, a specific vector meaning "no label given" &mdash; so that the same network also learns the unconditioned distribution. Dropout does not mean feeding the minus label on those samples, and it does not mean feeding nothing at all. Chapter 10 describes two structurally different ways to end up holding a second conditional; this rung implements the stochastic-replacement one with a null token, not \(\pi^*_{0.6}\)'s always-on two-term objective anchored at the negative conditional. Without that third value there is no unconditioned branch to take a difference against, and Chapter 12's guidance has nothing to work with.</p>
+
+<p>Evaluate the policy queried at \(c = +\) against an unconditioned twin trained on the same mixed data. <em>You understood it if</em> \(c = +\) beats the clean-data policy while the twin is dragged down &mdash; conditioning turned bad data into signal instead of poison.</p>
+
+<h2>B.4 Engineering rungs (Chapters 11&ndash;12)</h2>
+
+<h3>E8 &middot; Shaping honestly, and CUPED on your logs</h3>
+
+<p>Chapter 11; <span class="mono">rl-rover</span>; ~6 h. Two parts. In part (a) you add a deliberately broken progress bonus &mdash; a raw "+k whenever distance to the goal shrinks", not potential-based &mdash; and short-train until you catch the policy farming it, oscillating toward and away from the goal. Then rewrite the same idea as \(\gamma\Phi(s') - \Phi(s)\), where \(\Phi\) is a <strong>potential</strong>: any function of the state alone, here minus the distance to the goal. The bonus becomes the <em>change</em> in potential rather than a raw payment, so a step out and back cancels exactly instead of paying twice. Confirm the exploit dies. Section 11.3's theorem will never land as hard as a rover that learned to twitch.</p>
+
+<p>In part (b) you take E3's logged episodes, compute the correlation \(\rho_{GV}\) between returns and critic predictions, then the damping coefficient. This is <strong>CUPED</strong> &mdash; <em>controlled-experiment using pre-experiment data</em>, the A/B-testing trick of Section 11.5 that subtracts a correlated covariate scaled by a fitted coefficient rather than by 1 (Deng et al., 2013) &mdash; wearing RL clothes:</p>
+
+<div class="key-eq">\[ \alpha^\star \;=\; \rho_{GV}\,\frac{\sigma_G}{\sigma_V} \]</div>
+
+<div class="box plain"><div class="box-title">In plain words</div>
+\(\alpha^\star\) is how much of the critic's prediction to subtract from the return &mdash; not all of it, only the informative fraction. \(\rho_{GV}\) is the correlation between returns \(G\) and critic values \(V\) across your logged episodes: 1 means the critic tracks returns perfectly, 0 means it is noise. \(\sigma_G\) and \(\sigma_V\) are their standard deviations, and the ratio rescales \(V\) into \(G\)'s units. A trustworthy critic earns \(\alpha^\star\) near 1, so subtract it fully; a noisy one earns \(\alpha^\star\) near 0, meaning ignore it rather than let its noise contaminate your advantage.</div>
+
+<p><strong>A small worked example.</strong> Suppose your logs give \(\sigma_G = 6.0\), \(\sigma_V = 4.0\), \(\rho_{GV} = 0.5\). Then \(\alpha^\star = 0.5 \times 6.0 / 4.0 = 0.5 \times 1.5 = 0.75\).</p>
+
+<p>Compare variances with \(\mathrm{Var}(G - \alpha V) = \sigma_G^2 - 2\alpha\rho_{GV}\sigma_G\sigma_V + \alpha^2\sigma_V^2\). That expression is not a new fact, so unpack it once rather than reciting it. It is the ordinary variance of a difference, \(\mathrm{Var}(X - Y) = \mathrm{Var}(X) - 2\,\mathrm{Cov}(X,Y) + \mathrm{Var}(Y)\), applied with \(X = G\) and \(Y = \alpha V\). Scaling \(V\) by \(\alpha\) scales its covariance term by \(\alpha\) and its variance term by \(\alpha^2\), and \(\mathrm{Cov}(G,V)\) has been written out as \(\rho_{GV}\sigma_G\sigma_V\). Every symbol earns its place: \(\sigma_G^2\) is the noise you started with, the middle term is the payoff and is linear in \(\alpha\), the last term is the cost and is quadratic, and the whole thing is an upward parabola with one minimum at \(\alpha^\star\).</p>
+
+<p>Three numbers, then. No baseline at all: 36. Full subtraction, \(\alpha = 1\): \(36 - 2(1)(0.5)(6)(4) + 1(16) = 36 - 24 + 16 = 28\). At \(\alpha^\star = 0.75\): \(36 - 2(0.75)(0.5)(6)(4) + 0.5625(16) = 36 - 18 + 9 = 27\).</p>
+
+<p>Report both comparisons separately, because they answer different questions and it is easy to quote one while meaning the other. Against no baseline, \(36 \to 27\), a cut of \((36 - 27)/36 = 25\%\). Against full subtraction &mdash; the naive move damping is supposed to beat &mdash; \(28 \to 27\), a cut of \((28 - 27)/28 = 3.6\%\). The second number is the one that measures what damping actually bought, and here it is nearly nothing.</p>
+
+<p>That is not a defect in the method; it is a fact about the regime, and Chapter 11 hands you the line that makes the regime legible. Full subtraction is worse than no baseline at all whenever \(\sigma_V \gt 2\rho_{GV}\sigma_G\). Here that reads 4 against \(2(0.5)(6) = 6\), and \(4 \lt 6\), so you are in the benign regime where the textbook move already works and damping is a rounding error.</p>
+
+<p>So run it again with a critic worth damping, because that is the case the chapter is actually about. Take \(\sigma_G = 6.0\), \(\sigma_V = 8.0\), \(\rho_{GV} = 0.3\) &mdash; a head that bounces around more than the returns it is predicting, which is what E3's critic looks like in its first 50k steps. The diagnostic now reads 8 against \(2(0.3)(6) = 3.6\), and \(8 \gt 3.6\), so full subtraction should hurt.</p>
+
+<p>It does. At \(\alpha = 1\): \(36 - 2(1)(0.3)(6)(8) + 64 = 36 - 28.8 + 64 = 71.2\) &mdash; nearly double the raw variance of 36, from the move Chapter 2 taught you as standard. At \(\alpha^\star = 0.3 \times 6.0 / 8.0 = 0.225\): \(36 - 28.8(0.225) + 64(0.050625) = 36 - 6.48 + 3.24 = 32.76\), which agrees with the closed form \(\sigma_G^2(1 - \rho_{GV}^2) = 36 \times 0.91 = 32.76\).</p>
+
+<p>Report both comparisons here too. Against no baseline, \(36 \to 32.76\), a 9% cut. Against full subtraction, \(71.2 \to 32.76\), a cut of \((71.2 - 32.76)/71.2 = 54\%\). Same formula, same three symbols, same coefficient &mdash; and the point of the whole section is only visible in the second regime. Which regime your own logs land in is an empirical question you can settle in one line, so settle it before you decide damping was not worth the trouble.</p>
+
+<p><em>You understood it if</em> you can say which of E3's critics, early or late, deserves \(\alpha\) closer to 1 &mdash; and predict which of the two regimes each one lands in before computing anything.</p>
+
+<h3>E9 &middot; Inference knobs and a bandit to tune them</h3>
+
+<p>Chapter 12; E5's or E6's policy, in sim or on the arm; ~5 h. The checkpoint is frozen and only execution changes, which is what makes this rung cheap.</p>
+
+<p>Sweep <span class="mono">n_action_steps</span> over four <em>distinct</em> values at about 30 scored episodes each, and keep the curve. For E5's diffusion policy, whose <span class="mono">horizon</span> is 16, use \(\{1, 4, 8, 16\}\); note that at \(H = 16\) the generic choice \(H/2\) coincides with 8, so pick the four by hand rather than from a formula, or you will run two identical arms against each other and split the evidence between them. On a \(\pi_0\)-family policy \(H\) is much larger &mdash; 50 in the released configs, 30 in LeHome &mdash; so the same four fractions land on entirely different integers.</p>
+
+<p>Then be honest about what 30 episodes per arm can resolve, because this is where Rule Two bites the rung that states it. Near a 50% success rate, 30 episodes give a 95% Wilson interval of roughly plus or minus 18 points. So treat the sweep as a coarse ordering, not a ranking: the comparison you can actually make is between the best arm and the worst, not between neighbors. Chapter 12 makes the same point at scale &mdash; separating 70% from 75% takes on the order of a thousand trials &mdash; and Chapter 15 does the arithmetic in full. That imprecision is itself the argument for the bandit, which spends its episodes where the ordering is still in doubt rather than spreading them evenly across arms it has already separated.</p>
+
+<p>Now hand the same four-way choice to the Beta&ndash;Thompson bandit of Section 12.6 &mdash; the fifteen-line implementation &mdash; and let it allocate the same total budget online. Skip best-of-\(N\): you have no \(Q\)-like head until the capstone. <em>You understood it if</em> the bandit's posteriors put the same arm on top as your sweep did, having spent most of its episodes on the contenders &mdash; and if you can say why "the same arm on top" is the right gate here, while "the same full ordering" is a gate your sample size cannot support.</p>
+
+<h2>B.5 Human-and-real-world rungs (Chapters 13&ndash;14)</h2>
+
+<h3>E10 &middot; Close the HIL-SERL loop, and watch the human retire</h3>
+
+<p>Chapter 13; <span class="mono">hil-serl</span>, the run your <span class="mono">NEXT.md</span> says is one USB cable away; 2&ndash;3 robot sessions. Finish the cube run to a clean success rate over at least 50 scored episodes. Then instrument what Chapter 13 predicts: log the intervention flag per frame and plot intervention rate per 10-episode window. Your first working run sat at 98%, which is what the start of that curve should look like; it should decay as the policy absorbs your corrections. Keep the neutral-action histogram from your RB-release bug as a permanent dashboard check. Finally implement Section 13.4's weighting in one DAgger-style refit: corrections up-weighted, pre-takeover frames ramped to zero. <em>You understood it if</em> you can show the decay curve and say what a <em>flat</em> one would have told you.</p>
+
+<h3>E11 &middot; Async with two workers</h3>
+
+<p>Chapter 14; <span class="mono">rover-mujoco</span>; ~9 h. Split rover training into Chapter 14's actor/learner roles on one machine: a learner consuming episode files, plus rollout workers that load the newest checkpoint from a shared directory. The filesystem stands in for the model hub, and that substitution is the second analogy worth naming: the shared directory <em>is</em> a message queue, checkpoints are messages, staleness is queue lag. Where it breaks down: a real queue delivers every message exactly once, whereas a checkpoint directory is a mailbox where workers read only the newest item and skip the rest &mdash; which is why staleness is a correctness question, not a latency one. Measure episodes per hour at 1 versus 2 workers, then kill a worker mid-run and confirm nothing but throughput suffers. Use AWR-style weighted updates on the learner, then note why PPO here would be quietly wrong as checkpoints lag. Your <span class="mono">audit_baseline.py</span> solvability check is the companion piece: rerun it whenever you widen randomization. <em>You understood it if</em> the crash cost throughput and nothing else, and you can name the property of the update rule that made that true.</p>
+
+<h2>B.6 The capstone gate (Chapter 15)</h2>
+
+<h3>E12 &middot; Stage A, exactly as written</h3>
+
+<p>Chapter 15; LeHome repos, GPU; 1&ndash;2 weeks. Clone the challenge environment and the solution repo, get Isaac Lab rendering, run <em>his</em> checkpoint through the official evaluator on the public garments, and land within a few points of the published per-type numbers: 74.5 / 70.0 / 80.5 / 93.5. Write the one-page codebase map Chapter 15 demands. This rung is deliberately unoriginal, and that is its value: it converts the book into a running system you have verified. <em>You understood it if</em> your reproduced score has a confidence interval attached and you can point, in his code, at where each auxiliary head attaches and where the sampler applies the AWR priorities.</p>
+
+<div class="box lehome"><div class="box-title">In the LeHome solution</div>
+Nearly every rung has a counterpart in the LeHome stack, which is why the ladder ends there. E5 and E6's step-count and execution-length knobs are the inference-time parameters LeHome tunes; E7's conditioning bit is RECAP-style advantage conditioning in miniature; E8's damping is its \(\alpha\)-damped value baseline; E9's bandit is how its inference knobs were set; E11's split is its actor/learner topology. E12 is where those toy pieces become one system trained on a single H200 (Larchenko, 2026).</div>
+
+<h2>B.7 The ladder at a glance</h2>
+
+<table class="tbl">
+<thead><tr><th>Rung</th><th>Chapter</th><th>Where</th><th>Time</th><th>Roadmap phase</th></tr></thead>
+<tbody>
+<tr><td>E1 values by hand</td><td>1</td><td>rl-boarding</td><td>~3 h</td><td>Phase 0</td></tr>
+<tr><td>E2 REINFORCE + baseline</td><td>2</td><td>CartPole</td><td>~5 h</td><td>Phase 0</td></tr>
+<tr><td>E3 PPO forensics</td><td>3</td><td>rl-rover</td><td>~5 h</td><td>Phase 0</td></tr>
+<tr><td>E4 AWR on logged data</td><td>4</td><td>rl-rover</td><td>~7 h</td><td>Phase 1</td></tr>
+<tr><td>E5 diffusion + latency sweep</td><td>6</td><td>LeRobot + GPU</td><td>~8 h</td><td>Phase 1</td></tr>
+<tr><td>E6 flow matching + VLA shape trace</td><td>7&ndash;8</td><td>LeRobot + GPU</td><td>~8 h</td><td>Phase 1</td></tr>
+<tr><td>E7 minimal RECAP</td><td>10</td><td>hil-serl data</td><td>~8 h</td><td>Phase 1</td></tr>
+<tr><td>E8 shaping + CUPED</td><td>11</td><td>rl-rover</td><td>~6 h</td><td>Phase 2&ndash;3</td></tr>
+<tr><td>E9 knobs + bandit</td><td>12</td><td>E5/E6's policy</td><td>~5 h</td><td>Phase 3</td></tr>
+<tr><td>E10 HIL-SERL close-out</td><td>13</td><td>SO-101</td><td>2&ndash;3 sessions</td><td>Phases 1, 4</td></tr>
+<tr><td>E11 async, two workers</td><td>14</td><td>rover-mujoco</td><td>~9 h</td><td>Phase 2&ndash;3</td></tr>
+<tr><td>E12 capstone Stage A</td><td>15</td><td>LeHome stack</td><td>1&ndash;2 wk</td><td>Phase 2</td></tr>
+</tbody>
+</table>
+
+<p>Do the addition rather than trusting a round number, because a schedule built on the wrong one costs weeks. The ten rungs quoted in hours add up to 64: \(3 + 5 + 5 + 7 + 8 + 8 + 8 + 6 + 5 + 9\). E10's two or three robot sessions add roughly 10 to 15 more. And E12 is one to two weeks, which at your rate is another 15 to 40 &mdash; note that E12 <em>is</em> Stage A, so it comes before the capstone's Stage B rather than after it, and cannot be left out of the total. The ladder through Stage A therefore runs to roughly 90 to 120 hours of bench time. At 15 to 20 hours a week that divides out to five to eight weeks.</p>
+
+<p>Those are bench hours only. The reading that goes with them is separate and roughly as large, which is why the roadmap gives Phases 0 through 2 ten weeks rather than five. E1&ndash;E3 compress into Phase 0's two weeks because the tooling already exists. E10 straddles the plan deliberately: start it early, because the robot teaches faster than the book does.</p>
+
+<div class="box pitfall"><div class="box-title">Pitfalls</div>
+<strong>Climbing rungs without the gates.</strong> The temptation is to "run" E4 or E7, see a plausible curve, and move on. The gate is the stated measurement plus the <em>you understood it if</em> test, spoken aloud or written down. An experiment that produced a number you cannot explain has not been finished; it has been visited.</div>
+
+<div class="box checkpoint"><div class="box-title">Checkpoint</div>
+<ul>
+<li>State the three rules &mdash; one question, measure don't watch, log it &mdash; and what failure each prevents.</li>
+<li>Compute whether a chunked policy fits its real-time budget at a given step count, and say what dropping below the safe count does to sample quality.</li>
+<li>Say where \(H\), \(K\), and the execution length live in a LeRobot config, in both the diffusion and \(\pi_0\)-family namings.</li>
+<li>Explain why a single-seed result on E2 or E3 is not a result, and what to run instead.</li>
+<li>Attach an interval to every success rate you report, and say what 30 scored episodes per arm can and cannot resolve.</li>
+<li>Name, for each rung you climbed, the surprise it produced and where you wrote it down.</li>
+</ul>
+</div>
+
+<p><strong>Where to go deeper.</strong> The best next reading is your own logs: reread E3's TensorBoard after finishing E9, and you will see things you could not see the first time. For papers, Appendix A sequences them. For experimental hygiene, the reproducibility literature around deep RL &mdash; seed counts, confidence intervals, how often published gains fail to survive them &mdash; is worth an evening.</p>
+
+</section>
