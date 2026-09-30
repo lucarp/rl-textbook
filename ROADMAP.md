@@ -1,6 +1,6 @@
 # Robotics + RL Engineering Roadmap
 
-**Goal:** become employable as a robotics engineer specializing in robot learning (RL/IL on real hardware), in ~5–6 months at **15–20 h/week**.
+**Goal:** build deep, hands-on competence in robot learning (RL/IL on real hardware), in ~5–6 months at **15–20 h/week**.
 **Capstone:** replicate the LeHome Challenge solution — first in simulation, then adapted to the real SO-101.
 **Companion:** `textbook/` in this repo — *Reinforcement Learning for Real Robots* (2nd edition) — covers all the theory referenced below. Chapter numbers (Ch1–Ch15) refer to it; its **Appendix B (the experiment ladder)** gives one concrete experiment per chapter (E1–E12), each mapped to a phase below — the build hours in Phases 0–3 largely *are* those rungs.
 
@@ -26,9 +26,9 @@ flowchart TB
 
 Consequences of this picture:
 
-- **RL is the primary front.** It's the differentiator in the job market and the deepest theory. It gets the most hours.
+- **RL is the primary front.** It's the core of the work and the deepest theory. It gets the most hours.
 - **Simulation is not a separate subject** — it's where RL training happens. You learn Isaac Sim *by doing LeHome*, not from tutorials in a vacuum.
-- **ROS 2 is a background track.** ~2 h/week, always attached to a real need (rover-v1's RPLIDAR + Pi 4), never studied abstractly. Robotics employers expect working knowledge, not mastery.
+- **ROS 2 is a background track.** ~2 h/week, always attached to a real need (rover-v1's RPLIDAR + Pi 4), never studied abstractly. The target is working knowledge, not mastery.
 - **Robotics fundamentals** (kinematics, control, calibration) you learn on contact with hardware — you're already doing this in `hil-serl` (servo buses, udev rules, camera pipelines *are* robotics engineering).
 
 ## 2. Where you actually are (honest audit, Aug 2026)
@@ -91,8 +91,8 @@ Assumes ~17 h/wk average. Weekly template: **~8 h build · ~5 h theory (textbook
 - The bimanual fork: LeHome needs two arms. Either acquire a second SO-101 pair, or adapt to a **single-arm garment task** (towel fold with a fixture) reusing the full machinery: teleop demos → sim alignment → real fine-tune → DAgger corrections.
 - **Gate:** a video of the real SO-101 doing a garment task end-to-end, with success statistics over ≥20 trials.
 
-### Phase 5 — Portfolio and job search (weeks 19–24, thread starts week ~12)
-- Write-ups: one tech note per repo (rover sim-to-real; HIL-SERL reproduction; LeHome replication with per-stage numbers). Larchenko's career case study *is* the playbook: open-source + write + show videos.
+### Phase 5 — Write-ups and publication (weeks 19–24, thread starts week ~12)
+- Write-ups: one tech note per repo (rover sim-to-real; HIL-SERL reproduction; LeHome replication with per-stage numbers). Open-source + write + show videos.
 - rover-v1 as the ROS 2 credential: RPLIDAR + ROS 2 nodes on the Pi 4, even a minimal version.
 - Target roles: robot learning engineer, robotics software engineer (learning teams), applied research engineer. Interview prep maps directly to the textbook: policy gradients & PPO (Ch2–3), offline RL (Ch4), diffusion/flow/VLAs (Ch5–8), "why not PPO for a VLA?" (Ch9 — a common interview probe), practical debugging war stories (you have real ones).
 - Start applying **before** Phase 4 finishes — the pipeline is long, and "in progress" capstones interview well.
@@ -112,7 +112,7 @@ Assumes ~17 h/wk average. Weekly template: **~8 h build · ~5 h theory (textbook
 | 10 | LeHome runs + BC baseline | Eval score table + architecture note |
 | 16 | RL beats BC in sim | Ablation write-up |
 | 20 | Real-robot garment task | Video + success stats |
-| 24 | Job-ready portfolio | 3 tech notes, applications out |
+| 24 | Write-ups published | 3 tech notes |
 
 ## 6. Rules of the road
 
